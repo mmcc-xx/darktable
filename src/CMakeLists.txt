@@ -1227,6 +1227,8 @@ add_subdirectory(cli)
 # have a Model Context Protocol server exposing the raw engine to AI agents
 if(USE_MCP)
   add_subdirectory(mcp)
+  # long-running edit engine (proof of concept), built with the MCP server
+  add_subdirectory(api)
 endif()
 
 # have a command line utility to generate all the thumbnails

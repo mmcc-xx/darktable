@@ -126,6 +126,9 @@ message.
 | `module_enable {operation, instance, enabled}` | module on/off |
 | `history_list`, `history_end {end}` | history items; undo/redo to a step (0 = original) |
 | `history_compress {truncate}` | compress the history stack as the history panel does (`truncate`: only drop the steps above `history_end`); it works on the library, so the edit is saved first |
+| `module_move {operation, instance, before \| after: {operation, instance}}` | move a module in the pipe, as dragging it in the darkroom (darktable's rules for what may move apply) |
+| `curve_get` / `curve_set {operation, instance, channel, points, type}` | curves of rgbcurve (R, G, B), tonecurve (L, a, b), colorzones (lightness, chroma, hue) and basecurve: points `[[x, y], ...]` (x increasing, 0..1) and spline type per channel |
+| `image_duplicate {imgid, virgin, save}` | a duplicate (virtual copy, next version) as the lighttable's duplicate: with the saved edit (unsaved changes refused unless `save`) or none (`virgin`) |
 | `module_add {operation, instance, copy}` / `module_remove` / `module_rename {name}` | module instances: a new one after the given one (`copy`: duplicate its settings and blending; headless, drawn shapes aren't copied), delete one (not a module's only instance; its history steps go), label one |
 | `geometry_get` | orientation (`rotation` clockwise from the raw file, `mirrored`), straightening `angle` and `autocrop` (rotate and perspective), `crop` box (`left`, `top`, `right`, `bottom`, fractions of the uncropped image), `aspect`, and the uncropped (`frame_width`/`frame_height`) and final sizes |
 | `geometry_set {rotate, flip, angle, autocrop, crop, aspect}` | as the darkroom does, all or nothing: `rotate` turns by 90° steps (clockwise; -90 left) and `flip` (`horizontal`/`vertical`) mirrors in the flip module, and an existing crop box follows; `angle` straightens (degrees, positive turns counter-clockwise) and the automatic crop is refitted as ashift's GUI does; `crop` sets the box (`null` removes it); `aspect` (`free`, `original`, `square`, `W:H`) fits the largest box of that ratio inside the given or current one |
@@ -155,8 +158,8 @@ about 1/255 (mean absolute difference).
 
 - settings the GUI adjusts alongside a change (`gui_changed`), pickers and
   other operations whose logic lives in GUI code
-- arrays of structs (curve nodes) and integer arrays, path and brush shapes,
-  raster masks, module order
+- integer arrays and other arrays of structs than curves, path and brush
+  shapes, raster masks
   and order, styles, tags and metadata, import; export to storages other
   than disk
 - perspective correction (ashift's line detection and fitting); the

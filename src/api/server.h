@@ -44,6 +44,12 @@ int dt_api_listen(const char *path);
 // the socket path the example clients use for a config dir
 gchar *dt_api_default_socket(const char *configdir);
 
+// darktable's window, before it opens the library: if an engine serves the
+// library on path, ask it to hand over (it releases the library, passes its
+// unsaved edits along and exits). TRUE if it did; the edits are restored by
+// dt_api_start
+gboolean dt_api_handover(const char *path);
+
 void dt_api_start(const dt_api_options_t *options);
 
 // closes clients, the socket and every session; returns TRUE if the library

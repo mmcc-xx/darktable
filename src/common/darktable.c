@@ -28,6 +28,9 @@
 #include "common/collection.h"
 #include "common/colorspaces.h"
 #include "common/darktable.h"
+#ifdef HAVE_API
+#include "api/server.h"
+#endif
 #include "common/datetime.h"
 #include "common/exif.h"
 #include "common/pwstorage/pwstorage.h"
@@ -1030,6 +1033,10 @@ char *version = g_strdup_printf(
   return version;
 }
 
+#ifdef HAVE_API
+static gboolean _api_running = FALSE;
+#endif
+
 int dt_init(int argc,
             char *argv[],
             const gboolean init_gui,
@@ -1083,6 +1090,11 @@ int dt_init(int argc,
   char *tmpdir_from_command = NULL;
   char *configdir_from_command = NULL;
   char *cachedir_from_command = NULL;
+#ifdef HAVE_API
+  // serve the darktable-api protocol from this window (src/api/server.c)
+  gboolean api_from_command = FALSE;
+  char *api_socket_from_command = NULL;
+#endif
   gboolean print_paths = FALSE;
   gboolean print_paths_as_flags = FALSE;
 
@@ -1166,6 +1178,20 @@ int dt_init(int argc,
         argv[k-1] = NULL;
         argv[k] = NULL;
       }
+#ifdef HAVE_API
+      else if(!strcmp(argv[k], "--api"))
+      {
+        api_from_command = TRUE;
+        argv[k] = NULL;
+      }
+      else if(!strcmp(argv[k], "--api-socket") && argc > k + 1)
+      {
+        api_from_command = TRUE;
+        api_socket_from_command = argv[++k];
+        argv[k-1] = NULL;
+        argv[k] = NULL;
+      }
+#endif
       else if(!strcmp(argv[k], "--print-paths"))
       {
         print_paths = TRUE;
@@ -1858,6 +1884,20 @@ int dt_init(int argc,
   // initialize datetime data
   dt_datetime_init();
 
+#ifdef HAVE_API
+  // a darktable-api engine may hold the library: have it hand over before
+  // opening the library, so this window gets the lock and its unsaved edits
+  gchar *api_socket = NULL;
+  if(api_from_command && init_gui)
+  {
+    char configdir[PATH_MAX] = { 0 };
+    dt_loc_get_user_config_dir(configdir, sizeof(configdir));
+    api_socket = api_socket_from_command ? g_strdup(api_socket_from_command)
+                                         : dt_api_default_socket(configdir);
+    dt_api_handover(api_socket);
+  }
+#endif
+
   // initialize the database
   dt_splash_screen_set_progress(_("opening image library"));
   darktable.db = dt_database_init(dbfilename_from_command, load_data, init_gui);
@@ -2277,6 +2317,28 @@ int dt_init(int argc,
   dt_capabilities_add("opencv");
 #endif
 
+#ifdef HAVE_API
+  if(api_socket)
+  {
+    // an engine that a client started during the hand-off gives up on the
+    // lock and leaves; wait a little for its socket to go
+    int fd = -1;
+    for(int tries = 0; tries < 20 && (fd = dt_api_listen(api_socket)) < 0; tries++)
+      g_usleep(250000);
+    if(fd >= 0)
+    {
+      const dt_api_options_t api_options = {
+        .listen_fd = fd, .socket_path = api_socket, .out_fd = -1,
+        .max_sessions = 3, .idle_exit_s = 0, .in_gui = TRUE, .quit = NULL };
+      dt_api_start(&api_options);
+      _api_running = TRUE;
+    }
+    else
+      dt_print(DT_DEBUG_ALWAYS, "[dt_init] the API server could not listen on %s", api_socket);
+    g_free(api_socket);
+  }
+#endif
+
   dt_print(DT_DEBUG_CONTROL,
            "[dt_init] startup took %f seconds", dt_get_wtime());
 
@@ -2329,6 +2391,12 @@ void dt_get_sysresource_level()
 void dt_cleanup()
 {
   const gboolean init_gui = (darktable.gui != NULL);
+
+#ifdef HAVE_API
+  // clients go first: they must not reach a library being closed
+  if(_api_running) dt_api_stop();
+  _api_running = FALSE;
+#endif
 
   dt_stop_backthumbs_crawler(TRUE);
   // must finish before the database is closed underneath it

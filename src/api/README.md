@@ -105,7 +105,7 @@ message.
 
 | method | does |
 |---|---|
-| `ping` | version |
+| `ping` | version, `server` (`engine` or `gui`) and `methods`: the methods this server has, and options added to a method later (`render.zoom`), so a client can check before calling |
 | `film_rolls` | film rolls with image counts |
 | `images_list {film_id, rating, label, offset, limit}` | images in folder/filename order with rating, reject, color labels; `rating` is `visible` (default), `all`, `rejected` or `1`..`5` (at least) |
 | `image_info {imgid}` | one image, as in `images_list` |
@@ -113,8 +113,9 @@ message.
 | `set_rating {imgid, rating}` / `set_label {imgid, label, on}` | 0..5 or `"reject"` (as the lighttable); color label 0..4 (red, yellow, green, blue, purple) |
 | `session_open {imgid, fresh}` / `session_close` | open a photo for editing: load it and replay its history, as the darkroom does, or join the session another client has open (`joined`, `unsaved` in the reply); `fresh` reloads it as saved, dropping unsaved changes for everyone. `session_close` closes it for everyone |
 | `module_list` | the photo's modules in pipe order: enabled, in history |
-| `module_get {operation, instance}` | settings by name through introspection: value, default, declared range, enum names and labels |
-| `module_set {operation, instance, values}` | change settings by name, all or none; range-checked; enums by name, label or number; switches the module on and adds a history item (consecutive edits of one module merge, as in the darkroom) |
+| `module_get {operation, instance}` | settings by name through introspection: value, default, declared range, enum names and labels; lists with their `shape` and nested values |
+| `module_set {operation, instance, values}` | change settings by name, all or none; range-checked; enums by name, label or number; lists of floats, bools or enums whole (nested arrays of their `shape`) or by element (`grey[1]`, `x[0][3]`); switches the module on and adds a history item (consecutive edits of one module merge, as in the darkroom) |
+| `preset_list {operation, instance}` / `preset_apply {operation, instance, name}` | the module's presets for its version (`name`, `label` as the menu shows it, `builtin`, `autoapply`); apply one by name or label as the presets menu does: settings, on/off, blending and the module's label, one history item |
 | `module_enable {operation, instance, enabled}` | module on/off |
 | `history_list`, `history_end {end}` | history items; undo/redo to a step (0 = original) |
 | `geometry_get` | orientation (`rotation` clockwise from the raw file, `mirrored`), straightening `angle` and `autocrop` (rotate and perspective), `crop` box (`left`, `top`, `right`, `bottom`, fractions of the uncropped image), `aspect`, and the uncropped (`frame_width`/`frame_height`) and final sizes |
@@ -122,7 +123,7 @@ message.
 | `save` | write the history to the library (and the sidecar, if `write_sidecar_files` asks for it), as leaving the darkroom does |
 | `reset` | discard the history and reload, so darktable applies the workflow defaults and auto-apply presets again |
 | `export {imgid, format, quality, max_width, max_height, high_quality, upscale, style, path, on_conflict, save}` | darktable's export of the image's saved edit through a format module, as the export module does: its settings (format, size, quality, output pattern `$(FILE_FOLDER)/darktable_exported/$(FILE_NAME)`, conflict handling, metadata, ICC profile) unless given; tags the image `darktable|exported`. Unsaved changes are refused unless `save` is true. Replies `file`, or `skipped` when `on_conflict` (`unique`, `overwrite`, `overwrite_if_changed`, `skip`) leaves an existing file alone. Runs on the request thread (darktable's window pauses while it exports) |
-| `render {width, height, path, quality, uncropped}` | sRGB JPEG fitted inside width x height; `uncropped` leaves crop's box out (as the darkroom shows the image while crop has the focus), to draw a box on |
+| `render {width, height, path, quality, uncropped, zoom, center_x, center_y}` | sRGB JPEG fitted inside width x height; `uncropped` leaves crop's box out (as the darkroom shows the image while crop has the focus), to draw a box on; `zoom` (1 = 100%, up to 2) renders the width x height region around `center_x`/`center_y` (fractions) at that scale, as the darkroom zoomed in, and replies its `region` |
 | `library_status` / `library_release` / `library_acquire` | hand the library to darktable's GUI and take it back while running; unsaved edits of every open photo are kept and restored if the photo wasn't changed meanwhile |
 | `shutdown` | close and exit (SIGTERM does the same) |
 
@@ -145,7 +146,7 @@ about 1/255 (mean absolute difference).
 
 - settings the GUI adjusts alongside a change (`gui_changed`), pickers and
   other operations whose logic lives in GUI code
-- array fields (e.g. channel mixer coefficients), masks, module instances
+- arrays of structs (curve nodes) and integer arrays, masks, module instances
   and order, styles, tags and metadata, import; export to storages other
   than disk
 - perspective correction (ashift's line detection and fitting); the

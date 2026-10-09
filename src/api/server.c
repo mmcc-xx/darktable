@@ -32,8 +32,9 @@
    image, at most --max-sessions, default 3), and each change is announced to
    the other clients as a notification {"method": "event", "params": {"type",
    "imgid", "history_end", "unsaved", "client"}} with type edit, saved,
-   reset, reopened, closed, image (rating/label), library_released or
-   library_acquired. --idle-exit stops the engine that many seconds after the
+   reset, reopened, closed, image (rating/label), library_released,
+   library_acquired, handover or (darktable's window) darkroom: the photo its
+   darkroom shows now, imgid 0 for none. --idle-exit stops the engine that many seconds after the
    last client left, unless an image has unsaved changes.
 
    the session methods (module_*, history_*, save, reset, render,
@@ -1050,6 +1051,13 @@ static gboolean _library_status(JsonBuilder *b, const dt_imgid_t current, gchar 
   json_builder_add_string_value(b, _released ? "released" : "owned");
   json_builder_set_member_name(b, "server");
   json_builder_add_string_value(b, _in_gui ? "gui" : "engine");
+  if(_in_gui)
+  {
+    // the photo the user has open in darktable's darkroom, 0 if none
+    const dt_imgid_t dr = _darkroom_image();
+    json_builder_set_member_name(b, "darkroom_imgid");
+    json_builder_add_int_value(b, dt_is_valid_imgid(dr) ? dr : 0);
+  }
   json_builder_set_member_name(b, "library");
   json_builder_add_string_value(b, _released ? _library_path : dt_database_get_path(darktable.db));
   if(_released)
@@ -2143,6 +2151,24 @@ static void _gui_history_cb(gpointer instance, gpointer user_data)
   _notify(NULL, "edit", imgid);
 }
 
+// tell the clients which photo the darkroom shows (event "darkroom", imgid
+// 0 when none) whenever that changes
+static dt_imgid_t _darkroom_seen = NO_IMGID;
+
+static void _darkroom_announce(void)
+{
+  const dt_imgid_t imgid = _darkroom_image();
+  if(imgid == _darkroom_seen) return;
+  _darkroom_seen = imgid;
+  _notify(NULL, "darkroom", dt_is_valid_imgid(imgid) ? imgid : 0);
+}
+
+static void _gui_view_cb(gpointer instance, gpointer old_view, gpointer new_view, gpointer user_data)
+{
+  _gui_gen++;
+  _darkroom_announce();
+}
+
 static void _gui_image_cb(gpointer instance, gpointer user_data)
 {
   _gui_gen++;
@@ -2157,6 +2183,7 @@ static void _gui_image_cb(gpointer instance, gpointer user_data)
     _session_close(s);
     if(dirty) _notify(NULL, "reopened", imgid);
   }
+  _darkroom_announce();
 }
 
 static void _gui_info_cb(gpointer instance, GList *imgs, gpointer user_data)
@@ -2234,6 +2261,7 @@ void dt_api_start(const dt_api_options_t *options)
     DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_HISTORY_CHANGE, _gui_history_cb, NULL);
     DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_IMAGE_CHANGED, _gui_image_cb, NULL);
     DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_IMAGE_INFO_CHANGED, _gui_info_cb, NULL);
+    DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_VIEWMANAGER_VIEW_CHANGED, _gui_view_cb, NULL);
   }
   // unsaved edits handed over by an engine (dt_api_handover) or kept by the
   // last server that stopped
@@ -2316,6 +2344,7 @@ gboolean dt_api_stop(void)
     DT_CONTROL_SIGNAL_DISCONNECT(_gui_history_cb, NULL);
     DT_CONTROL_SIGNAL_DISCONNECT(_gui_image_cb, NULL);
     DT_CONTROL_SIGNAL_DISCONNECT(_gui_info_cb, NULL);
+    DT_CONTROL_SIGNAL_DISCONNECT(_gui_view_cb, NULL);
     if(_gui_session.mirror) _session_free(_gui_session.mirror);
     _gui_session.mirror = NULL;
   }

@@ -65,6 +65,9 @@ library on that socket while its window is open, on GTK's main thread:
   undo is the history panel's undo; a change made in the window reaches the
   clients as an `edit` event (`client` 0). Renders of that image go through
   a copy reloaded from the darkroom's history when it changed;
+- `library_status` reports `darkroom_imgid`, the photo the darkroom shows
+  (0 if none), and clients get a `darkroom` event when that changes, so they
+  can follow the user;
 - other images get sessions as in the engine;
 - **automatic hand-off:** at startup, darktable asks an engine serving the
   same socket to hand over (`handover`: the engine releases the library,

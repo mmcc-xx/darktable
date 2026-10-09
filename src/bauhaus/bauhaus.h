@@ -206,6 +206,9 @@ void dt_bauhaus_widget_set_quad_paint(GtkWidget *widget,
                                       dt_bauhaus_quad_paint_f f,
                                       const int paint_flags,
                                       void *paint_data);
+// the quad's paint function, telling what the quad does (a color picker,
+// a wand), or NULL:
+dt_bauhaus_quad_paint_f dt_bauhaus_widget_get_quad_paint(GtkWidget *widget);
 // make this quad a toggle button:
 void dt_bauhaus_widget_set_quad_toggle(GtkWidget *widget,
                                        gboolean toggle);

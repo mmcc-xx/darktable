@@ -15,6 +15,8 @@ module versions; an older darktable can't read some of them.
 A web front end using it (library browsing, editing with live previews,
 handing the library to darktable's GUI and back):
 https://github.com/mmcc-xx/darktable-api-web
+An MCP server using it, for AI assistants:
+https://github.com/mmcc-xx/darktable-api-mcp
 
 This code was written with AI assistance (Claude), directed and reviewed by
 the branch owner.

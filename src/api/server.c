@@ -83,6 +83,16 @@
                                     item; enums by name, label or number;
                                     lists whole (nested arrays) or by
                                     element ("grey[1]", "x[0][3]")
+     coords {points, from, to}   -> maps [x, y] points between "raw" (drawn
+                                    mask space: the pipe's input, normalized),
+                                    "image" (the rendered image, fractions)
+                                    and "uncropped" (crop's input)
+     retouch_list                -> retouch's shapes: type, circle center,
+                                    radius and feather, source (raw space),
+                                    algorithm
+     retouch_heal {spots: [{x, y, r, sx, sy}]}
+                                 -> adds heal circles (raw space; r relative
+                                    to the shorter side) as one history item
      preset_list {operation, instance}
                                  -> the module's presets for its version:
                                     name, label, builtin, autoapply
@@ -169,6 +179,7 @@
 #include "develop/blend.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
+#include "develop/masks.h"
 #include "develop/pixelpipe_hb.h"
 #include "gui/presets.h"
 #include "imageio/imageio_jpeg.h"
@@ -1708,6 +1719,346 @@ static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
   return TRUE;
 }
 
+// ---- coordinates and retouch -----------------------------------------------
+// drawn masks and retouch shapes live in the pipe's input, normalized: x
+// times its width, y times its height, a circle's radius times the shorter
+// side (develop/masks/circle.c). clients see the image as rendered: these
+// map between the two through the pipe's distortions (lens, rotation,
+// crop...), as the darkroom does for the mouse
+
+// "raw": mask space; "image": fractions of the rendered image; "uncropped":
+// fractions of crop's input (render uncropped)
+static gboolean _coords(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  const char *from = params ? json_object_get_string_member_with_default(params, "from", "image") : "image";
+  const char *to = params ? json_object_get_string_member_with_default(params, "to", "raw") : "raw";
+  JsonArray *in = params && json_object_has_member(params, "points")
+                  && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "points"))
+                    ? json_object_get_array_member(params, "points") : NULL;
+  static const char *spaces[] = { "raw", "image", "uncropped", NULL };
+  int fs = -1, ts = -1;
+  for(int k = 0; spaces[k]; k++)
+  {
+    if(!g_strcmp0(from, spaces[k])) fs = k;
+    if(!g_strcmp0(to, spaces[k])) ts = k;
+  }
+  if(fs < 0 || ts < 0 || !in)
+  {
+    *err = g_strdup("coords needs points [[x, y], ...] and from/to: raw, image or uncropped");
+    return FALSE;
+  }
+  const guint n = json_array_get_length(in);
+  float *pts = g_new0(float, 2 * MAX(n, 1));
+  for(guint k = 0; k < n; k++)
+  {
+    JsonArray *p = JSON_NODE_HOLDS_ARRAY(json_array_get_element(in, k))
+                   ? json_array_get_array_element(in, k) : NULL;
+    if(!p || json_array_get_length(p) != 2)
+    {
+      g_free(pts);
+      *err = g_strdup_printf("point %u: needs [x, y]", k);
+      return FALSE;
+    }
+    pts[2 * k] = json_array_get_double_element(p, 0);
+    pts[2 * k + 1] = json_array_get_double_element(p, 1);
+  }
+  _session_t *s = _pipe_session(err);
+  if(!s)
+  {
+    g_free(pts);
+    return FALSE;
+  }
+  _pipe_sync(s);
+  // pixel sizes of the three spaces in this full-size pipe
+  const dt_dev_pixelpipe_iop_t *cp = _piece(s, "crop");
+  const double w[3] = { s->pipe.iwidth, s->pipe.processed_width, cp ? cp->buf_in.width : s->pipe.processed_width };
+  const double h[3] = { s->pipe.iheight, s->pipe.processed_height, cp ? cp->buf_in.height : s->pipe.processed_height };
+  const int crop_order = cp ? cp->module->iop_order : INT_MAX;
+  for(guint k = 0; k < n; k++)
+  {
+    pts[2 * k] *= w[fs];
+    pts[2 * k + 1] *= h[fs];
+  }
+  // to raw first, then out: uncropped stops before crop, image goes through
+  if(fs == 1)
+    dt_dev_distort_backtransform_plus(s->dev, &s->pipe, 0, DT_DEV_TRANSFORM_DIR_ALL, pts, n);
+  else if(fs == 2)
+    dt_dev_distort_backtransform_plus(s->dev, &s->pipe, crop_order, DT_DEV_TRANSFORM_DIR_BACK_EXCL, pts, n);
+  if(ts == 1)
+    dt_dev_distort_transform_plus(s->dev, &s->pipe, 0, DT_DEV_TRANSFORM_DIR_ALL, pts, n);
+  else if(ts == 2)
+    dt_dev_distort_transform_plus(s->dev, &s->pipe, crop_order, DT_DEV_TRANSFORM_DIR_BACK_EXCL, pts, n);
+  json_builder_set_member_name(b, "points");
+  json_builder_begin_array(b);
+  for(guint k = 0; k < n; k++)
+  {
+    json_builder_begin_array(b);
+    json_builder_add_double_value(b, pts[2 * k] / w[ts]);
+    json_builder_add_double_value(b, pts[2 * k + 1] / h[ts]);
+    json_builder_end_array(b);
+  }
+  json_builder_end_array(b);
+  // a length in raw space is a fraction of this many raw pixels
+  json_builder_set_member_name(b, "raw_width");
+  json_builder_add_int_value(b, s->pipe.iwidth);
+  json_builder_set_member_name(b, "raw_height");
+  json_builder_add_int_value(b, s->pipe.iheight);
+  g_free(pts);
+  return TRUE;
+}
+
+// a field of retouch's rt_forms[k] (array of structs: introspection gives
+// the first element's layout, dev-doc/introspection.md)
+static void *_rt_form_field(dt_iop_module_t *m, const int k, const char *name,
+                            dt_introspection_field_t **f)
+{
+  dt_introspection_field_t *forms = NULL;
+  for(dt_introspection_field_t *i = m->so->get_introspection_linear();
+      i && i->header.type != DT_INTROSPECTION_TYPE_NONE; i++)
+    if(!g_strcmp0(i->header.name, "rt_forms")) { forms = i; break; }
+  if(!forms) return NULL;
+  dt_introspection_field_t *elem = NULL;
+  void *p = dt_introspection_access_array(forms, (uint8_t *)m->params + forms->header.offset, k, &elem);
+  return dt_introspection_get_child(elem, p, name, f);
+}
+
+static int _rt_forms_count(dt_iop_module_t *m)
+{
+  for(dt_introspection_field_t *i = m->so->get_introspection_linear();
+      i && i->header.type != DT_INTROSPECTION_TYPE_NONE; i++)
+    if(!g_strcmp0(i->header.name, "rt_forms")) return i->Array.count;
+  return 0;
+}
+
+static int _enum_value(const dt_introspection_field_t *f, const char *name)
+{
+  for(const dt_introspection_type_enum_tuple_t *e = f->Enum.values; e && e->name; e++)
+    if(!g_strcmp0(e->name, name)) return e->value;
+  return -1;
+}
+
+// retouch's shapes: type, circle center/radius/source in raw space, and the
+// algorithm retouch applies to each
+static gboolean _retouch_list(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  dt_iop_module_t *m = dt_iop_get_module_by_op_priority(_cur->dev->iop, "retouch", 0);
+  if(!m)
+  {
+    *err = g_strdup("this darktable has no retouch module");
+    return FALSE;
+  }
+  json_builder_set_member_name(b, "enabled");
+  json_builder_add_boolean_value(b, m->enabled);
+  json_builder_set_member_name(b, "spots");
+  json_builder_begin_array(b);
+  dt_masks_form_t *grp = dt_masks_get_from_id(_cur->dev, m->blend_params->mask_id);
+  const int count = _rt_forms_count(m);
+  for(GList *l = grp && (grp->type & DT_MASKS_GROUP) ? grp->points : NULL; l; l = g_list_next(l))
+  {
+    const dt_masks_point_group_t *gp = l->data;
+    const dt_masks_form_t *form = dt_masks_get_from_id(_cur->dev, gp->formid);
+    if(!form) continue;
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "formid");
+    json_builder_add_int_value(b, gp->formid);
+    json_builder_set_member_name(b, "type");
+    json_builder_add_string_value(b, form->type & DT_MASKS_CIRCLE ? "circle" : form->type & DT_MASKS_ELLIPSE
+                                     ? "ellipse" : form->type & DT_MASKS_PATH ? "path" : form->type & DT_MASKS_BRUSH
+                                     ? "brush" : "other");
+    json_builder_set_member_name(b, "active");
+    json_builder_add_boolean_value(b, (gp->state & DT_MASKS_STATE_USE) != 0);
+    if((form->type & DT_MASKS_CIRCLE) && form->points)
+    {
+      const dt_masks_point_circle_t *c = form->points->data;
+      json_builder_set_member_name(b, "x");
+      json_builder_add_double_value(b, c->center[0]);
+      json_builder_set_member_name(b, "y");
+      json_builder_add_double_value(b, c->center[1]);
+      json_builder_set_member_name(b, "r");
+      json_builder_add_double_value(b, c->radius);
+      // the feather around it, in the same unit as r
+      json_builder_set_member_name(b, "border");
+      json_builder_add_double_value(b, c->border);
+    }
+    json_builder_set_member_name(b, "sx");
+    json_builder_add_double_value(b, form->source[0]);
+    json_builder_set_member_name(b, "sy");
+    json_builder_add_double_value(b, form->source[1]);
+    for(int k = 0; k < count; k++)
+    {
+      dt_introspection_field_t *f = NULL;
+      const dt_mask_id_t *id = _rt_form_field(m, k, "formid", &f);
+      if(!id || *id != gp->formid) continue;
+      const int *algo = _rt_form_field(m, k, "algorithm", &f);
+      if(algo)
+      {
+        json_builder_set_member_name(b, "algorithm");
+        _add_field_value(b, f, (const uint8_t *)algo - f->header.offset);
+      }
+      break;
+    }
+    json_builder_end_object(b);
+  }
+  json_builder_end_array(b);
+  return TRUE;
+}
+
+// heal circles in retouch, as clicking with its circle tool does: a clone
+// circle per spot with the user's circle feather, healing from its source,
+// all in one history step. in darktable's window, the darkroom's image goes
+// through the darkroom's own path (darkroom.c heal_spots, patched 5.6);
+// elsewhere retouch's window code isn't there to list new forms in its
+// params (rt_resynch_params), so that is done here
+static gboolean _retouch_heal(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  dt_develop_t *dev = _cur->dev;
+  dt_iop_module_t *m = dt_iop_get_module_by_op_priority(dev->iop, "retouch", 0);
+  if(!m)
+  {
+    *err = g_strdup("this darktable has no retouch module");
+    return FALSE;
+  }
+  JsonArray *spots = params && json_object_has_member(params, "spots")
+                     && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "spots"))
+                       ? json_object_get_array_member(params, "spots") : NULL;
+  const guint n = spots ? json_array_get_length(spots) : 0;
+  if(!n)
+  {
+    *err = g_strdup("retouch_heal needs spots [{x, y, r, sx, sy}] in raw space (coords)");
+    return FALSE;
+  }
+  float (*v)[5] = g_malloc0_n(n, sizeof(*v));
+  static const char *keys[5] = { "x", "y", "r", "sx", "sy" };
+  for(guint i = 0; i < n; i++)
+  {
+    JsonObject *o = JSON_NODE_HOLDS_OBJECT(json_array_get_element(spots, i))
+                    ? json_array_get_object_element(spots, i) : NULL;
+    gboolean ok = o != NULL;
+    for(int k = 0; ok && k < 5; k++)
+    {
+      JsonNode *x = json_object_get_member(o, keys[k]);
+      ok = x && JSON_NODE_HOLDS_VALUE(x)
+           && (json_node_get_value_type(x) == G_TYPE_DOUBLE || json_node_get_value_type(x) == G_TYPE_INT64);
+      if(ok) v[i][k] = json_node_get_double(x);
+    }
+    ok = ok && v[i][0] >= 0.f && v[i][0] <= 1.f && v[i][1] >= 0.f && v[i][1] <= 1.f
+            && v[i][2] > 0.f && v[i][2] < 0.5f
+            && v[i][3] >= 0.f && v[i][3] <= 1.f && v[i][4] >= 0.f && v[i][4] <= 1.f;
+    if(!ok)
+    {
+      g_free(v);
+      *err = g_strdup_printf("spot %u: needs x, y, sx, sy in 0..1 and r in 0..0.5 (raw space)", i);
+      return FALSE;
+    }
+  }
+  const int count = _rt_forms_count(m);
+  int used = 0;
+  for(int k = 0; k < count; k++)
+  {
+    dt_introspection_field_t *f = NULL;
+    const dt_mask_id_t *id = _rt_form_field(m, k, "formid", &f);
+    if(id && *id) used++;
+  }
+  if(used + (int)n > count)
+  {
+    g_free(v);
+    *err = g_strdup_printf("retouch holds at most %d shapes; it has %d", count, used);
+    return FALSE;
+  }
+
+  dt_introspection_field_t *af = _field(m, "algorithm");
+  const int heal = af ? _enum_value(af, "DT_IOP_RETOUCH_HEAL") : -1;
+  const float border = dt_conf_get_float("plugins/darkroom/spots/circle_border");
+  if(_cur->gui)
+  {
+    _api_editing = TRUE;
+    dt_dev_undo_start_record(dev);
+  }
+  // in the window, a history item of its own, so the spots don't merge into
+  // a retouch step on top of the history (as heal_spots does)
+  if(_cur->gui) dt_dev_add_new_history_item(dev, m, TRUE);
+  if(af && heal >= 0) _set_num(af, (uint8_t *)m->params + af->header.offset, heal);
+  JsonBuilder *ids = json_builder_new();
+  json_builder_begin_array(ids);
+  for(guint i = 0; i < n; i++)
+  {
+    dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE | DT_MASKS_CLONE);
+    dt_masks_point_circle_t *circle = malloc(sizeof(dt_masks_point_circle_t));
+    circle->center[0] = v[i][0];
+    circle->center[1] = v[i][1];
+    circle->radius = v[i][2];
+    circle->border = border;
+    form->points = g_list_append(form->points, circle);
+    form->source[0] = v[i][3];
+    form->source[1] = v[i][4];
+    dt_masks_gui_form_save_creation(dev, m, form, NULL);
+    json_builder_add_int_value(ids, form->formid);
+    if(!_cur->gui)
+    {
+      // rt_resynch_params for the new form: retouch's current scale,
+      // healing, distortion mode 2
+      for(int k = 0; k < count; k++)
+      {
+        dt_introspection_field_t *f = NULL;
+        dt_mask_id_t *id = _rt_form_field(m, k, "formid", &f);
+        if(!id || *id) continue;
+        *id = form->formid;
+        int *scale = _rt_form_field(m, k, "scale", &f);
+        const int *curr = m->get_p(m->params, "curr_scale");
+        if(scale && curr) *scale = *curr;
+        int *algo = _rt_form_field(m, k, "algorithm", &f);
+        if(algo && heal >= 0) *algo = heal;
+        int *mode = _rt_form_field(m, k, "distort_mode", &f);
+        if(mode) *mode = 2;
+        break;
+      }
+    }
+  }
+  json_builder_end_array(ids);
+  g_free(v);
+  if(_cur->gui)
+  {
+    dt_masks_iop_update(m);         // retouch lists the new forms (rt_resynch_params)
+    dt_dev_add_history_item(dev, m, TRUE);
+    dt_dev_undo_end_record(dev);
+    _api_editing = FALSE;
+    _gui_changed_by_api();
+  }
+  else
+  {
+    m->enabled = TRUE;
+    // a history item carrying the new forms; no_image, as _record: a
+    // session has no darkroom pipes for it to flag (develop.c marks
+    // dev->full.pipe and preview_pipe), its own pipe is synced on render
+    dt_dev_add_masks_history_item_ext(dev, m, TRUE, TRUE);
+    _cur->pipe_changed = TRUE;
+    _cur->dirty = TRUE;
+  }
+  json_builder_set_member_name(b, "added");
+  json_builder_add_int_value(b, n);
+  json_builder_set_member_name(b, "formids");
+  json_builder_add_value(b, json_builder_get_root(ids));
+  g_object_unref(ids);
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, dev->history_end);
+  return TRUE;
+}
+
 // ---- export ----------------------------------------------------------------
 // darktable's export: the disk storage and a format module, with the export
 // module's settings (libs/export.c) unless the request overrides them, as
@@ -2986,13 +3337,15 @@ static const char *_methods[] = {
   "ping", "film_rolls", "images_list", "image_info", "thumbnail", "set_rating", "set_label",
   "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
   "module_enable", "preset_list", "preset_apply", "history_list", "history_end", "geometry_get",
-  "geometry_set", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
+  "geometry_set", "coords", "retouch_list", "retouch_heal", "save", "reset", "render", "render.uncropped",
+  "render.zoom", "export",
   "library_status", "library_release", "library_acquire", "handover", "shutdown", NULL };
 
 // methods that work on an edit session, and the event each one sends
 static const struct { const char *method; const char *event; } _session_methods[] = {
   { "module_list", NULL }, { "module_get", NULL }, { "history_list", NULL }, { "render", NULL },
   { "geometry_get", NULL }, { "preset_list", NULL }, { "preset_apply", "edit" },
+  { "coords", NULL }, { "retouch_list", NULL }, { "retouch_heal", "edit" },
   { "module_set", "edit" }, { "module_enable", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" },
   { "save", "saved" }, { "reset", "reset" }, { "session_close", "closed" }, { NULL, NULL } };
 
@@ -3124,6 +3477,12 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _preset_list(params, b, &err);
   else if(!g_strcmp0(method, "preset_apply"))
     _preset_apply(params, b, &err);
+  else if(!g_strcmp0(method, "coords"))
+    _coords(params, b, &err);
+  else if(!g_strcmp0(method, "retouch_list"))
+    _retouch_list(params, b, &err);
+  else if(!g_strcmp0(method, "retouch_heal"))
+    _retouch_heal(params, b, &err);
   else if(!g_strcmp0(method, "geometry_get"))
     _geometry_get(b, &err);
   else if(!g_strcmp0(method, "geometry_set"))

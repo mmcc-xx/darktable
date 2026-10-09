@@ -115,6 +115,9 @@ message.
 | `module_list` | the photo's modules in pipe order: enabled, in history |
 | `module_get {operation, instance}` | settings by name through introspection: value, default, declared range, enum names and labels; lists with their `shape` and nested values |
 | `module_set {operation, instance, values}` | change settings by name, all or none; range-checked; enums by name, label or number; lists of floats, bools or enums whole (nested arrays of their `shape`) or by element (`grey[1]`, `x[0][3]`); switches the module on and adds a history item (consecutive edits of one module merge, as in the darkroom) |
+| `coords {points, from, to}` | map `[x, y]` points between `raw` (drawn-mask space: the pipe's input, normalized; circle radii are relative to its shorter side), `image` (the rendered image, fractions) and `uncropped` (crop's input), through the pipe's distortions (lens, rotation, crop) as the darkroom maps the mouse |
+| `retouch_list` | retouch's shapes: type, active, circle center, radius and feather, heal source (raw space), algorithm |
+| `retouch_heal {spots: [{x, y, r, sx, sy}]}` | add heal circles in raw space as one history item, as clicking with retouch's circle tool (feather from the user's circle border setting); in darktable's window the darkroom's photo goes through the darkroom's own path |
 | `preset_list {operation, instance}` / `preset_apply {operation, instance, name}` | the module's presets for its version (`name`, `label` as the menu shows it, `builtin`, `autoapply`); apply one by name or label as the presets menu does: settings, on/off, blending and the module's label, one history item |
 | `module_enable {operation, instance, enabled}` | module on/off |
 | `history_list`, `history_end {end}` | history items; undo/redo to a step (0 = original) |
@@ -146,7 +149,8 @@ about 1/255 (mean absolute difference).
 
 - settings the GUI adjusts alongside a change (`gui_changed`), pickers and
   other operations whose logic lives in GUI code
-- arrays of structs (curve nodes) and integer arrays, masks, module instances
+- arrays of structs (curve nodes) and integer arrays, drawn masks other than
+  retouch's heal circles, module instances
   and order, styles, tags and metadata, import; export to storages other
   than disk
 - perspective correction (ashift's line detection and fitting); the

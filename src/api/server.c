@@ -93,6 +93,27 @@
      retouch_heal {spots: [{x, y, r, sx, sy}]}
                                  -> adds heal circles (raw space; r relative
                                     to the shorter side) as one history item
+     blend_get / blend_set {operation, instance, values}
+                                 -> a module's blending in the darkroom's
+                                    names and units: masks, blend_mode,
+                                    reverse, opacity, blend_parameter,
+                                    feathering_radius, blur_radius,
+                                    brightness, contrast, details, combine,
+                                    feathering_guide, parametric ranges per
+                                    channel ("g_in": {range, inverted,
+                                    boost}); all or none, one history item
+     mask_add {operation, instance, shape, combine, inverted}
+                                 -> a drawn shape (circle, ellipse, gradient,
+                                    raw space) on a module's mask
+     mask_list / mask_remove {operation, instance, formid}
+                                 -> the module's shapes; take one out
+     sample {width, height, zoom, center_x, center_y, uncropped, points,
+             radius, boxes, bins}
+                                 -> renders as render does and reads the
+                                    output: sRGB and Lab at points (fractions
+                                    of the image, averaged over radius
+                                    pixels) and in boxes, R/G/B/luminance
+                                    histograms, clipped fractions
      preset_list {operation, instance}
                                  -> the module's presets for its version:
                                     name, label, builtin, autoapply
@@ -2059,6 +2080,631 @@ static gboolean _retouch_heal(JsonObject *params, JsonBuilder *b, gchar **err)
   return TRUE;
 }
 
+// ---- blending and masks -----------------------------------------------------
+// a module's blending: how its output mixes with its input (blend mode,
+// opacity) and where (drawn shapes, parametric ranges per channel), as the
+// blending section under each module in the darkroom. settings use the
+// darkroom's names and units (develop/blend_gui.c)
+
+// the name of an enum value from darktable's tables, without a "context|"
+static const char *_enum_label(const dt_introspection_type_enum_tuple_t *t, const int v)
+{
+  for(; t && t->name; t++)
+    if(t->value == v)
+    {
+      const char *bar = strchr(t->name, '|');
+      return bar ? bar + 1 : t->name;
+    }
+  return NULL;
+}
+
+static gboolean _enum_parse(const dt_introspection_type_enum_tuple_t *t, const char *name, int *v)
+{
+  for(; t && t->name; t++)
+  {
+    const char *bar = strchr(t->name, '|');
+    if(!g_ascii_strcasecmp(bar ? bar + 1 : t->name, name))
+    {
+      *v = t->value;
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+// the masking choices of the blending section's tabs
+static const struct { const char *name; uint32_t mode; } _mask_modes[] = {
+  { "off", DEVELOP_MASK_DISABLED },
+  { "uniform", DEVELOP_MASK_ENABLED },
+  { "drawn", DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK },
+  { "parametric", DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL },
+  { "drawn & parametric", DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK | DEVELOP_MASK_CONDITIONAL },
+  { "raster", DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER },
+  { NULL, 0 } };
+
+// the float settings: name, offset, the slider's range
+static const struct { const char *name; size_t offset; float lo, hi; } _blend_floats[] = {
+  { "opacity", G_STRUCT_OFFSET(dt_develop_blend_params_t, opacity), 0.f, 100.f },
+  { "blend_parameter", G_STRUCT_OFFSET(dt_develop_blend_params_t, blend_parameter), -18.f, 18.f },
+  { "feathering_radius", G_STRUCT_OFFSET(dt_develop_blend_params_t, feathering_radius), 0.f, 250.f },
+  { "blur_radius", G_STRUCT_OFFSET(dt_develop_blend_params_t, blur_radius), 0.f, 100.f },
+  { "brightness", G_STRUCT_OFFSET(dt_develop_blend_params_t, brightness), -1.f, 1.f },
+  { "contrast", G_STRUCT_OFFSET(dt_develop_blend_params_t, contrast), -1.f, 1.f },
+  { "details", G_STRUCT_OFFSET(dt_develop_blend_params_t, details), -1.f, 1.f },
+  { NULL, 0, 0.f, 0.f } };
+
+// parametric channels of each blending color space, as the blending tabs
+// list them (blend_gui.c: Lab_channels, rgb_channels, rgbj_channels); kind
+// is how the darkroom shows a value: percent, Lab a/b, hue in degrees.
+// boost_offset: the boost slider shows the stored boost minus this
+enum { _PCT, _AB, _HUE };
+typedef struct _channel_t { const char *name; int index; int kind; gboolean boost; float boost_offset; } _channel_t;
+static const _channel_t _lab_channels[] = {
+  { "L", DEVELOP_BLENDIF_L_in, _PCT, TRUE, 0.f }, { "a", DEVELOP_BLENDIF_A_in, _AB, TRUE, 0.f },
+  { "b", DEVELOP_BLENDIF_B_in, _AB, TRUE, 0.f }, { "C", DEVELOP_BLENDIF_C_in, _PCT, TRUE, 0.f },
+  { "h", DEVELOP_BLENDIF_h_in, _HUE, FALSE, 0.f }, { NULL } };
+static const _channel_t _rgb_channels[] = {
+  { "g", DEVELOP_BLENDIF_GRAY_in, _PCT, TRUE, 0.f }, { "R", DEVELOP_BLENDIF_RED_in, _PCT, TRUE, 0.f },
+  { "G", DEVELOP_BLENDIF_GREEN_in, _PCT, TRUE, 0.f }, { "B", DEVELOP_BLENDIF_BLUE_in, _PCT, TRUE, 0.f },
+  { "H", DEVELOP_BLENDIF_H_in, _HUE, FALSE, 0.f }, { "S", DEVELOP_BLENDIF_S_in, _PCT, FALSE, 0.f },
+  { "l", DEVELOP_BLENDIF_l_in, _PCT, FALSE, 0.f }, { NULL } };
+static const _channel_t _rgbj_channels[] = {
+  { "g", DEVELOP_BLENDIF_GRAY_in, _PCT, TRUE, 0.f }, { "R", DEVELOP_BLENDIF_RED_in, _PCT, TRUE, 0.f },
+  { "G", DEVELOP_BLENDIF_GREEN_in, _PCT, TRUE, 0.f }, { "B", DEVELOP_BLENDIF_BLUE_in, _PCT, TRUE, 0.f },
+  { "Jz", DEVELOP_BLENDIF_Jz_in, _PCT, TRUE, -6.64385619f }, { "Cz", DEVELOP_BLENDIF_Cz_in, _PCT, TRUE, -6.64385619f },
+  { "hz", DEVELOP_BLENDIF_hz_in, _HUE, FALSE, 0.f }, { NULL } };
+
+static const _channel_t *_channels_of(const dt_develop_blend_params_t *bp)
+{
+  switch(bp->blend_cst)
+  {
+    case DEVELOP_BLEND_CS_LAB: return _lab_channels;
+    case DEVELOP_BLEND_CS_RGB_DISPLAY: return _rgb_channels;
+    case DEVELOP_BLEND_CS_RGB_SCENE: return _rgbj_channels;
+    default: return NULL;
+  }
+}
+
+static double _to_display(const _channel_t *c, const double v, const double boost)
+{
+  return c->kind == _HUE ? v * 360.0 : c->kind == _AB ? (v * 256.0 - 128.0) * boost : v * boost * 100.0;
+}
+
+static double _from_display(const _channel_t *c, const double d, const double boost)
+{
+  return c->kind == _HUE ? d / 360.0 : c->kind == _AB ? (d / boost + 128.0) / 256.0 : d / boost / 100.0;
+}
+
+static dt_iop_module_t *_blend_module(JsonObject *params, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return NULL;
+  }
+  dt_iop_module_t *m = _find_module(params, err);
+  if(!m) return NULL;
+  if(!(m->flags() & IOP_FLAGS_SUPPORTS_BLENDING) || !m->blend_params || !_channels_of(m->blend_params))
+  {
+    *err = g_strdup_printf("module '%s' has no blending", m->op);
+    return NULL;
+  }
+  return m;
+}
+
+static void _add_blend(JsonBuilder *b, const dt_iop_module_t *m)
+{
+  const dt_develop_blend_params_t *bp = m->blend_params;
+  json_builder_set_member_name(b, "colorspace");
+  json_builder_add_string_value(b, _enum_label(dt_develop_blend_colorspace_names, bp->blend_cst));
+  json_builder_set_member_name(b, "masks");
+  const char *mode = "other";
+  for(int k = 0; _mask_modes[k].name; k++)
+    if(_mask_modes[k].mode == (bp->mask_mode & (DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK
+                                                | DEVELOP_MASK_CONDITIONAL | DEVELOP_MASK_RASTER)))
+      mode = _mask_modes[k].name;
+  json_builder_add_string_value(b, mode);
+  json_builder_set_member_name(b, "blend_mode");
+  const char *bm = _enum_label(dt_develop_blend_mode_names, bp->blend_mode & DEVELOP_BLEND_MODE_MASK);
+  json_builder_add_string_value(b, bm ? bm : "other");
+  json_builder_set_member_name(b, "reverse");
+  json_builder_add_boolean_value(b, (bp->blend_mode & DEVELOP_BLEND_REVERSE) != 0);
+  for(int k = 0; _blend_floats[k].name; k++)
+  {
+    json_builder_set_member_name(b, _blend_floats[k].name);
+    json_builder_add_double_value(b, *(const float *)((const uint8_t *)bp + _blend_floats[k].offset));
+  }
+  json_builder_set_member_name(b, "combine");
+  const char *cm = _enum_label(dt_develop_combine_masks_names,
+                               bp->mask_combine & (DEVELOP_COMBINE_INV | DEVELOP_COMBINE_INCL));
+  json_builder_add_string_value(b, cm ? cm : "other");
+  json_builder_set_member_name(b, "feathering_guide");
+  const char *fg = _enum_label(dt_develop_feathering_guide_names, bp->feathering_guide);
+  json_builder_add_string_value(b, fg ? fg : "other");
+  json_builder_set_member_name(b, "drawn_shapes");
+  dt_masks_form_t *grp = dt_masks_get_from_id(_cur->dev, bp->mask_id);
+  json_builder_add_int_value(b, grp && (grp->type & DT_MASKS_GROUP) ? g_list_length(grp->points) : 0);
+
+  // parametric ranges: [low end, low full, high full, high end] per channel
+  // in the darkroom's units, for the module's input ("_in") and output
+  // ("_out"); only channels that are on
+  json_builder_set_member_name(b, "parametric");
+  json_builder_begin_object(b);
+  for(const _channel_t *c = _channels_of(bp); c->name; c++)
+    for(int out = 0; out < 2; out++)
+    {
+      const int idx = c->index + 4 * out;
+      if(!(bp->blendif & (1u << idx))) continue;
+      gchar *key = g_strdup_printf("%s_%s", c->name, out ? "out" : "in");
+      const double boost = exp2(bp->blendif_boost_factors[idx]);
+      json_builder_set_member_name(b, key);
+      json_builder_begin_object(b);
+      json_builder_set_member_name(b, "range");
+      json_builder_begin_array(b);
+      for(int k = 0; k < 4; k++)
+        json_builder_add_double_value(b, round(_to_display(c, bp->blendif_parameters[4 * idx + k], boost) * 1e3) / 1e3);
+      json_builder_end_array(b);
+      json_builder_set_member_name(b, "inverted");
+      json_builder_add_boolean_value(b, (bp->blendif & (1u << (idx + 16))) != 0);
+      if(c->boost)
+      {
+        json_builder_set_member_name(b, "boost");
+        json_builder_add_double_value(b, bp->blendif_boost_factors[idx] - c->boost_offset);
+      }
+      json_builder_end_object(b);
+      g_free(key);
+    }
+  json_builder_end_object(b);
+  json_builder_set_member_name(b, "channels");
+  json_builder_begin_array(b);
+  for(const _channel_t *c = _channels_of(bp); c->name; c++) json_builder_add_string_value(b, c->name);
+  json_builder_end_array(b);
+}
+
+static gboolean _blend_get(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_iop_module_t *m = _blend_module(params, err);
+  if(!m) return FALSE;
+  json_builder_set_member_name(b, "operation");
+  json_builder_add_string_value(b, m->op);
+  json_builder_set_member_name(b, "instance");
+  json_builder_add_int_value(b, m->multi_priority);
+  _add_blend(b, m);
+  return TRUE;
+}
+
+// change blending settings, all or none: masks, blend_mode, reverse, the
+// float settings, combine, feathering_guide, and parametric: {"g_in":
+// {"range": [4 values], "inverted", "boost"} or null to switch it off}.
+// parametric ranges switch parametric masking on, as the darkroom's tab does
+static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_iop_module_t *m = _blend_module(params, err);
+  if(!m) return FALSE;
+  JsonObject *values = params && json_object_has_member(params, "values")
+                       && JSON_NODE_HOLDS_OBJECT(json_object_get_member(params, "values"))
+                         ? json_object_get_object_member(params, "values") : NULL;
+  if(!values || !json_object_get_size(values))
+  {
+    *err = g_strdup("blend_set needs values {setting: value}");
+    return FALSE;
+  }
+  dt_develop_blend_params_t bp = *m->blend_params;
+  gboolean parametric = FALSE, ok = TRUE;
+  GList *names = json_object_get_members(values);
+  for(GList *n = names; n && ok; n = g_list_next(n))
+  {
+    const char *name = n->data;
+    JsonNode *v = json_object_get_member(values, name);
+    const gboolean is_str = JSON_NODE_HOLDS_VALUE(v) && json_node_get_value_type(v) == G_TYPE_STRING;
+    const gboolean is_num = JSON_NODE_HOLDS_VALUE(v) && (json_node_get_value_type(v) == G_TYPE_DOUBLE
+                                                        || json_node_get_value_type(v) == G_TYPE_INT64);
+    int e = 0, f = -1;
+    for(int k = 0; _blend_floats[k].name; k++)
+      if(!g_strcmp0(name, _blend_floats[k].name)) f = k;
+    if(f >= 0)
+    {
+      const double x = is_num ? json_node_get_double(v) : NAN;
+      if(!(x >= _blend_floats[f].lo && x <= _blend_floats[f].hi))
+      {
+        *err = g_strdup_printf("'%s': a number in %g..%g", name, _blend_floats[f].lo, _blend_floats[f].hi);
+        ok = FALSE;
+      }
+      else
+        *(float *)((uint8_t *)&bp + _blend_floats[f].offset) = x;
+    }
+    else if(!g_strcmp0(name, "masks"))
+    {
+      int k = 0;
+      while(_mask_modes[k].name && !(is_str && !g_ascii_strcasecmp(json_node_get_string(v), _mask_modes[k].name))) k++;
+      if(!_mask_modes[k].name)
+      {
+        *err = g_strdup("'masks': off, uniform, drawn, parametric, drawn & parametric or raster");
+        ok = FALSE;
+      }
+      else
+        bp.mask_mode = (bp.mask_mode & ~(DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK | DEVELOP_MASK_CONDITIONAL
+                                         | DEVELOP_MASK_RASTER)) | _mask_modes[k].mode;
+    }
+    else if(!g_strcmp0(name, "blend_mode"))
+    {
+      if(!(is_str && _enum_parse(dt_develop_blend_mode_names, json_node_get_string(v), &e)))
+      {
+        *err = g_strdup("'blend_mode': a blend mode name, e.g. normal, multiply, lighten, darken");
+        ok = FALSE;
+      }
+      else
+        bp.blend_mode = (bp.blend_mode & DEVELOP_BLEND_REVERSE) | e;
+    }
+    else if(!g_strcmp0(name, "reverse"))
+    {
+      if(!(JSON_NODE_HOLDS_VALUE(v) && json_node_get_value_type(v) == G_TYPE_BOOLEAN))
+      {
+        *err = g_strdup("'reverse': true or false");
+        ok = FALSE;
+      }
+      else
+        bp.blend_mode = json_node_get_boolean(v) ? bp.blend_mode | DEVELOP_BLEND_REVERSE
+                                                 : bp.blend_mode & ~DEVELOP_BLEND_REVERSE;
+    }
+    else if(!g_strcmp0(name, "combine"))
+    {
+      if(!(is_str && _enum_parse(dt_develop_combine_masks_names, json_node_get_string(v), &e)))
+      {
+        *err = g_strdup("'combine': exclusive, inclusive, exclusive & inverted or inclusive & inverted");
+        ok = FALSE;
+      }
+      else
+        bp.mask_combine = (bp.mask_combine & ~(DEVELOP_COMBINE_INV | DEVELOP_COMBINE_INCL)) | e;
+    }
+    else if(!g_strcmp0(name, "feathering_guide"))
+    {
+      if(!(is_str && _enum_parse(dt_develop_feathering_guide_names, json_node_get_string(v), &e)))
+      {
+        *err = g_strdup("'feathering_guide': output before blur, input before blur, output after blur"
+                        " or input after blur");
+        ok = FALSE;
+      }
+      else
+        bp.feathering_guide = e;
+    }
+    else if(!g_strcmp0(name, "parametric") && JSON_NODE_HOLDS_OBJECT(v))
+    {
+      JsonObject *chs = json_node_get_object(v);
+      GList *keys = json_object_get_members(chs);
+      for(GList *kk = keys; kk && ok; kk = g_list_next(kk))
+      {
+        const char *key = kk->data;
+        const char *us = strrchr(key, '_');
+        const _channel_t *c = NULL;
+        const int out = us && !g_strcmp0(us, "_out");
+        if(us && (out || !g_strcmp0(us, "_in")))
+          for(const _channel_t *t = _channels_of(&bp); t->name; t++)
+            if(strlen(t->name) == (size_t)(us - key) && !strncmp(t->name, key, us - key)) c = t;
+        if(!c)
+        {
+          GString *list = g_string_new(NULL);
+          for(const _channel_t *t = _channels_of(&bp); t->name; t++)
+            g_string_append_printf(list, "%s%s_in, %s_out", list->len ? ", " : "", t->name, t->name);
+          *err = g_strdup_printf("parametric: no channel '%s' in this module (%s)", key, list->str);
+          g_string_free(list, TRUE);
+          ok = FALSE;
+          break;
+        }
+        const int idx = c->index + 4 * out;
+        JsonNode *cv = json_object_get_member(chs, key);
+        if(JSON_NODE_HOLDS_NULL(cv))
+        {
+          bp.blendif &= ~((1u << idx) | (1u << (idx + 16)));
+          continue;
+        }
+        JsonObject *co = JSON_NODE_HOLDS_OBJECT(cv) ? json_node_get_object(cv) : NULL;
+        if(co && json_object_has_member(co, "boost"))
+        {
+          if(!c->boost)
+          {
+            *err = g_strdup_printf("parametric '%s': this channel has no boost", key);
+            ok = FALSE;
+            break;
+          }
+          const double boost = json_object_get_double_member(co, "boost");
+          if(!(boost >= 0.0 && boost <= 18.0))
+          {
+            *err = g_strdup_printf("parametric '%s': boost is 0..18 EV", key);
+            ok = FALSE;
+            break;
+          }
+          bp.blendif_boost_factors[idx] = boost + c->boost_offset;
+        }
+        JsonArray *range = co && json_object_has_member(co, "range")
+                           && JSON_NODE_HOLDS_ARRAY(json_object_get_member(co, "range"))
+                             ? json_object_get_array_member(co, "range") : NULL;
+        if(co && json_object_has_member(co, "range") && (!range || json_array_get_length(range) != 4))
+        {
+          *err = g_strdup_printf("parametric '%s': range is 4 numbers, in the darkroom's units", key);
+          ok = FALSE;
+          break;
+        }
+        if(range)
+        {
+          const double boostf = exp2(bp.blendif_boost_factors[idx]);
+          float r[4];
+          for(int k = 0; k < 4; k++)
+            r[k] = CLAMP(_from_display(c, json_array_get_double_element(range, k), boostf), 0.0, 1.0);
+          if(r[0] > r[1] || r[1] > r[2] || r[2] > r[3])
+          {
+            *err = g_strdup_printf("parametric '%s': range must not decrease", key);
+            ok = FALSE;
+            break;
+          }
+          memcpy(&bp.blendif_parameters[4 * idx], r, sizeof(r));
+        }
+        if(!co)
+        {
+          *err = g_strdup_printf("parametric '%s': {range, inverted, boost} or null", key);
+          ok = FALSE;
+          break;
+        }
+        bp.blendif |= 1u << idx;
+        if(json_object_has_member(co, "inverted"))
+        {
+          if(json_object_get_boolean_member(co, "inverted")) bp.blendif |= 1u << (idx + 16);
+          else bp.blendif &= ~(1u << (idx + 16));
+        }
+        parametric = TRUE;
+      }
+      g_list_free(keys);
+    }
+    else
+    {
+      *err = g_strdup_printf("blend_set: no setting '%s' (masks, blend_mode, reverse, opacity,"
+                             " blend_parameter, feathering_radius, blur_radius, brightness, contrast, details,"
+                             " combine, feathering_guide, parametric)", name);
+      ok = FALSE;
+    }
+  }
+  g_list_free(names);
+  if(!ok) return FALSE;
+  // ranges set: the parametric tab is on, keeping drawn shapes if any
+  if(parametric && !(bp.mask_mode & DEVELOP_MASK_CONDITIONAL))
+    bp.mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL | (bp.mask_mode & DEVELOP_MASK_MASK);
+  *m->blend_params = bp;
+  _record(m, TRUE);
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, _cur->dev->history_end);
+  _add_blend(b, m);
+  return TRUE;
+}
+
+// drawn shapes on a module (not retouch's, which retouch_heal makes): one
+// shape per call in raw space (coords), as drawing it in the darkroom does.
+// combine: how it joins the shapes before it (union, intersection,
+// difference, exclusion)
+static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_iop_module_t *m = _blend_module(params, err);
+  if(!m) return FALSE;
+  if(m->flags() & IOP_FLAGS_NO_MASKS)
+  {
+    *err = g_strdup_printf("module '%s' takes no drawn masks (retouch: retouch_heal)", m->op);
+    return FALSE;
+  }
+  JsonObject *sh = params && json_object_has_member(params, "shape")
+                   && JSON_NODE_HOLDS_OBJECT(json_object_get_member(params, "shape"))
+                     ? json_object_get_object_member(params, "shape") : NULL;
+  const char *type = sh ? json_object_get_string_member_with_default(sh, "type", "") : "";
+  const char *combine = params ? json_object_get_string_member_with_default(params, "combine", "union") : "union";
+  const gboolean inverted = params ? json_object_get_boolean_member_with_default(params, "inverted", FALSE) : FALSE;
+  static const struct { const char *name; int state; } ops[] = {
+    { "union", DT_MASKS_STATE_UNION }, { "intersection", DT_MASKS_STATE_INTERSECTION },
+    { "difference", DT_MASKS_STATE_DIFFERENCE }, { "exclusion", DT_MASKS_STATE_EXCLUSION }, { NULL, 0 } };
+  int op = -1;
+  for(int k = 0; ops[k].name; k++)
+    if(!g_ascii_strcasecmp(combine, ops[k].name)) op = ops[k].state;
+  if(op < 0)
+  {
+    *err = g_strdup("combine: union, intersection, difference or exclusion");
+    return FALSE;
+  }
+#define _NUM(o, k, d) json_object_get_double_member_with_default((o), (k), (d))
+  dt_masks_form_t *form = NULL;
+  const double x = sh ? _NUM(sh, "x", -1) : -1, y = sh ? _NUM(sh, "y", -1) : -1;
+  if(!(x >= 0.0 && x <= 1.0 && y >= 0.0 && y <= 1.0))
+  {
+    *err = g_strdup("shape needs type (circle, ellipse, gradient) and x, y in 0..1 (raw space, coords)");
+    return FALSE;
+  }
+  if(!g_strcmp0(type, "circle"))
+  {
+    const double r = _NUM(sh, "r", 0.05);
+    const double border = _NUM(sh, "border", dt_conf_get_float("plugins/darkroom/masks/circle/border"));
+    if(!(r > 0.0 && r <= 1.0 && border >= 0.0 && border <= 1.0))
+    {
+      *err = g_strdup("circle: r in 0..1 and border in 0..1 (relative to the shorter side)");
+      return FALSE;
+    }
+    form = dt_masks_create(DT_MASKS_CIRCLE);
+    dt_masks_point_circle_t *c = malloc(sizeof(dt_masks_point_circle_t));
+    c->center[0] = x;
+    c->center[1] = y;
+    c->radius = r;
+    c->border = border;
+    form->points = g_list_append(form->points, c);
+  }
+  else if(!g_strcmp0(type, "ellipse"))
+  {
+    const double ra = _NUM(sh, "ra", 0.05), rb = _NUM(sh, "rb", 0.03), rot = _NUM(sh, "rotation", 0);
+    const double border = _NUM(sh, "border", dt_conf_get_float("plugins/darkroom/masks/ellipse/border"));
+    if(!(ra > 0.0 && ra <= 1.0 && rb > 0.0 && rb <= 1.0 && border >= 0.0 && border <= 1.0))
+    {
+      *err = g_strdup("ellipse: ra, rb in 0..1, border in 0..1, rotation in degrees");
+      return FALSE;
+    }
+    form = dt_masks_create(DT_MASKS_ELLIPSE);
+    dt_masks_point_ellipse_t *e = malloc(sizeof(dt_masks_point_ellipse_t));
+    e->center[0] = x;
+    e->center[1] = y;
+    e->radius[0] = ra;
+    e->radius[1] = rb;
+    e->rotation = fmod(rot, 360.0);
+    e->border = border;
+    e->flags = json_object_get_boolean_member_with_default(sh, "proportional", FALSE)
+               ? DT_MASKS_ELLIPSE_PROPORTIONAL : DT_MASKS_ELLIPSE_EQUIDISTANT;
+    form->points = g_list_append(form->points, e);
+  }
+  else if(!g_strcmp0(type, "gradient"))
+  {
+    const double rot = _NUM(sh, "rotation", 0), comp = _NUM(sh, "compression", 0.5);
+    const double steep = _NUM(sh, "steepness", 0), curv = _NUM(sh, "curvature", 0);
+    if(!(comp >= 0.0 && comp <= 1.0 && steep >= 0.0 && steep <= 1.0 && curv >= -2.0 && curv <= 2.0))
+    {
+      *err = g_strdup("gradient: rotation in degrees, compression 0..1, steepness 0..1, curvature -2..2");
+      return FALSE;
+    }
+    form = dt_masks_create(DT_MASKS_GRADIENT);
+    dt_masks_point_gradient_t *g = malloc(sizeof(dt_masks_point_gradient_t));
+    g->anchor[0] = x;
+    g->anchor[1] = y;
+    g->rotation = fmod(rot, 360.0);
+    g->compression = comp;
+    g->steepness = steep;
+    g->curvature = curv;
+    g->state = json_object_get_boolean_member_with_default(sh, "linear", FALSE)
+               ? DT_MASKS_GRADIENT_STATE_LINEAR : DT_MASKS_GRADIENT_STATE_SIGMOIDAL;
+    form->points = g_list_append(form->points, g);
+  }
+  else
+  {
+    *err = g_strdup("shape type: circle, ellipse or gradient");
+    return FALSE;
+  }
+#undef _NUM
+  dt_develop_t *dev = _cur->dev;
+  if(_cur->gui)
+  {
+    _api_editing = TRUE;
+    dt_dev_undo_start_record(dev);
+  }
+  dt_masks_gui_form_save_creation(dev, m, form, NULL);
+  // the group entry save_creation added: how it combines, and inverted
+  dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
+  GList *last = grp ? g_list_last(grp->points) : NULL;
+  if(last && ((dt_masks_point_group_t *)last->data)->formid == form->formid)
+  {
+    dt_masks_point_group_t *gp = last->data;
+    if(last != grp->points)
+      gp->state = (gp->state & ~(DT_MASKS_STATE_UNION | DT_MASKS_STATE_INTERSECTION | DT_MASKS_STATE_DIFFERENCE
+                                 | DT_MASKS_STATE_EXCLUSION)) | op;
+    if(inverted) gp->state |= DT_MASKS_STATE_INVERSE;
+  }
+  // the drawn tab on, keeping parametric ranges if on
+  m->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK
+                               | (m->blend_params->mask_mode & DEVELOP_MASK_CONDITIONAL);
+  if(_cur->gui)
+  {
+    dt_masks_iop_update(m);
+    dt_dev_add_history_item(dev, m, TRUE);
+    dt_dev_undo_end_record(dev);
+    _api_editing = FALSE;
+    _gui_changed_by_api();
+  }
+  else
+  {
+    m->enabled = TRUE;
+    dt_dev_add_masks_history_item_ext(dev, m, TRUE, TRUE);
+    _cur->pipe_changed = TRUE;
+    _cur->dirty = TRUE;
+  }
+  json_builder_set_member_name(b, "formid");
+  json_builder_add_int_value(b, form->formid);
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, dev->history_end);
+  return TRUE;
+}
+
+static gboolean _mask_list(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_iop_module_t *m = _blend_module(params, err);
+  if(!m) return FALSE;
+  json_builder_set_member_name(b, "shapes");
+  json_builder_begin_array(b);
+  dt_masks_form_t *grp = dt_masks_get_from_id(_cur->dev, m->blend_params->mask_id);
+  for(GList *l = grp && (grp->type & DT_MASKS_GROUP) ? grp->points : NULL; l; l = g_list_next(l))
+  {
+    const dt_masks_point_group_t *gp = l->data;
+    const dt_masks_form_t *form = dt_masks_get_from_id(_cur->dev, gp->formid);
+    if(!form) continue;
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "formid");
+    json_builder_add_int_value(b, gp->formid);
+    json_builder_set_member_name(b, "name");
+    json_builder_add_string_value(b, form->name);
+    json_builder_set_member_name(b, "type");
+    json_builder_add_string_value(b, form->type & DT_MASKS_CIRCLE ? "circle" : form->type & DT_MASKS_ELLIPSE
+                                     ? "ellipse" : form->type & DT_MASKS_GRADIENT ? "gradient"
+                                     : form->type & DT_MASKS_PATH ? "path" : form->type & DT_MASKS_BRUSH
+                                     ? "brush" : form->type & DT_MASKS_GROUP ? "group" : "other");
+    json_builder_set_member_name(b, "combine");
+    json_builder_add_string_value(b, gp->state & DT_MASKS_STATE_INTERSECTION ? "intersection"
+                                     : gp->state & DT_MASKS_STATE_DIFFERENCE ? "difference"
+                                     : gp->state & DT_MASKS_STATE_EXCLUSION ? "exclusion" : "union");
+    json_builder_set_member_name(b, "inverted");
+    json_builder_add_boolean_value(b, (gp->state & DT_MASKS_STATE_INVERSE) != 0);
+    json_builder_set_member_name(b, "active");
+    json_builder_add_boolean_value(b, (gp->state & DT_MASKS_STATE_USE) != 0);
+    if(form->points && (form->type & (DT_MASKS_CIRCLE | DT_MASKS_ELLIPSE | DT_MASKS_GRADIENT)))
+    {
+      const float *p = form->points->data;   // center or anchor first in all three
+      json_builder_set_member_name(b, "x");
+      json_builder_add_double_value(b, p[0]);
+      json_builder_set_member_name(b, "y");
+      json_builder_add_double_value(b, p[1]);
+    }
+    json_builder_end_object(b);
+  }
+  json_builder_end_array(b);
+  return TRUE;
+}
+
+// take a shape out of a module's mask (it stays among the image's shapes,
+// as the darkroom's "remove from this module" keeps it in the mask manager)
+static gboolean _mask_remove(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_iop_module_t *m = _blend_module(params, err);
+  if(!m) return FALSE;
+  const dt_mask_id_t formid = params ? json_object_get_int_member_with_default(params, "formid", 0) : 0;
+  dt_develop_t *dev = _cur->dev;
+  dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
+  GList *hit = NULL;
+  for(GList *l = grp && (grp->type & DT_MASKS_GROUP) ? grp->points : NULL; l; l = g_list_next(l))
+    if(((dt_masks_point_group_t *)l->data)->formid == formid) hit = l;
+  if(!hit)
+  {
+    *err = g_strdup_printf("module '%s' has no shape %d (mask_list)", m->op, formid);
+    return FALSE;
+  }
+  if(_cur->gui)
+  {
+    _api_editing = TRUE;
+    dt_masks_form_remove(m, grp, dt_masks_get_from_id(dev, formid));
+    _api_editing = FALSE;
+    _gui_changed_by_api();
+  }
+  else
+  {
+    free(hit->data);
+    grp->points = g_list_delete_link(grp->points, hit);
+    if(!grp->points)
+      m->blend_params->mask_mode &= ~DEVELOP_MASK_MASK;
+    dt_dev_add_masks_history_item_ext(dev, m, TRUE, TRUE);
+    _cur->pipe_changed = TRUE;
+    _cur->dirty = TRUE;
+  }
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, dev->history_end);
+  return TRUE;
+}
+
 // ---- export ----------------------------------------------------------------
 // darktable's export: the disk storage and a format module, with the export
 // module's settings (libs/export.c) unless the request overrides them, as
@@ -3062,23 +3708,19 @@ static gboolean _render(JsonObject *params, JsonBuilder *b, gchar **err)
   return ok;
 }
 
-static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
+// what a render shows: the region of the (scaled) image it processed
+typedef struct _view_t
 {
-  if(!_cur)
-  {
-    *err = g_strdup("no open session");
-    return FALSE;
-  }
-  const int max_w = params ? json_object_get_int_member_with_default(params, "width", 1200) : 1200;
-  const int max_h = params ? json_object_get_int_member_with_default(params, "height", 1200) : 1200;
-  const int quality = params ? json_object_get_int_member_with_default(params, "quality", 85) : 85;
-  const gchar *path = params ? json_object_get_string_member_with_default(params, "path", NULL) : NULL;
-  if(!path || max_w <= 0 || max_h <= 0)
-  {
-    *err = g_strdup("render needs path, width > 0 and height > 0");
-    return FALSE;
-  }
+  int x, y, w, h;
+  double scale, pw, ph;              // pw, ph: full-size image as rendered
+  gboolean uncropped, zoomed;
+  gint64 ms;
+} _view_t;
 
+// run the pipe as render asks (fitted inside max_w x max_h, or zoomed on a
+// region, uncropped or not), leaving the result in the pipe's backbuf (BGRA)
+static gboolean _process_view(JsonObject *params, const int max_w, const int max_h, _view_t *v, gchar **err)
+{
   const gint64 t0 = g_get_monotonic_time();
   _pipe_sync(_cur);
   // uncropped: without crop's box, as the darkroom shows the image while
@@ -3096,24 +3738,26 @@ static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
   // darkroom shows it zoomed in, centered on center_x/center_y (fractions);
   // else the whole image fitted inside max_w x max_h
   const double zoom = params ? json_object_get_double_member_with_default(params, "zoom", 0.0) : 0.0;
-  const double pw = _cur->pipe.processed_width, ph = _cur->pipe.processed_height;
-  double scale;
-  int x = 0, y = 0, w, h;
-  if(zoom > 0.0)
+  v->pw = _cur->pipe.processed_width;
+  v->ph = _cur->pipe.processed_height;
+  v->x = v->y = 0;
+  v->zoomed = zoom > 0.0;
+  v->uncropped = crop != NULL;
+  if(v->zoomed)
   {
-    scale = CLAMP(zoom, 0.01, 2.0);
+    v->scale = CLAMP(zoom, 0.01, 2.0);
     const double cx = params ? json_object_get_double_member_with_default(params, "center_x", 0.5) : 0.5;
     const double cy = params ? json_object_get_double_member_with_default(params, "center_y", 0.5) : 0.5;
-    w = MIN(max_w, (int)floor(scale * pw));
-    h = MIN(max_h, (int)floor(scale * ph));
-    x = CLAMP((int)round(cx * scale * pw - w / 2.0), 0, (int)floor(scale * pw) - w);
-    y = CLAMP((int)round(cy * scale * ph - h / 2.0), 0, (int)floor(scale * ph) - h);
+    v->w = MIN(max_w, (int)floor(v->scale * v->pw));
+    v->h = MIN(max_h, (int)floor(v->scale * v->ph));
+    v->x = CLAMP((int)round(cx * v->scale * v->pw - v->w / 2.0), 0, (int)floor(v->scale * v->pw) - v->w);
+    v->y = CLAMP((int)round(cy * v->scale * v->ph - v->h / 2.0), 0, (int)floor(v->scale * v->ph) - v->h);
   }
   else
   {
-    scale = fmin(1.0, fmin(max_w / pw, max_h / ph));
-    w = floor(scale * pw);
-    h = floor(scale * ph);
+    v->scale = fmin(1.0, fmin(max_w / v->pw, max_h / v->ph));
+    v->w = floor(v->scale * v->pw);
+    v->h = floor(v->scale * v->ph);
   }
 
   // as a non-hq export does: downscale right after demosaic, not in finalscale
@@ -3124,7 +3768,7 @@ static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
     if(dt_iop_module_is_finalscale(piece->module)) { finalscale = piece; break; }
   }
   if(finalscale) finalscale->enabled = FALSE;
-  dt_dev_pixelpipe_process(&_cur->pipe, _cur->dev, x, y, w, h, scale, DT_DEVICE_NONE);
+  dt_dev_pixelpipe_process(&_cur->pipe, _cur->dev, v->x, v->y, v->w, v->h, v->scale, DT_DEVICE_NONE);
   if(finalscale) finalscale->enabled = TRUE;
   if(crop)
   {
@@ -3132,15 +3776,58 @@ static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
     dt_dev_pixelpipe_get_dimensions(&_cur->pipe, _cur->dev, _cur->pipe.iwidth, _cur->pipe.iheight,
                                     &_cur->pipe.processed_width, &_cur->pipe.processed_height);
   }
-  const gint64 t1 = g_get_monotonic_time();
-
-  if(!_cur->pipe.backbuf || _cur->pipe.backbuf_width != w || _cur->pipe.backbuf_height != h)
+  v->ms = (g_get_monotonic_time() - t0) / 1000;
+  if(!_cur->pipe.backbuf || _cur->pipe.backbuf_width != v->w || _cur->pipe.backbuf_height != v->h)
   {
     *err = g_strdup("the pipe produced no output");
     return FALSE;
   }
+  return TRUE;
+}
+
+static void _add_view(JsonBuilder *b, const _view_t *v)
+{
+  json_builder_set_member_name(b, "width");
+  json_builder_add_int_value(b, v->w);
+  json_builder_set_member_name(b, "height");
+  json_builder_add_int_value(b, v->h);
+  json_builder_set_member_name(b, "uncropped");
+  json_builder_add_boolean_value(b, v->uncropped);
+  if(v->zoomed)
+  {
+    // the region shown, in fractions of the whole image
+    json_builder_set_member_name(b, "zoom");
+    json_builder_add_double_value(b, v->scale);
+    json_builder_set_member_name(b, "region");
+    _add_box(b, (float[4]){ v->x / (v->scale * v->pw), v->y / (v->scale * v->ph),
+                            (v->x + v->w) / (v->scale * v->pw), (v->y + v->h) / (v->scale * v->ph) });
+  }
+  json_builder_set_member_name(b, "process_ms");
+  json_builder_add_int_value(b, v->ms);
+}
+
+static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  const int max_w = params ? json_object_get_int_member_with_default(params, "width", 1200) : 1200;
+  const int max_h = params ? json_object_get_int_member_with_default(params, "height", 1200) : 1200;
+  const int quality = params ? json_object_get_int_member_with_default(params, "quality", 85) : 85;
+  const gchar *path = params ? json_object_get_string_member_with_default(params, "path", NULL) : NULL;
+  if(!path || max_w <= 0 || max_h <= 0)
+  {
+    *err = g_strdup("render needs path, width > 0 and height > 0");
+    return FALSE;
+  }
+  _view_t v;
+  if(!_process_view(params, max_w, max_h, &v, err)) return FALSE;
+  const gint64 t1 = g_get_monotonic_time();
+
   // backbuf is a cache line in display byte order (BGRA): convert a copy
-  const size_t npix = (size_t)w * h;
+  const size_t npix = (size_t)v.w * v.h;
   uint8_t *rgba = g_malloc(npix * 4);
   const uint8_t *src = _cur->pipe.backbuf;
   for(size_t k = 0; k < npix; k++)
@@ -3150,34 +3837,205 @@ static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
     rgba[4 * k + 2] = src[4 * k + 0];
     rgba[4 * k + 3] = 255;
   }
-  const int jerr = dt_imageio_jpeg_write(path, rgba, w, h, quality, NULL, 0);
+  const int jerr = dt_imageio_jpeg_write(path, rgba, v.w, v.h, quality, NULL, 0);
   g_free(rgba);
   if(jerr)
   {
     *err = g_strdup_printf("cannot write %s", path);
     return FALSE;
   }
-  const gint64 t2 = g_get_monotonic_time();
-
-  json_builder_set_member_name(b, "width");
-  json_builder_add_int_value(b, w);
-  json_builder_set_member_name(b, "height");
-  json_builder_add_int_value(b, h);
-  json_builder_set_member_name(b, "uncropped");
-  json_builder_add_boolean_value(b, crop != NULL);
-  if(zoom > 0.0)
-  {
-    // the region shown, in fractions of the whole image
-    json_builder_set_member_name(b, "zoom");
-    json_builder_add_double_value(b, scale);
-    json_builder_set_member_name(b, "region");
-    _add_box(b, (float[4]){ x / (scale * pw), y / (scale * ph), (x + w) / (scale * pw), (y + h) / (scale * ph) });
-  }
-  json_builder_set_member_name(b, "process_ms");
-  json_builder_add_int_value(b, (t1 - t0) / 1000);
+  _add_view(b, &v);
   json_builder_set_member_name(b, "jpeg_ms");
-  json_builder_add_int_value(b, (t2 - t1) / 1000);
+  json_builder_add_int_value(b, (g_get_monotonic_time() - t1) / 1000);
   return TRUE;
+}
+
+// ---- readouts ---------------------------------------------------------------
+// what the rendered image holds: values at points and in boxes, histograms
+// and clipping. these are the output (display-referred sRGB) as the
+// darkroom shows it, not values inside the pipe
+
+static double _srgb_to_linear(const double c)
+{
+  return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+
+static void _rgb_to_lab(const double rgb[3], double lab[3])
+{
+  const double r = _srgb_to_linear(rgb[0]), g = _srgb_to_linear(rgb[1]), b = _srgb_to_linear(rgb[2]);
+  // sRGB (D65) to XYZ, relative to D65 white
+  const double xyz[3] = { (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047,
+                          0.2126 * r + 0.7152 * g + 0.0722 * b,
+                          (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883 };
+  double f[3];
+  for(int k = 0; k < 3; k++)
+    f[k] = xyz[k] > 216.0 / 24389.0 ? cbrt(xyz[k]) : (24389.0 / 27.0 * xyz[k] + 16.0) / 116.0;
+  lab[0] = 116.0 * f[1] - 16.0;
+  lab[1] = 500.0 * (f[0] - f[1]);
+  lab[2] = 200.0 * (f[1] - f[2]);
+}
+
+// the mean over pixels [x0, x1) x [y0, y1) of the BGRA view
+static void _add_area(JsonBuilder *b, const uint8_t *buf, const int w, int x0, int y0, int x1, int y1)
+{
+  double sum[3] = { 0 }, lmin = 1.0, lmax = 0.0;
+  size_t n = 0;
+  for(int y = y0; y < y1; y++)
+    for(int x = x0; x < x1; x++)
+    {
+      const uint8_t *p = buf + 4 * ((size_t)y * w + x);
+      const double rgb[3] = { p[2] / 255.0, p[1] / 255.0, p[0] / 255.0 };
+      for(int k = 0; k < 3; k++) sum[k] += rgb[k];
+      const double l = 0.2126 * _srgb_to_linear(rgb[0]) + 0.7152 * _srgb_to_linear(rgb[1])
+                       + 0.0722 * _srgb_to_linear(rgb[2]);
+      lmin = MIN(lmin, l);
+      lmax = MAX(lmax, l);
+      n++;
+    }
+  if(!n)
+  {
+    json_builder_add_null_value(b);
+    return;
+  }
+  const double rgb[3] = { sum[0] / n, sum[1] / n, sum[2] / n };
+  double lab[3];
+  _rgb_to_lab(rgb, lab);
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "rgb");
+  json_builder_begin_array(b);
+  for(int k = 0; k < 3; k++) json_builder_add_double_value(b, round(rgb[k] * 1e4) / 1e4);
+  json_builder_end_array(b);
+  json_builder_set_member_name(b, "lab");
+  json_builder_begin_array(b);
+  for(int k = 0; k < 3; k++) json_builder_add_double_value(b, round(lab[k] * 100) / 100);
+  json_builder_end_array(b);
+  json_builder_set_member_name(b, "luminance_min");
+  json_builder_add_double_value(b, round(lmin * 1e4) / 1e4);
+  json_builder_set_member_name(b, "luminance_max");
+  json_builder_add_double_value(b, round(lmax * 1e4) / 1e4);
+  json_builder_set_member_name(b, "pixels");
+  json_builder_add_int_value(b, n);
+  json_builder_end_object(b);
+}
+
+static gboolean _sample_session(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  const int max_w = params ? json_object_get_int_member_with_default(params, "width", 1024) : 1024;
+  const int max_h = params ? json_object_get_int_member_with_default(params, "height", 1024) : 1024;
+  const int radius = params ? CLAMP(json_object_get_int_member_with_default(params, "radius", 2), 0, 200) : 2;
+  const int bins = params ? CLAMP(json_object_get_int_member_with_default(params, "bins", 64), 2, 256) : 64;
+  if(max_w <= 0 || max_h <= 0)
+  {
+    *err = g_strdup("sample needs width > 0 and height > 0");
+    return FALSE;
+  }
+  _view_t v;
+  if(!_process_view(params, max_w, max_h, &v, err)) return FALSE;
+  const uint8_t *buf = _cur->pipe.backbuf;
+  // image fractions to view pixels
+  const double kx = v.scale * v.pw, ky = v.scale * v.ph;
+  _add_view(b, &v);
+
+  JsonArray *points = params && json_object_has_member(params, "points")
+                      && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "points"))
+                        ? json_object_get_array_member(params, "points") : NULL;
+  json_builder_set_member_name(b, "points");
+  json_builder_begin_array(b);
+  for(guint k = 0; points && k < json_array_get_length(points); k++)
+  {
+    JsonArray *p = JSON_NODE_HOLDS_ARRAY(json_array_get_element(points, k))
+                   ? json_array_get_array_element(points, k) : NULL;
+    if(!p || json_array_get_length(p) != 2)
+    {
+      json_builder_add_null_value(b);
+      continue;
+    }
+    const int px = (int)floor(json_array_get_double_element(p, 0) * kx) - v.x;
+    const int py = (int)floor(json_array_get_double_element(p, 1) * ky) - v.y;
+    if(px < 0 || py < 0 || px >= v.w || py >= v.h)
+      json_builder_add_null_value(b);   // outside what was rendered
+    else
+      _add_area(b, buf, v.w, MAX(0, px - radius), MAX(0, py - radius),
+                MIN(v.w, px + radius + 1), MIN(v.h, py + radius + 1));
+  }
+  json_builder_end_array(b);
+
+  JsonArray *boxes = params && json_object_has_member(params, "boxes")
+                     && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "boxes"))
+                       ? json_object_get_array_member(params, "boxes") : NULL;
+  json_builder_set_member_name(b, "boxes");
+  json_builder_begin_array(b);
+  for(guint k = 0; boxes && k < json_array_get_length(boxes); k++)
+  {
+    JsonObject *o = JSON_NODE_HOLDS_OBJECT(json_array_get_element(boxes, k))
+                    ? json_array_get_object_element(boxes, k) : NULL;
+    if(!o)
+    {
+      json_builder_add_null_value(b);
+      continue;
+    }
+    const int x0 = CLAMP((int)floor(json_object_get_double_member_with_default(o, "left", 0) * kx) - v.x, 0, v.w);
+    const int y0 = CLAMP((int)floor(json_object_get_double_member_with_default(o, "top", 0) * ky) - v.y, 0, v.h);
+    const int x1 = CLAMP((int)ceil(json_object_get_double_member_with_default(o, "right", 1) * kx) - v.x, 0, v.w);
+    const int y1 = CLAMP((int)ceil(json_object_get_double_member_with_default(o, "bottom", 1) * ky) - v.y, 0, v.h);
+    _add_area(b, buf, v.w, x0, y0, x1, y1);
+  }
+  json_builder_end_array(b);
+
+  // histograms of R, G, B and luminance (8-bit output, bins), and how much
+  // is clipped: any channel at 255, or all at 0
+  guint64 *hist = g_new0(guint64, 4 * bins);
+  guint64 high = 0, low = 0;
+  const size_t npix = (size_t)v.w * v.h;
+  for(size_t k = 0; k < npix; k++)
+  {
+    const uint8_t *p = buf + 4 * k;
+    const int r = p[2], g = p[1], bl = p[0];
+    const double l = 0.2126 * _srgb_to_linear(r / 255.0) + 0.7152 * _srgb_to_linear(g / 255.0)
+                     + 0.0722 * _srgb_to_linear(bl / 255.0);
+    // luminance binned as an sRGB-encoded value, like the channels
+    const int lv = (int)round(255.0 * (l <= 0.0031308 ? 12.92 * l : 1.055 * pow(l, 1 / 2.4) - 0.055));
+    hist[0 * bins + r * bins / 256]++;
+    hist[1 * bins + g * bins / 256]++;
+    hist[2 * bins + bl * bins / 256]++;
+    hist[3 * bins + CLAMP(lv, 0, 255) * bins / 256]++;
+    if(r == 255 || g == 255 || bl == 255) high++;
+    if(r == 0 && g == 0 && bl == 0) low++;
+  }
+  static const char *names[] = { "red", "green", "blue", "luminance" };
+  json_builder_set_member_name(b, "histogram");
+  json_builder_begin_object(b);
+  for(int c = 0; c < 4; c++)
+  {
+    json_builder_set_member_name(b, names[c]);
+    json_builder_begin_array(b);
+    for(int k = 0; k < bins; k++) json_builder_add_int_value(b, hist[c * bins + k]);
+    json_builder_end_array(b);
+  }
+  json_builder_end_object(b);
+  g_free(hist);
+  json_builder_set_member_name(b, "clipped_highlights");
+  json_builder_add_double_value(b, npix ? round(1e6 * high / (double)npix) / 1e6 : 0.0);
+  json_builder_set_member_name(b, "clipped_shadows");
+  json_builder_add_double_value(b, npix ? round(1e6 * low / (double)npix) / 1e6 : 0.0);
+  return TRUE;
+}
+
+static gboolean _sample(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur || !_cur->gui) return _sample_session(params, b, err);
+  _session_t *gui = _cur;
+  _session_t *mirror = _pipe_session(err);
+  if(!mirror) return FALSE;
+  _cur = mirror;
+  const gboolean ok = _sample_session(params, b, err);
+  _cur = gui;
+  return ok;
 }
 
 // ---- clients ------------------------------------------------------------
@@ -3337,8 +4195,8 @@ static const char *_methods[] = {
   "ping", "film_rolls", "images_list", "image_info", "thumbnail", "set_rating", "set_label",
   "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
   "module_enable", "preset_list", "preset_apply", "history_list", "history_end", "geometry_get",
-  "geometry_set", "coords", "retouch_list", "retouch_heal", "save", "reset", "render", "render.uncropped",
-  "render.zoom", "export",
+  "geometry_set", "coords", "retouch_list", "retouch_heal", "blend_get", "blend_set", "mask_add", "mask_list",
+  "mask_remove", "sample", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
   "library_status", "library_release", "library_acquire", "handover", "shutdown", NULL };
 
 // methods that work on an edit session, and the event each one sends
@@ -3346,6 +4204,8 @@ static const struct { const char *method; const char *event; } _session_methods[
   { "module_list", NULL }, { "module_get", NULL }, { "history_list", NULL }, { "render", NULL },
   { "geometry_get", NULL }, { "preset_list", NULL }, { "preset_apply", "edit" },
   { "coords", NULL }, { "retouch_list", NULL }, { "retouch_heal", "edit" },
+  { "blend_get", NULL }, { "blend_set", "edit" }, { "mask_add", "edit" }, { "mask_list", NULL },
+  { "mask_remove", "edit" }, { "sample", NULL },
   { "module_set", "edit" }, { "module_enable", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" },
   { "save", "saved" }, { "reset", "reset" }, { "session_close", "closed" }, { NULL, NULL } };
 
@@ -3477,6 +4337,18 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _preset_list(params, b, &err);
   else if(!g_strcmp0(method, "preset_apply"))
     _preset_apply(params, b, &err);
+  else if(!g_strcmp0(method, "blend_get"))
+    _blend_get(params, b, &err);
+  else if(!g_strcmp0(method, "blend_set"))
+    _blend_set(params, b, &err);
+  else if(!g_strcmp0(method, "mask_add"))
+    _mask_add(params, b, &err);
+  else if(!g_strcmp0(method, "mask_list"))
+    _mask_list(params, b, &err);
+  else if(!g_strcmp0(method, "mask_remove"))
+    _mask_remove(params, b, &err);
+  else if(!g_strcmp0(method, "sample"))
+    _sample(params, b, &err);
   else if(!g_strcmp0(method, "coords"))
     _coords(params, b, &err);
   else if(!g_strcmp0(method, "retouch_list"))

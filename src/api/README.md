@@ -47,6 +47,11 @@ JSON-RPC 2.0, one request per line on stdin, one reply per line on stdout:
 | method | does |
 |---|---|
 | `ping` | version |
+| `film_rolls` | film rolls with image counts |
+| `images_list {film_id, rating, label, offset, limit}` | images in folder/filename order with rating, reject, color labels; `rating` is `visible` (default), `all`, `rejected` or `1`..`5` (at least) |
+| `image_info {imgid}` | one image, as in `images_list` |
+| `thumbnail {imgid, size, path, quality}` | JPEG from darktable's thumbnail (mipmap) cache, rendered with the current edit if not cached |
+| `set_rating {imgid, rating}` / `set_label {imgid, label, on}` | 0..5 or `"reject"` (as the lighttable); color label 0..4 (red, yellow, green, blue, purple) |
 | `session_open {imgid}` / `session_close` | load a photo and replay its history, as the darkroom does (one open photo at a time) |
 | `module_list` | the photo's modules in pipe order: enabled, in history |
 | `module_get {operation, instance}` | settings by name through introspection: value, default, declared range, enum names and labels |
@@ -68,6 +73,8 @@ JSON-RPC 2.0, one request per line on stdin, one reply per line on stdout:
 | render after a change, 1200 px | 0.14-0.39 s (a repeat: ~3 ms) |
 | memory with the photo open | 1.7 GB |
 | release / acquire | ~1 ms / 30-90 ms |
+| list 770 images / a page | < 1 ms |
+| thumbnail ~600 px: cached / rendered | 1 ms / 0.2-0.9 s |
 
 The engine's render matches darktable's own export of the same edit within
 about 1/255 (mean absolute difference).
@@ -77,5 +84,5 @@ about 1/255 (mean absolute difference).
 - settings the GUI adjusts alongside a change (`gui_changed`), pickers and
   other operations whose logic lives in GUI code
 - array fields (e.g. channel mixer coefficients), masks, module instances
-  and order, styles, export, library browsing
+  and order, styles, export, tags and metadata, import
 - one open photo per process

@@ -96,6 +96,13 @@
      module_add {operation, instance, copy}
                                  -> a new instance after the given one ("new
                                     instance", or "duplicate" with copy)
+     ai_denoise {imgid, strength, path}
+                                 -> AI raw denoise (neural restore) as a
+                                    background job: a DNG beside the photo,
+                                    imported into its group; replies the job
+     job_status {job} / job_list / job_cancel {job}
+                                 -> background jobs; a "job" event goes to
+                                    every client when one ends
      module_move {operation, instance, before | after: {operation, instance}}
                                  -> moves a module in the pipe, as dragging it
                                     in the darkroom (darktable's rules apply)
@@ -234,8 +241,18 @@
 #include "common/datetime.h"
 #include "common/variables.h"
 #include "common/ras2vect.h"
+#include "common/collection.h"
+#include "common/exif.h"
+#include "common/film.h"
+#include "common/grouping.h"
+#include "common/metadata.h"
+#include "imageio/imageio_dng.h"
+#include "control/jobs.h"
 #ifdef HAVE_AI
 #include "common/ai/segmentation.h"
+#include "common/ai/restore.h"
+#include "common/ai/restore_raw_bayer.h"
+#include "common/ai/restore_raw_linear.h"
 #include "common/ai_models.h"
 #endif
 #include "control/signal.h"
@@ -5017,6 +5034,440 @@ static gboolean _mask_ai(JsonObject *params, JsonBuilder *b, gchar **err)
 #endif
 }
 
+// ---- background jobs ----------------------------------------------------------
+// work that takes minutes (AI denoise) runs on a thread of its own, so the
+// server keeps answering: the request replies a job id at once; job_status,
+// job_list and job_cancel follow it, and every client gets a "job" event
+// when it ends. the thread does the computing; reading the result into the
+// library happens back on the server's thread (the main loop: the engine's,
+// or darktable's window). in darktable's window a job also has a darktable
+// job handle: its progress shows in darktable's progress bar, and cancel
+// stops the computation; headless (darktable's control isn't running, so
+// there are no handles) progress is unknown and cancel discards the result
+
+typedef enum _job_state_t { _JOB_RUNNING, _JOB_DONE, _JOB_FAILED, _JOB_CANCELLED } _job_state_t;
+static const char *_job_states[] = { "running", "done", "failed", "cancelled" };
+
+typedef struct _job_t
+{
+  int id;
+  const char *type;
+  dt_imgid_t imgid;
+  _job_state_t state;
+  gint cancel;                       // set by job_cancel, read by the thread
+  gint64 started, finished;
+  dt_job_t *handle;                  // darktable's window only
+  GThread *thread;
+  gchar *error;
+  dt_imgid_t new_imgid;
+  gchar *file;
+  // the task's own data
+  gchar *src;
+  float strength;
+  int status;                        // the thread's result: 0 = ok
+} _job_t;
+
+static GList *_jobs = NULL;
+static int _next_job = 1;
+
+static void _notify_job(const _job_t *j);
+
+static gboolean _jobs_running(void)
+{
+  for(GList *l = _jobs; l; l = g_list_next(l))
+    if(((_job_t *)l->data)->state == _JOB_RUNNING) return TRUE;
+  return FALSE;
+}
+
+static void _add_job(JsonBuilder *b, const _job_t *j)
+{
+  json_builder_set_member_name(b, "job");
+  json_builder_add_int_value(b, j->id);
+  // "task", not "type": the "job" event's own type is "job"
+  json_builder_set_member_name(b, "task");
+  json_builder_add_string_value(b, j->type);
+  json_builder_set_member_name(b, "imgid");
+  json_builder_add_int_value(b, j->imgid);
+  json_builder_set_member_name(b, "state");
+  json_builder_add_string_value(b, _job_states[j->state]);
+  const double progress = j->handle && j->state == _JOB_RUNNING ? dt_control_job_get_progress(j->handle) : -1.0;
+  json_builder_set_member_name(b, "progress");
+  if(j->state != _JOB_RUNNING) json_builder_add_double_value(b, 1.0);
+  else if(progress >= 0.0) json_builder_add_double_value(b, round(progress * 1e3) / 1e3);
+  else json_builder_add_null_value(b);
+  json_builder_set_member_name(b, "elapsed_ms");
+  json_builder_add_int_value(b, ((j->finished ? j->finished : g_get_monotonic_time()) - j->started) / 1000);
+  if(j->state == _JOB_DONE)
+  {
+    json_builder_set_member_name(b, "new_imgid");
+    json_builder_add_int_value(b, j->new_imgid);
+    json_builder_set_member_name(b, "file");
+    json_builder_add_string_value(b, j->file ? j->file : "");
+  }
+  if(j->error)
+  {
+    json_builder_set_member_name(b, "error");
+    json_builder_add_string_value(b, j->error);
+  }
+}
+
+static _job_t *_job_find(JsonObject *params, gchar **err)
+{
+  const int id = params ? json_object_get_int_member_with_default(params, "job", 0) : 0;
+  for(GList *l = _jobs; l; l = g_list_next(l))
+    if(((_job_t *)l->data)->id == id) return l->data;
+  *err = g_strdup_printf("no job %d (job_list)", id);
+  return NULL;
+}
+
+static gboolean _job_status(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  _job_t *j = _job_find(params, err);
+  if(!j) return FALSE;
+  _add_job(b, j);
+  return TRUE;
+}
+
+static gboolean _job_list(JsonBuilder *b, gchar **err)
+{
+  json_builder_set_member_name(b, "jobs");
+  json_builder_begin_array(b);
+  for(GList *l = _jobs; l; l = g_list_next(l))
+  {
+    json_builder_begin_object(b);
+    _add_job(b, l->data);
+    json_builder_end_object(b);
+  }
+  json_builder_end_array(b);
+  return TRUE;
+}
+
+static gboolean _job_cancel(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  _job_t *j = _job_find(params, err);
+  if(!j) return FALSE;
+  if(j->state != _JOB_RUNNING)
+  {
+    *err = g_strdup_printf("job %d has already ended (%s)", j->id, _job_states[j->state]);
+    return FALSE;
+  }
+  g_atomic_int_set(&j->cancel, 1);
+  if(j->handle) dt_control_job_cancel(j->handle);
+  _add_job(b, j);
+  json_builder_set_member_name(b, "note");
+  json_builder_add_string_value(b, j->handle ? "the computation stops at its next check"
+                                             : "headless the computation runs to its end; its result is discarded");
+  return TRUE;
+}
+
+#ifdef HAVE_AI
+// the source raw's embedded JPEG, as the DNG's thumbnail (neural_restore.c:
+// _extract_source_jpeg_preview)
+static gboolean _source_preview(const char *src, dt_imageio_dng_preview_t *pv)
+{
+  uint8_t *buf = NULL;
+  size_t size = 0;
+  char *mime = NULL;
+  memset(pv, 0, sizeof(*pv));
+  if(dt_exif_get_thumbnail(src, &buf, &size, &mime) || !buf)
+  {
+    free(mime);
+    return FALSE;
+  }
+  dt_imageio_jpeg_t jpg;
+  const gboolean jpeg = mime && !g_strcmp0(mime, "image/jpeg")
+                        && !dt_imageio_jpeg_decompress_header(buf, size, &jpg);
+  free(mime);
+  if(!jpeg)
+  {
+    free(buf);
+    return FALSE;
+  }
+  pv->data = buf;                    // malloc'd by dt_exif_get_thumbnail: free()
+  pv->len = size;
+  pv->width = jpg.width;
+  pv->height = jpg.height;
+  return TRUE;
+}
+
+// AI denoise of one raw, as the neural restore panel's raw denoise does
+// (neural_restore.c: _process_raw_denoise_one): the model runs on the
+// sensor data and a DNG is written; runs on the job's thread
+static gpointer _ai_denoise_thread(gpointer data)
+{
+  _job_t *j = data;
+  dt_restore_env_t *env = dt_restore_env_init();
+  const dt_image_t *cached = dt_image_cache_get(j->imgid, 'r');
+  dt_image_t img = *cached;
+  dt_image_cache_read_release(cached);
+  const dt_restore_sensor_class_t cls = dt_restore_classify_sensor(&img);
+  dt_restore_context_t *ctx = !env ? NULL
+    : cls == DT_RESTORE_SENSOR_CLASS_BAYER ? dt_restore_load_rawdenoise_bayer(env)
+    : cls == DT_RESTORE_SENSOR_CLASS_XTRANS ? dt_restore_load_rawdenoise_xtrans(env)
+    : cls == DT_RESTORE_SENSOR_CLASS_LINEAR ? dt_restore_load_rawdenoise_linear(env) : NULL;
+  j->status = 1;
+  if(!ctx)
+    j->error = g_strdup("the AI raw denoise model could not be loaded for this sensor");
+  else if(cls == DT_RESTORE_SENSOR_CLASS_BAYER)
+  {
+    dt_mipmap_buffer_t mb;
+    dt_mipmap_cache_get(&mb, j->imgid, DT_MIPMAP_FULL, DT_MIPMAP_BLOCKING, 'r');
+    const size_t npix = (size_t)img.width * img.height;
+    float *cfa = mb.buf ? g_try_malloc(npix * sizeof(float)) : NULL;
+    if(cfa && img.buf_dsc.datatype == TYPE_UINT16)
+      for(size_t i = 0; i < npix; i++) cfa[i] = ((const uint16_t *)mb.buf)[i];
+    else if(cfa && img.buf_dsc.datatype == TYPE_FLOAT)
+      memcpy(cfa, mb.buf, npix * sizeof(float));
+    else
+    {
+      g_free(cfa);
+      cfa = NULL;
+    }
+    dt_mipmap_cache_release(&mb);
+    uint16_t *out = cfa ? g_try_malloc(npix * sizeof(uint16_t)) : NULL;
+    if(!cfa || !out)
+      j->error = g_strdup("could not read the raw's sensor data");
+    else if((j->status = dt_restore_raw_bayer(ctx, &img, cfa, img.width, img.height, out, j->strength, j->handle)))
+      j->error = g_strdup("the AI raw denoise failed or was cancelled");
+    else
+    {
+      uint8_t *exif = NULL;
+      const int exif_len = dt_exif_read_blob(&exif, j->src, j->imgid, FALSE, img.width, img.height, TRUE);
+      dt_imageio_dng_preview_t pv;
+      const gboolean has_pv = _source_preview(j->src, &pv);
+      j->status = dt_imageio_dng_write_cfa_bayer(j->file, out, img.width, img.height, &img, exif, exif_len,
+                                                 has_pv ? &pv : NULL);
+      free((void *)pv.data);
+      free(exif);
+      if(j->status) j->error = g_strdup_printf("could not write %s", j->file);
+    }
+    g_free(cfa);
+    g_free(out);
+  }
+  else
+  {
+    // X-Trans and linear raws: darktable demosaics, the model denoises RGB
+    float *rgb = NULL;
+    int w = 0, h = 0;
+    if((j->status = dt_restore_raw_linear(ctx, j->imgid, &rgb, &w, &h, j->strength, j->handle)) || !rgb)
+    {
+      j->status = 1;
+      j->error = g_strdup("the AI raw denoise failed or was cancelled");
+    }
+    else
+    {
+      uint8_t *exif = NULL;
+      const int exif_len = dt_exif_read_blob(&exif, j->src, j->imgid, FALSE, w, h, TRUE);
+      dt_imageio_dng_preview_t pv;
+      const gboolean has_pv = _source_preview(j->src, &pv);
+      j->status = dt_imageio_dng_write_linear(j->file, rgb, w, h, &img, exif, exif_len, has_pv ? &pv : NULL);
+      free((void *)pv.data);
+      free(exif);
+      if(j->status) j->error = g_strdup_printf("could not write %s", j->file);
+    }
+    dt_free_align(rgb);
+  }
+  if(!j->status && dt_conf_get_bool("plugins/lighttable/neural_restore/mark_output"))
+    dt_exif_xmp_write_neural_restore(j->file, "raw-denoise");
+  if(ctx) dt_restore_unref(ctx);
+  if(env) dt_restore_env_destroy(env);
+  return NULL;
+}
+
+// back on the server's thread: the DNG into the library beside the source
+// (same film roll, its rating, labels, metadata, tags and group), as the
+// panel's _import_image does
+static gboolean _ai_denoise_finish(gpointer data)
+{
+  _job_t *j = data;
+  g_thread_join(j->thread);
+  j->thread = NULL;
+  j->finished = g_get_monotonic_time();
+  if(j->status || g_atomic_int_get(&j->cancel))
+  {
+    if(j->file) g_unlink(j->file);
+    j->state = g_atomic_int_get(&j->cancel) ? _JOB_CANCELLED : _JOB_FAILED;
+  }
+  else
+  {
+    dt_film_t film;
+    dt_film_init(&film);
+    gchar *dir = g_path_get_dirname(j->file);
+    const dt_filmid_t filmid = dt_film_new(&film, dir);
+    g_free(dir);
+    j->new_imgid = dt_image_import(filmid, j->file, TRUE, FALSE);
+    dt_film_cleanup(&film);
+    if(!dt_is_valid_imgid(j->new_imgid))
+    {
+      j->state = _JOB_FAILED;
+      j->error = g_strdup_printf("%s was written but couldn't be imported", j->file);
+    }
+    else
+    {
+      const dt_imgid_t src = j->imgid, dst = j->new_imgid;
+      const dt_image_t *si = dt_image_cache_get(src, 'r');
+      const int rating = dt_image_get_xmp_rating(si);
+      const dt_imgid_t grpid = si && dt_is_valid_imgid(si->group_id) ? si->group_id : src;
+      dt_image_cache_read_release(si);
+      dt_image_t *di = dt_image_cache_get(dst, 'w');
+      dt_image_set_xmp_rating(di, rating);
+      dt_image_cache_write_release(di, DT_IMAGE_CACHE_SAFE);
+      const int labels = dt_colorlabels_get_labels(src);
+      for(int c = 0; c < DT_COLORLABELS_LAST; c++)
+        if(labels & (1 << c)) dt_colorlabels_set_label(dst, c);
+      GList *meta = dt_metadata_get_list_id(src);
+      if(meta)
+      {
+        GList *imgs = g_list_prepend(NULL, GINT_TO_POINTER(dst));
+        dt_metadata_set_list_id(imgs, meta, FALSE, FALSE);
+        g_list_free(imgs);
+        g_list_free_full(meta, g_free);
+      }
+      GList *tags = NULL;
+      if(dt_tag_get_attached(src, &tags, TRUE))
+      {
+        GList *imgs = g_list_prepend(NULL, GINT_TO_POINTER(dst));
+        for(GList *t = tags; t; t = g_list_next(t)) dt_tag_attach_images(((dt_tag_t *)t->data)->id, imgs, FALSE);
+        g_list_free(imgs);
+      }
+      dt_tag_free_result(&tags);
+      dt_grouping_add_to_group(grpid, dst);
+      if(grpid == src) dt_grouping_change_representative(dst);
+      dt_image_synch_xmp(dst);
+      if(_in_gui)
+        dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
+                                   DT_COLLECTION_PROP_UNDEF, NULL);
+      j->state = _JOB_DONE;
+    }
+  }
+  if(j->handle)
+  {
+    dt_control_job_dispose(j->handle);
+    j->handle = NULL;
+  }
+  _notify_job(j);
+  return G_SOURCE_REMOVE;
+}
+
+static gpointer _ai_denoise_run(gpointer data)
+{
+  _ai_denoise_thread(data);
+  g_idle_add(_ai_denoise_finish, data);
+  return NULL;
+}
+#endif
+
+// AI raw denoise of a photo as a job: a new DNG, imported beside it
+static gboolean _ai_denoise(JsonObject *params, const dt_imgid_t current, JsonBuilder *b, gchar **err)
+{
+#ifndef HAVE_AI
+  *err = g_strdup("this darktable was built without AI (USE_AI)");
+  return FALSE;
+#else
+  const dt_imgid_t imgid = params && json_object_has_member(params, "imgid")
+    ? json_object_get_int_member(params, "imgid") : current;
+  if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
+  {
+    *err = g_strdup_printf("no image with id %d", imgid);
+    return FALSE;
+  }
+  if(!dt_ai_registry_is_enabled())
+  {
+    *err = g_strdup("AI features are off in darktable's preferences (plugins/ai/enabled)");
+    return FALSE;
+  }
+  const double strength = params && json_object_has_member(params, "strength")
+    ? json_object_get_double_member(params, "strength")
+    : (dt_conf_key_exists("plugins/lighttable/neural_restore/raw_strength")
+         ? dt_conf_get_float("plugins/lighttable/neural_restore/raw_strength") : 1.0);
+  if(!(strength >= 0.0 && strength <= 1.0))
+  {
+    *err = g_strdup("strength: 0..1 (blend of the original and the denoised raw)");
+    return FALSE;
+  }
+  // the raw loaded, so its sensor layout is known (neural_restore.c does the same)
+  dt_mipmap_buffer_t warm;
+  dt_mipmap_cache_get(&warm, imgid, DT_MIPMAP_FULL, DT_MIPMAP_BLOCKING, 'r');
+  const gboolean loaded = warm.buf != NULL;
+  dt_mipmap_cache_release(&warm);
+  const dt_image_t *ci = dt_image_cache_get(imgid, 'r');
+  const dt_restore_sensor_class_t cls = ci ? dt_restore_classify_sensor(ci) : DT_RESTORE_SENSOR_CLASS_UNSUPPORTED;
+  dt_image_cache_read_release(ci);
+  if(!loaded || cls == DT_RESTORE_SENSOR_CLASS_UNSUPPORTED)
+  {
+    *err = g_strdup("AI raw denoise needs a raw photo darktable can read (Bayer, X-Trans or linear)");
+    return FALSE;
+  }
+  dt_restore_env_t *env = dt_restore_env_init();
+  const gboolean available = env && dt_restore_rawdenoise_available(env);
+  if(env) dt_restore_env_destroy(env);
+  if(!available)
+  {
+    *err = g_strdup("no AI raw denoise model is installed (darktable's preferences: AI models)");
+    return FALSE;
+  }
+
+  // the output: the panel's pattern, unique, folder created
+  char src[PATH_MAX] = { 0 };
+  gboolean from_cache = FALSE;
+  dt_image_full_path(imgid, src, sizeof(src), &from_cache);
+  const char *pat = params ? json_object_get_string_member_with_default(params, "path", NULL) : NULL;
+  gchar *conf = pat ? NULL : dt_conf_get_string("plugins/lighttable/neural_restore/output_pattern/raw_denoise");
+  const char *pattern = pat ? pat : (conf && *conf ? conf : "$(FILE_FOLDER)/$(FILE.NAME)_restore");
+  dt_variables_params_t *vp = NULL;
+  dt_variables_params_init(&vp);
+  vp->filename = src;
+  vp->jobcode = "neural_restore";
+  vp->imgid = imgid;
+  vp->sequence = 1;
+  gchar *base = dt_variables_expand_path(vp, (gchar *)pattern, TRUE);
+  dt_variables_params_destroy(vp);
+  g_free(conf);
+  if(!base || !*base)
+  {
+    g_free(base);
+    *err = g_strdup("the output pattern expands to nothing");
+    return FALSE;
+  }
+  gchar *dir = g_path_get_dirname(base);
+  if(g_mkdir_with_parents(dir, 0755))
+  {
+    *err = g_strdup_printf("cannot create %s", dir);
+    g_free(dir);
+    g_free(base);
+    return FALSE;
+  }
+  g_free(dir);
+  gchar *file = g_strdup_printf("%s.dng", base);
+  for(int k = 1; g_file_test(file, G_FILE_TEST_EXISTS) && k < 1000; k++)
+  {
+    g_free(file);
+    file = g_strdup_printf("%s_%d.dng", base, k);
+  }
+  g_free(base);
+
+  _job_t *j = g_new0(_job_t, 1);
+  j->id = _next_job++;
+  j->type = "ai_denoise";
+  j->imgid = imgid;
+  j->state = _JOB_RUNNING;
+  j->started = g_get_monotonic_time();
+  j->src = g_strdup(src);
+  j->file = file;
+  j->strength = strength;
+  // darktable's job handle, where darktable's control runs (its window):
+  // progress in its progress bar, and cancel
+  j->handle = dt_control_job_create(NULL, "api: AI denoise %d", imgid);
+  if(j->handle) dt_control_job_add_progress(j->handle, _("AI denoise"), TRUE);
+  _jobs = g_list_append(_jobs, j);
+  j->thread = g_thread_new("api-ai-denoise", _ai_denoise_run, j);
+  _add_job(b, j);
+  json_builder_set_member_name(b, "note");
+  json_builder_add_string_value(b, "runs in the background: job_status, or wait for the \"job\" event");
+  return TRUE;
+#endif
+}
+
 // ---- clients ------------------------------------------------------------
 // stdin/stdout is one client; with a socket, every connection is one. the
 // sockets are GLib sources of the default main context: the engine's own
@@ -5170,12 +5621,34 @@ static void _notify(const struct _client_t *from, const char *type, const dt_img
   g_object_unref(b);
 }
 
+// a job ended: every client hears it (the one that started it too)
+static void _notify_job(const _job_t *j)
+{
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "jsonrpc");
+  json_builder_add_string_value(b, "2.0");
+  json_builder_set_member_name(b, "method");
+  json_builder_add_string_value(b, "event");
+  json_builder_set_member_name(b, "params");
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "type");
+  json_builder_add_string_value(b, "job");
+  _add_job(b, j);
+  json_builder_end_object(b);
+  json_builder_end_object(b);
+  JsonNode *root = json_builder_get_root(b);
+  for(GList *l = _clients; l; l = g_list_next(l)) _send_node(l->data, root);
+  json_node_unref(root);
+  g_object_unref(b);
+}
+
 static const char *_methods[] = {
   "ping", "film_rolls", "images_list", "image_info", "thumbnail", "set_rating", "set_label",
   "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
   "module_enable", "preset_list", "preset_apply", "history_list", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "blend_get", "blend_set", "mask_add", "mask_list",
-  "mask_remove", "mask_ai", "sample", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "module_remove", "module_rename", "history_compress",
+  "mask_remove", "mask_ai", "sample", "ai_denoise", "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "module_remove", "module_rename", "history_compress",
   "render.history_end", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
   "library_status", "library_release", "library_acquire", "handover", "shutdown", NULL };
 
@@ -5239,6 +5712,9 @@ static gboolean _handle(_client_t *c, const gchar *line)
 
   if(err)
     ;
+  else if(_jobs_running() && (!g_strcmp0(method, "library_release") || !g_strcmp0(method, "handover")
+                               || !g_strcmp0(method, "shutdown")))
+    err = g_strdup("a background job is running (job_list): wait for it, or job_cancel it, first");
   else if(_released && g_strcmp0(method, "ping") && g_strcmp0(method, "library_status")
      && g_strcmp0(method, "library_acquire") && g_strcmp0(method, "shutdown")
      && g_strcmp0(method, "handover"))
@@ -5319,6 +5795,14 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _preset_list(params, b, &err);
   else if(!g_strcmp0(method, "preset_apply"))
     _preset_apply(params, b, &err);
+  else if(!g_strcmp0(method, "job_status"))
+    _job_status(params, b, &err);
+  else if(!g_strcmp0(method, "job_list"))
+    _job_list(b, &err);
+  else if(!g_strcmp0(method, "job_cancel"))
+    _job_cancel(params, b, &err);
+  else if(!g_strcmp0(method, "ai_denoise"))
+    _ai_denoise(params, c->current, b, &err);
   else if(!g_strcmp0(method, "module_move"))
     _module_move(params, b, &err);
   else if(!g_strcmp0(method, "curve_get"))

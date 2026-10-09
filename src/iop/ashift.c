@@ -2684,28 +2684,13 @@ static double crop_fitness(double *params, void *data)
 // center coordinates (and optionally the aspect angle) that delivers
 // the largest overall crop area.
 
-static void do_crop(dt_iop_module_t *self, dt_iop_ashift_params_t *p)
+// the crop box (cl, cr, ct, cb) that fits p->cropmode, for an input of
+// width x height pixels; FALSE if the fit failed
+static gboolean _fit_crop_box(const dt_iop_ashift_params_t *p,
+                              const int width,
+                              const int height,
+                              float box[4])
 {
-  dt_iop_ashift_gui_data_t *g = self->gui_data;
-
-  const dt_iop_ashift_bufgeom_t b = _get_buf_geometry(self);
-
-  // if sizes are not ready (module disabled), just ignore this
-  if(b.width == 0 || b.height == 0) return;
-
-  // skip if fitting is still running
-  if(g->fitting) return;
-
-  // reset fit margins if auto-cropping is off
-  if(p->cropmode == ASHIFT_CROP_OFF)
-  {
-    _clear_shadow_crop_box(g);
-    _commit_crop_box(p, g);
-    return;
-  }
-
-  g->fitting = 1;
-
   double params[3];
   int pcount;
 
@@ -2723,8 +2708,8 @@ static void do_crop(dt_iop_module_t *self, dt_iop_ashift_params_t *p)
 
   // prepare structure of constant parameters
   dt_iop_ashift_cropfit_params_t DT_ALIGNED_ARRAY cropfit;
-  cropfit.width = b.width;
-  cropfit.height = b.height;
+  cropfit.width = width;
+  cropfit.height = height;
   _homography((float *)cropfit.homograph, rotation, lensshift_v, lensshift_h,
               shear, f_length_kb,
               orthocorr, aspect, cropfit.width, cropfit.height, ASHIFT_HOMOGRAPH_FORWARD);
@@ -2792,7 +2777,7 @@ static void do_crop(dt_iop_module_t *self, dt_iop_ashift_params_t *p)
                            NMS_CROP_EPSILON, NMS_CROP_SCALE, NMS_CROP_ITERATIONS,
                            crop_constraint, (void*)&cropfit);
   // in case the fit did not converge -> failed
-  if(iter >= NMS_CROP_ITERATIONS) goto failed;
+  if(iter >= NMS_CROP_ITERATIONS) return FALSE;
 
   // the fit did converge -> get clipping margins out of params:
   cropfit.x = dt_isnan(cropfit.x) ? params[0] : cropfit.x;
@@ -2803,7 +2788,7 @@ static void do_crop(dt_iop_module_t *self, dt_iop_ashift_params_t *p)
   const float A = fabs(crop_fitness(params, (void*)&cropfit));
 
   // unlikely to happen but we need to catch this case
-  if(A == 0.0f) goto failed;
+  if(A == 0.0f) return FALSE;
 
   // we need the half diagonal of that rectangle (this is in output
   // image dimensions); no need to check for division by zero here as
@@ -2820,21 +2805,54 @@ static void do_crop(dt_iop_module_t *self, dt_iop_ashift_params_t *p)
   P[1] /= P[2];
 
   // calculate clipping margins relative to output image dimensions
-  g->cl = CLAMP((P[0] - d * cosf(cropfit.alpha)) / owd, 0.0f, 1.0f);
-  g->cr = CLAMP((P[0] + d * cosf(cropfit.alpha)) / owd, 0.0f, 1.0f);
-  g->ct = CLAMP((P[1] - d * sinf(cropfit.alpha)) / oht, 0.0f, 1.0f);
-  g->cb = CLAMP((P[1] + d * sinf(cropfit.alpha)) / oht, 0.0f, 1.0f);
+  box[0] = CLAMP((P[0] - d * cosf(cropfit.alpha)) / owd, 0.0f, 1.0f);
+  box[1] = CLAMP((P[0] + d * cosf(cropfit.alpha)) / owd, 0.0f, 1.0f);
+  box[2] = CLAMP((P[1] - d * sinf(cropfit.alpha)) / oht, 0.0f, 1.0f);
+  box[3] = CLAMP((P[1] + d * sinf(cropfit.alpha)) / oht, 0.0f, 1.0f);
 
   // final sanity check
-  if(g->cr - g->cl <= 0.0f || g->cb - g->ct <= 0.0f) goto failed;
-
-  g->fitting = 0;
+  if(box[1] - box[0] <= 0.0f || box[3] - box[2] <= 0.0f) return FALSE;
 
   dt_print(DT_DEBUG_PIPE | DT_DEBUG_VERBOSE,
     "margins after crop fitting: iter=%d x=%.4f y=%.4f angle=%.4f"
     " crop area (%.4f %.4f %.4f %.4f) wd=%i ht=%i",
     iter, cropfit.x, cropfit.y, cropfit.alpha,
-    g->cl, g->cr, g->ct, g->cb, cropfit.width, cropfit.height);
+    box[0], box[1], box[2], box[3], cropfit.width, cropfit.height);
+  return TRUE;
+}
+
+static void do_crop(dt_iop_module_t *self, dt_iop_ashift_params_t *p)
+{
+  dt_iop_ashift_gui_data_t *g = self->gui_data;
+
+  const dt_iop_ashift_bufgeom_t b = _get_buf_geometry(self);
+
+  // if sizes are not ready (module disabled), just ignore this
+  if(b.width == 0 || b.height == 0) return;
+
+  // skip if fitting is still running
+  if(g->fitting) return;
+
+  // reset fit margins if auto-cropping is off
+  if(p->cropmode == ASHIFT_CROP_OFF)
+  {
+    _clear_shadow_crop_box(g);
+    _commit_crop_box(p, g);
+    return;
+  }
+
+  g->fitting = 1;
+
+  float box[4];
+  if(!_fit_crop_box(p, b.width, b.height, box)) goto failed;
+
+  g->cl = box[0];
+  g->cr = box[1];
+  g->ct = box[2];
+  g->cb = box[3];
+
+  g->fitting = 0;
+
   dt_control_queue_redraw_center();
   return;
 
@@ -2848,6 +2866,30 @@ failed:
   g->fitting = 0;
   dt_control_log(_("automatic cropping failed"));
   return;
+}
+
+// what gui_changed() and do_crop() do to the crop box, for an editor with
+// no GUI: darktable-api (src/api) looks it up by name after changing the
+// rotation. width x height is the module's input. a failed fit switches
+// automatic cropping off, as do_crop() does
+__attribute__((visibility("default")))
+gboolean dt_iop_ashift_fit_crop(dt_iop_params_t *params, const int width, const int height)
+{
+  dt_iop_ashift_params_t *p = params;
+  float box[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
+  const gboolean ok = p->cropmode == ASHIFT_CROP_OFF
+                      || (width > 0 && height > 0 && _fit_crop_box(p, width, height, box));
+  if(!ok)
+  {
+    box[0] = box[2] = 0.0f;
+    box[1] = box[3] = 1.0f;
+    p->cropmode = ASHIFT_CROP_OFF;
+  }
+  p->cl = box[0];
+  p->cr = box[1];
+  p->ct = box[2];
+  p->cb = box[3];
+  return ok;
 }
 
 // manually adjust crop area by shifting its center

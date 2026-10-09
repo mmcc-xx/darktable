@@ -37,8 +37,8 @@
    darkroom shows now, imgid 0 for none. --idle-exit stops the engine that many seconds after the
    last client left, unless an image has unsaved changes.
 
-   the session methods (module_*, history_*, save, reset, render,
-   session_close) work on params.imgid if given, else on the image the
+   the session methods (module_*, history_*, geometry_*, save, reset,
+   render, session_close) work on params.imgid if given, else on the image the
    client last opened.
 
    this server also runs in darktable's window (darktable --api, or
@@ -86,6 +86,17 @@
      history_list                -> the open image's history items, and
                                     history_end
      history_end {end}           -> undo/redo to a step (0 = original)
+     geometry_get                -> orientation {rotation, mirrored}, angle,
+                                    autocrop, crop {left, top, right,
+                                    bottom}, aspect, frame_width/height (what
+                                    the crop box is a fraction of) and the
+                                    output width/height, full size
+     geometry_set {rotate, flip, angle, autocrop, crop, aspect}
+                                 -> turns by 90 degrees (rotate, clockwise)
+                                    or mirrors (flip) in flip, sets the angle
+                                    in ashift and fits its automatic crop as
+                                    the darkroom does, sets crop's box (null
+                                    removes it) and aspect; all or nothing
      save                        -> writes the history to the library (and
                                     the sidecar, if write_sidecar_files
                                     asks for it), as leaving the darkroom does
@@ -104,9 +115,10 @@
                                     database and caches, reloads darktablerc
                                     and restores each draft whose image was
                                     not changed meanwhile
-     render {width, height, path, quality}
+     render {width, height, path, quality, uncropped}
                                  -> writes an sRGB JPEG fitted inside
-                                    width x height to path
+                                    width x height to path; uncropped
+                                    leaves crop's box out
      handover                    -> (engine) releases the library to
                                     darktable's window, replies the unsaved
                                     edits as drafts, and exits
@@ -173,6 +185,9 @@ typedef struct _session_t
 
 static GList *_sessions = NULL;
 static _session_t *_cur = NULL;
+
+// ashift's automatic crop fit (iop/ashift.c: dt_iop_ashift_fit_crop)
+typedef gboolean (*_fit_crop_t)(dt_iop_params_t *params, int width, int height);
 static int _max_sessions = 3;        // each holds a full-size raw and a pipe cache
 
 static gboolean _in_gui = FALSE;     // darktable's window serves the API
@@ -929,6 +944,431 @@ static gboolean _reset(JsonBuilder *b, gchar **err)
   return TRUE;
 }
 
+// ---- geometry: orientation, rotation and crop ------------------------------
+// three modules, as in the darkroom: flip (steps of 90 degrees and mirroring),
+// ashift (rotate and perspective: the angle, and its automatic crop) and crop.
+// crop's box is in fractions of its input: the image as oriented and rotated
+
+// the session whose pipe shows the open image's edit: the darkroom's image
+// renders through a mirror, reloaded from the darkroom's history (written
+// first, as its autosave does) when that changed
+static _session_t *_pipe_session(gchar **err)
+{
+  if(!_cur->gui) return _cur;
+  _session_t *gui = _cur;
+  const dt_imgid_t imgid = gui->dev->image_storage.id;
+  if(!gui->mirror || gui->mirror_gen != _gui_gen || gui->mirror->dev->image_storage.id != imgid)
+  {
+    dt_dev_write_history(gui->dev);
+    if(gui->mirror) _session_free(gui->mirror);
+    gui->mirror = _session_load_ext(imgid, FALSE, err);
+    gui->mirror_gen = _gui_gen;
+  }
+  return gui->mirror;
+}
+
+// parameters changed or modules switched: syncing the nodes is enough, and
+// the cache keeps every line whose inputs are unchanged
+static void _pipe_sync(_session_t *s)
+{
+  if(!s->pipe_changed) return;
+  dt_dev_pixelpipe_synch_all(&s->pipe, s->dev);
+  dt_dev_pixelpipe_get_dimensions(&s->pipe, s->dev, s->pipe.iwidth, s->pipe.iheight,
+                                  &s->pipe.processed_width, &s->pipe.processed_height);
+  s->pipe_changed = FALSE;
+}
+
+// a module's node in a synced pipe; buf_in is its full-size input
+static dt_dev_pixelpipe_iop_t *_piece(_session_t *s, const char *op)
+{
+  for(GList *n = s->pipe.nodes; n; n = g_list_next(n))
+  {
+    dt_dev_pixelpipe_iop_t *piece = n->data;
+    if(!g_strcmp0(piece->module->op, op) && piece->module->multi_priority == 0) return piece;
+  }
+  return NULL;
+}
+
+static double _param(const dt_iop_module_t *m, const char *name)
+{
+  const dt_introspection_field_t *f = _field(m, name);
+  return f ? _get_num(f, (const uint8_t *)m->params + f->header.offset) : 0.0;
+}
+
+static void _set_param(dt_iop_module_t *m, const char *name, const double v)
+{
+  const dt_introspection_field_t *f = _field(m, name);
+  if(f) _set_num(f, (uint8_t *)m->params + f->header.offset, v);
+}
+
+// what flip shows: its orientation, the image's own one if "autodetect"
+static dt_image_orientation_t _orientation(const dt_iop_module_t *flip)
+{
+  if(!flip->enabled) return ORIENTATION_NONE;
+  const dt_image_orientation_t o = _param(flip, "orientation");
+  return o == ORIENTATION_NULL ? dt_image_orientation(&flip->dev->image_storage) : o;
+}
+
+// an orientation as clockwise degrees after an optional horizontal mirror
+static const struct { dt_image_orientation_t o; int degrees; gboolean mirrored; } _orientations[] = {
+  { ORIENTATION_NONE, 0, FALSE }, { ORIENTATION_ROTATE_CW_90_DEG, 90, FALSE },
+  { ORIENTATION_ROTATE_180_DEG, 180, FALSE }, { ORIENTATION_ROTATE_CCW_90_DEG, 270, FALSE },
+  { ORIENTATION_FLIP_HORIZONTALLY, 0, TRUE }, { ORIENTATION_TRANSVERSE, 90, TRUE },
+  { ORIENTATION_FLIP_VERTICALLY, 180, TRUE }, { ORIENTATION_TRANSPOSE, 270, TRUE } };
+
+// what flip's buttons do (iop/flip.c: do_rotate, _flip_h, _flip_v), and what
+// crop does to its box then (iop/crop.c: _crop_handle_flip)
+static dt_image_orientation_t _turn(dt_image_orientation_t o, const dt_image_orientation_t mode, float box[4])
+{
+  const gboolean swapped = o & ORIENTATION_SWAP_XY;
+  if(mode == ORIENTATION_ROTATE_CW_90_DEG)
+    o = (o ^ (swapped ? ORIENTATION_FLIP_X : ORIENTATION_FLIP_Y)) ^ ORIENTATION_SWAP_XY;
+  else if(mode == ORIENTATION_ROTATE_CCW_90_DEG)
+    o = (o ^ (swapped ? ORIENTATION_FLIP_Y : ORIENTATION_FLIP_X)) ^ ORIENTATION_SWAP_XY;
+  else if(mode == ORIENTATION_FLIP_HORIZONTALLY)
+    o ^= swapped ? ORIENTATION_FLIP_VERTICALLY : ORIENTATION_FLIP_HORIZONTALLY;
+  else
+    o ^= swapped ? ORIENTATION_FLIP_HORIZONTALLY : ORIENTATION_FLIP_VERTICALLY;
+
+  // box: left, top, right, bottom
+  const float l = box[0], t = box[1], r = box[2], b = box[3];
+  if(mode == ORIENTATION_FLIP_HORIZONTALLY)      { box[0] = 1.f - r; box[2] = 1.f - l; }
+  else if(mode == ORIENTATION_FLIP_VERTICALLY)   { box[1] = 1.f - b; box[3] = 1.f - t; }
+  else if(mode == ORIENTATION_ROTATE_CW_90_DEG)  { box[0] = 1.f - b; box[1] = l; box[2] = 1.f - t; box[3] = r; }
+  else                                           { box[0] = t; box[1] = 1.f - r; box[2] = b; box[3] = 1.f - l; }
+  return o;
+}
+
+static void _crop_box(const dt_iop_module_t *crop, float box[4])
+{
+  box[0] = _param(crop, "cx");
+  box[1] = _param(crop, "cy");
+  box[2] = _param(crop, "cw");
+  box[3] = _param(crop, "ch");
+}
+
+static gboolean _full_box(const float box[4])
+{
+  return box[0] == 0.f && box[1] == 0.f && box[2] == 1.f && box[3] == 1.f;
+}
+
+// crop's ratio_d/ratio_n as darktable's aspect presets store them: d is the
+// long side, negative when the box's orientation differs from the image's
+// (iop/crop.c: _aspect_ratio_get, _aspect_apply)
+static gchar *_aspect_name(const int d, const int n, const gboolean landscape)
+{
+  if(n == 0 && abs(d) == 1) return g_strdup("original");
+  if(n <= 0 || d == 0) return g_strdup("free");
+  const gboolean wide = (d > 0) == landscape;
+  const int lo = MIN(abs(d), n), hi = MAX(abs(d), n);
+  return wide ? g_strdup_printf("%d:%d", hi, lo) : g_strdup_printf("%d:%d", lo, hi);
+}
+
+// "free", "original", "square" or "W:H" (box width:height, e.g. "3:2" or
+// "2:3"); *w/*h is the box's ratio, 0 for free and original
+static gboolean _parse_aspect(const char *s, int *d, int *n, double *w, double *h, gchar **err)
+{
+  *w = *h = 0.0;
+  if(!g_ascii_strcasecmp(s, "free") || !g_ascii_strcasecmp(s, "freehand")) { *d = *n = 0; return TRUE; }
+  if(!g_ascii_strcasecmp(s, "original")) { *d = 1; *n = 0; return TRUE; }
+  if(!g_ascii_strcasecmp(s, "square")) s = "1:1";
+  gchar **p = g_strsplit(s, ":", 2);
+  gchar *e0 = NULL, *e1 = NULL;
+  const double a = p[0] ? g_ascii_strtod(p[0], &e0) : 0.0;
+  const double b = p[0] && p[1] ? g_ascii_strtod(p[1], &e1) : 0.0;
+  const gboolean ok = e0 && e1 && !*e0 && !*e1 && a > 0.0 && b > 0.0 && a / b < 100.0 && b / a < 100.0;
+  g_strfreev(p);
+  if(!ok)
+  {
+    *err = g_strdup_printf("aspect '%s': use free, original, square or W:H such as 3:2", s);
+    return FALSE;
+  }
+  // crop stores integers: 1.91:1 becomes 191:100
+  const double k = (a == floor(a) && b == floor(b) && a < 100000 && b < 100000) ? 1.0 : 100.0;
+  *w = a;
+  *h = b;
+  *d = (int)round(MAX(a, b) * k);  // the sign is set once the image's orientation is known
+  *n = (int)round(MIN(a, b) * k);
+  return TRUE;
+}
+
+static void _add_box(JsonBuilder *b, const float box[4])
+{
+  static const char *names[] = { "left", "top", "right", "bottom" };
+  json_builder_begin_object(b);
+  for(int k = 0; k < 4; k++)
+  {
+    json_builder_set_member_name(b, names[k]);
+    json_builder_add_double_value(b, round(box[k] * 1e5) / 1e5);
+  }
+  json_builder_end_object(b);
+}
+
+static gboolean _geometry_get(JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  dt_iop_module_t *flip = dt_iop_get_module_by_op_priority(_cur->dev->iop, "flip", 0);
+  dt_iop_module_t *ashift = dt_iop_get_module_by_op_priority(_cur->dev->iop, "ashift", 0);
+  dt_iop_module_t *crop = dt_iop_get_module_by_op_priority(_cur->dev->iop, "crop", 0);
+  _session_t *s = _pipe_session(err);
+  if(!s) return FALSE;
+  _pipe_sync(s);
+  const dt_dev_pixelpipe_iop_t *cp = _piece(s, "crop");
+
+  json_builder_set_member_name(b, "orientation");
+  json_builder_begin_object(b);
+  const dt_image_orientation_t o = flip ? _orientation(flip) : ORIENTATION_NONE;
+  for(int k = 0; k < (int)G_N_ELEMENTS(_orientations); k++)
+    if(_orientations[k].o == o)
+    {
+      json_builder_set_member_name(b, "rotation");
+      json_builder_add_int_value(b, _orientations[k].degrees);
+      json_builder_set_member_name(b, "mirrored");
+      json_builder_add_boolean_value(b, _orientations[k].mirrored);
+    }
+  json_builder_end_object(b);
+
+  json_builder_set_member_name(b, "angle");
+  json_builder_add_double_value(b, ashift && ashift->enabled ? round(_param(ashift, "rotation") * 1e4) / 1e4 : 0.0);
+  if(ashift)
+  {
+    json_builder_set_member_name(b, "autocrop");
+    _add_field_value(b, _field(ashift, "cropmode"), ashift->params);
+  }
+
+  float box[4] = { 0.f, 0.f, 1.f, 1.f };
+  if(crop && crop->enabled) _crop_box(crop, box);
+  json_builder_set_member_name(b, "crop");
+  _add_box(b, box);
+  const int fw = cp ? cp->buf_in.width : s->pipe.processed_width;
+  const int fh = cp ? cp->buf_in.height : s->pipe.processed_height;
+  gchar *aspect = crop && crop->enabled ? _aspect_name(_param(crop, "ratio_d"), _param(crop, "ratio_n"), fw >= fh)
+                                        : g_strdup("free");
+  json_builder_set_member_name(b, "aspect");
+  json_builder_add_string_value(b, aspect);
+  g_free(aspect);
+  json_builder_set_member_name(b, "frame_width");
+  json_builder_add_int_value(b, fw);
+  json_builder_set_member_name(b, "frame_height");
+  json_builder_add_int_value(b, fh);
+  json_builder_set_member_name(b, "width");
+  json_builder_add_int_value(b, s->pipe.processed_width);
+  json_builder_set_member_name(b, "height");
+  json_builder_add_int_value(b, s->pipe.processed_height);
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, _cur->dev->history_end);
+  return TRUE;
+}
+
+// orientation, rotation and crop in one request, all or nothing, applied in
+// pipe order: each module changed becomes a history item, as in the darkroom
+static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  dt_iop_module_t *flip = dt_iop_get_module_by_op_priority(_cur->dev->iop, "flip", 0);
+  dt_iop_module_t *ashift = dt_iop_get_module_by_op_priority(_cur->dev->iop, "ashift", 0);
+  dt_iop_module_t *crop = dt_iop_get_module_by_op_priority(_cur->dev->iop, "crop", 0);
+  if(!flip || !ashift || !crop)
+  {
+    *err = g_strdup("this darktable lacks the flip, ashift or crop module");
+    return FALSE;
+  }
+  JsonNode *n_rotate = params ? json_object_get_member(params, "rotate") : NULL;
+  JsonNode *n_flip = params ? json_object_get_member(params, "flip") : NULL;
+  JsonNode *n_angle = params ? json_object_get_member(params, "angle") : NULL;
+  JsonNode *n_autocrop = params ? json_object_get_member(params, "autocrop") : NULL;
+  JsonNode *n_crop = params ? json_object_get_member(params, "crop") : NULL;
+  JsonNode *n_aspect = params ? json_object_get_member(params, "aspect") : NULL;
+  if(!n_rotate && !n_flip && !n_angle && !n_autocrop && !n_crop && !n_aspect)
+  {
+    *err = g_strdup("geometry_set needs rotate, flip, angle, autocrop, crop or aspect");
+    return FALSE;
+  }
+
+  // check everything before changing anything
+  int turns = 0;
+  if(n_rotate)
+  {
+    const int deg = JSON_NODE_HOLDS_VALUE(n_rotate) ? json_node_get_int(n_rotate) : 1;
+    if(!JSON_NODE_HOLDS_VALUE(n_rotate) || json_node_get_value_type(n_rotate) != G_TYPE_INT64 || deg % 90)
+    {
+      *err = g_strdup("rotate: degrees clockwise, a multiple of 90 (-90 turns left)");
+      return FALSE;
+    }
+    turns = ((deg / 90) % 4 + 4) % 4;
+  }
+  dt_image_orientation_t mirror = 0;
+  if(n_flip)
+  {
+    const char *f = JSON_NODE_HOLDS_VALUE(n_flip) && json_node_get_value_type(n_flip) == G_TYPE_STRING
+                    ? json_node_get_string(n_flip) : "";
+    if(!g_ascii_strcasecmp(f, "horizontal")) mirror = ORIENTATION_FLIP_HORIZONTALLY;
+    else if(!g_ascii_strcasecmp(f, "vertical")) mirror = ORIENTATION_FLIP_VERTICALLY;
+    else
+    {
+      *err = g_strdup("flip: \"horizontal\" or \"vertical\"");
+      return FALSE;
+    }
+  }
+  double angle = 0.0, autocrop = 0.0;
+  if(n_angle && !_parse_value(_field(ashift, "rotation"), n_angle, &angle, err)) return FALSE;
+  if(n_autocrop && !_parse_value(_field(ashift, "cropmode"), n_autocrop, &autocrop, err)) return FALSE;
+  float want[4] = { 0.f, 0.f, 1.f, 1.f };
+  const gboolean uncrop = n_crop && JSON_NODE_HOLDS_NULL(n_crop);
+  if(n_crop && !uncrop)
+  {
+    JsonObject *c = JSON_NODE_HOLDS_OBJECT(n_crop) ? json_node_get_object(n_crop) : NULL;
+    static const char *names[] = { "left", "top", "right", "bottom" };
+    for(int k = 0; k < 4; k++)
+    {
+      JsonNode *v = c ? json_object_get_member(c, names[k]) : NULL;
+      if(!v || !JSON_NODE_HOLDS_VALUE(v)
+         || (json_node_get_value_type(v) != G_TYPE_DOUBLE && json_node_get_value_type(v) != G_TYPE_INT64))
+      {
+        *err = g_strdup("crop: {left, top, right, bottom} as fractions 0..1 of the image, or null for none");
+        return FALSE;
+      }
+      want[k] = json_node_get_double(v);
+    }
+    if(want[0] < 0.f || want[1] < 0.f || want[2] > 1.f || want[3] > 1.f
+       || want[2] - want[0] < 0.01f || want[3] - want[1] < 0.01f)
+    {
+      *err = g_strdup("crop: needs 0 <= left < right <= 1 and 0 <= top < bottom <= 1");
+      return FALSE;
+    }
+  }
+  int ratio_d = 0, ratio_n = 0;
+  double aw = 0.0, ah = 0.0;
+  if(n_aspect)
+  {
+    const char *a = JSON_NODE_HOLDS_VALUE(n_aspect) && json_node_get_value_type(n_aspect) == G_TYPE_STRING
+                    ? json_node_get_string(n_aspect) : "";
+    if(!_parse_aspect(a, &ratio_d, &ratio_n, &aw, &ah, err)) return FALSE;
+    if(uncrop)
+    {
+      *err = g_strdup("crop null removes the crop: no aspect with it");
+      return FALSE;
+    }
+  }
+  _fit_crop_t fit = NULL;
+  if((n_angle || n_autocrop)
+     && !g_module_symbol(ashift->so->module, "dt_iop_ashift_fit_crop", (gpointer *)&fit))
+    fit = NULL;
+
+  // flip first, then ashift, then crop: each one changes what the next sees
+  float box[4];
+  _crop_box(crop, box);
+  const gboolean had_box = !_full_box(box);
+  if(turns || mirror)
+  {
+    dt_image_orientation_t o = _orientation(flip);
+    const dt_image_orientation_t mode = turns == 3 ? ORIENTATION_ROTATE_CCW_90_DEG : ORIENTATION_ROTATE_CW_90_DEG;
+    for(int k = 0; k < (turns == 3 ? 1 : turns); k++) o = _turn(o, mode, box);
+    if(mirror) o = _turn(o, mirror, box);
+    _set_param(flip, "orientation", o);
+    _record(flip, TRUE);
+    if(had_box && !n_crop)
+    {
+      // as the darkroom does: the box follows the image
+      _set_param(crop, "cx", box[0]);
+      _set_param(crop, "cy", box[1]);
+      _set_param(crop, "cw", box[2]);
+      _set_param(crop, "ch", box[3]);
+      _record(crop, FALSE);
+    }
+  }
+
+  gboolean autocropped = TRUE;
+  if(n_angle || n_autocrop)
+  {
+    if(n_angle) _set_param(ashift, "rotation", angle);
+    if(n_autocrop) _set_param(ashift, "cropmode", autocrop);
+    // what gui_changed() does in the darkroom: fit the automatic crop to the
+    // new rotation. ashift's input doesn't depend on any change above
+    _session_t *s = _pipe_session(err);
+    if(!s) return FALSE;
+    _pipe_sync(s);
+    const dt_dev_pixelpipe_iop_t *ap = _piece(s, "ashift");
+    if(fit && ap)
+      autocropped = fit(ashift->params, ap->buf_in.width, ap->buf_in.height);
+    else
+      autocropped = FALSE;
+    _record(ashift, TRUE);
+  }
+
+  if(n_crop || n_aspect)
+  {
+    if(n_crop) memcpy(box, want, sizeof(box));
+    else _crop_box(crop, box);
+    if(uncrop)
+    {
+      memcpy(box, (float[4]){ 0.f, 0.f, 1.f, 1.f }, sizeof(box));
+    }
+    else if(n_aspect)
+    {
+      // the largest box of that aspect inside the given (or current) one,
+      // centered on it, in pixels of crop's input
+      _session_t *s = _pipe_session(err);
+      if(!s) return FALSE;
+      _pipe_sync(s);
+      const dt_dev_pixelpipe_iop_t *cp = _piece(s, "crop");
+      const double fw = cp ? cp->buf_in.width : s->pipe.processed_width;
+      const double fh = cp ? cp->buf_in.height : s->pipe.processed_height;
+      const gboolean landscape = fw >= fh;
+      if(ratio_n == 0 && ratio_d == 1)
+      {
+        // the sensor's ratio, oriented as the image
+        const double pw = _cur->dev->image_storage.p_width, ph = _cur->dev->image_storage.p_height;
+        aw = landscape ? MAX(pw, ph) : MIN(pw, ph);
+        ah = landscape ? MIN(pw, ph) : MAX(pw, ph);
+      }
+      else if(ratio_d)
+        ratio_d = (aw >= ah) == landscape ? ratio_d : -ratio_d;
+      if(aw > 0.0 && ah > 0.0 && fw > 0.0 && fh > 0.0)
+      {
+        double bw = (box[2] - box[0]) * fw, bh = (box[3] - box[1]) * fh;
+        const double cx = (box[0] + box[2]) / 2.0 * fw, cy = (box[1] + box[3]) / 2.0 * fh;
+        if(bw / bh > aw / ah) bw = bh * aw / ah;
+        else bh = bw * ah / aw;
+        box[0] = (cx - bw / 2.0) / fw;
+        box[2] = (cx + bw / 2.0) / fw;
+        box[1] = (cy - bh / 2.0) / fh;
+        box[3] = (cy + bh / 2.0) / fh;
+      }
+      _set_param(crop, "ratio_d", ratio_d);
+      _set_param(crop, "ratio_n", ratio_n);
+    }
+    else
+    {
+      // a box without an aspect is freehand
+      _set_param(crop, "ratio_d", 0);
+      _set_param(crop, "ratio_n", 0);
+    }
+    _set_param(crop, "cx", box[0]);
+    _set_param(crop, "cy", box[1]);
+    _set_param(crop, "cw", box[2]);
+    _set_param(crop, "ch", box[3]);
+    if(uncrop) crop->enabled = FALSE;
+    _record(crop, !uncrop);
+  }
+
+  if(!_geometry_get(b, err)) return FALSE;
+  if(n_angle || n_autocrop)
+  {
+    json_builder_set_member_name(b, "autocrop_fitted");
+    json_builder_add_boolean_value(b, autocropped);
+  }
+  return TRUE;
+}
+
 // ---- releasing and taking back the library -------------------------------
 // while released, darktable's GUI (or another engine) may own the library.
 // the engine keeps running with no database, no image cache and no mipmap
@@ -1604,22 +2044,14 @@ static gboolean _set_label(JsonObject *params, JsonBuilder *b, gchar **err)
 
 static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err);
 
-// the darkroom's image renders through a mirror session, reloaded from the
-// darkroom's history (written first, as its autosave does) when that changed
+// the darkroom's image renders through its mirror (_pipe_session)
 static gboolean _render(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur || !_cur->gui) return _render_session(params, b, err);
   _session_t *gui = _cur;
-  const dt_imgid_t imgid = gui->dev->image_storage.id;
-  if(!gui->mirror || gui->mirror_gen != _gui_gen || gui->mirror->dev->image_storage.id != imgid)
-  {
-    dt_dev_write_history(gui->dev);
-    if(gui->mirror) _session_free(gui->mirror);
-    gui->mirror = _session_load_ext(imgid, FALSE, err);
-    gui->mirror_gen = _gui_gen;
-    if(!gui->mirror) return FALSE;
-  }
-  _cur = gui->mirror;
+  _session_t *mirror = _pipe_session(err);
+  if(!mirror) return FALSE;
+  _cur = mirror;
   const gboolean ok = _render_session(params, b, err);
   _cur = gui;
   return ok;
@@ -1643,14 +2075,17 @@ static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
   }
 
   const gint64 t0 = g_get_monotonic_time();
-  if(_cur->pipe_changed)
+  _pipe_sync(_cur);
+  // uncropped: without crop's box, as the darkroom shows the image while
+  // crop has the focus, for drawing a box on
+  dt_dev_pixelpipe_iop_t *crop = params && json_object_get_boolean_member_with_default(params, "uncropped", FALSE)
+                                 ? _piece(_cur, "crop") : NULL;
+  if(crop && !crop->enabled) crop = NULL;
+  if(crop)
   {
-    // parameters changed or modules switched: syncing the nodes is enough,
-    // and the cache keeps every line whose inputs are unchanged
-    dt_dev_pixelpipe_synch_all(&_cur->pipe, _cur->dev);
+    crop->enabled = FALSE;
     dt_dev_pixelpipe_get_dimensions(&_cur->pipe, _cur->dev, _cur->pipe.iwidth, _cur->pipe.iheight,
                                     &_cur->pipe.processed_width, &_cur->pipe.processed_height);
-    _cur->pipe_changed = FALSE;
   }
   const double scale = fmin(1.0, fmin((double)max_w / _cur->pipe.processed_width,
                                       (double)max_h / _cur->pipe.processed_height));
@@ -1667,6 +2102,12 @@ static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
   if(finalscale) finalscale->enabled = FALSE;
   dt_dev_pixelpipe_process(&_cur->pipe, _cur->dev, 0, 0, w, h, scale, DT_DEVICE_NONE);
   if(finalscale) finalscale->enabled = TRUE;
+  if(crop)
+  {
+    crop->enabled = TRUE;
+    dt_dev_pixelpipe_get_dimensions(&_cur->pipe, _cur->dev, _cur->pipe.iwidth, _cur->pipe.iheight,
+                                    &_cur->pipe.processed_width, &_cur->pipe.processed_height);
+  }
   const gint64 t1 = g_get_monotonic_time();
 
   if(!_cur->pipe.backbuf || _cur->pipe.backbuf_width != w || _cur->pipe.backbuf_height != h)
@@ -1698,6 +2139,8 @@ static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
   json_builder_add_int_value(b, w);
   json_builder_set_member_name(b, "height");
   json_builder_add_int_value(b, h);
+  json_builder_set_member_name(b, "uncropped");
+  json_builder_add_boolean_value(b, crop != NULL);
   json_builder_set_member_name(b, "process_ms");
   json_builder_add_int_value(b, (t1 - t0) / 1000);
   json_builder_set_member_name(b, "jpeg_ms");
@@ -1861,7 +2304,8 @@ static void _notify(const struct _client_t *from, const char *type, const dt_img
 // methods that work on an edit session, and the event each one sends
 static const struct { const char *method; const char *event; } _session_methods[] = {
   { "module_list", NULL }, { "module_get", NULL }, { "history_list", NULL }, { "render", NULL },
-  { "module_set", "edit" }, { "module_enable", "edit" }, { "history_end", "edit" },
+  { "geometry_get", NULL },
+  { "module_set", "edit" }, { "module_enable", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" },
   { "save", "saved" }, { "reset", "reset" }, { "session_close", "closed" }, { NULL, NULL } };
 
 // returns FALSE when the engine should stop
@@ -1972,6 +2416,10 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _module_enable(params, b, &err);
   else if(!g_strcmp0(method, "history_list"))
     _history_list(b, &err);
+  else if(!g_strcmp0(method, "geometry_get"))
+    _geometry_get(b, &err);
+  else if(!g_strcmp0(method, "geometry_set"))
+    _geometry_set(params, b, &err);
   else if(!g_strcmp0(method, "history_end"))
     _history_end(params, b, &err);
   else if(!g_strcmp0(method, "save"))

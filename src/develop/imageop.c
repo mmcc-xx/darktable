@@ -2444,10 +2444,12 @@ void dt_iop_commit_params(dt_iop_module_t *module,
     {
       phash = dt_hash(phash, blendop_params, sizeof(dt_develop_blend_params_t));
 
-      dt_masks_form_t *grp = dt_masks_get_from_id(darktable.develop, blendop_params->mask_id);
+      // the module's own develop: a pipe of another image than the
+      // darkroom's (an export, darktable-api) has its own shapes
+      dt_masks_form_t *grp = dt_masks_get_from_id(module->dev, blendop_params->mask_id);
       if(grp)
       {
-        phash = dt_masks_group_hash(phash, grp);
+        phash = dt_masks_group_hash_ext(phash, grp, module->dev->forms);
       }
     }
   }

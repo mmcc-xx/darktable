@@ -121,6 +121,7 @@ message.
 | `geometry_set {rotate, flip, angle, autocrop, crop, aspect}` | as the darkroom does, all or nothing: `rotate` turns by 90° steps (clockwise; -90 left) and `flip` (`horizontal`/`vertical`) mirrors in the flip module, and an existing crop box follows; `angle` straightens (degrees, positive turns counter-clockwise) and the automatic crop is refitted as ashift's GUI does; `crop` sets the box (`null` removes it); `aspect` (`free`, `original`, `square`, `W:H`) fits the largest box of that ratio inside the given or current one |
 | `save` | write the history to the library (and the sidecar, if `write_sidecar_files` asks for it), as leaving the darkroom does |
 | `reset` | discard the history and reload, so darktable applies the workflow defaults and auto-apply presets again |
+| `export {imgid, format, quality, max_width, max_height, high_quality, upscale, style, path, on_conflict, save}` | darktable's export of the image's saved edit through a format module, as the export module does: its settings (format, size, quality, output pattern `$(FILE_FOLDER)/darktable_exported/$(FILE_NAME)`, conflict handling, metadata, ICC profile) unless given; tags the image `darktable|exported`. Unsaved changes are refused unless `save` is true. Replies `file`, or `skipped` when `on_conflict` (`unique`, `overwrite`, `overwrite_if_changed`, `skip`) leaves an existing file alone. Runs on the request thread (darktable's window pauses while it exports) |
 | `render {width, height, path, quality, uncropped}` | sRGB JPEG fitted inside width x height; `uncropped` leaves crop's box out (as the darkroom shows the image while crop has the focus), to draw a box on |
 | `library_status` / `library_release` / `library_acquire` | hand the library to darktable's GUI and take it back while running; unsaved edits of every open photo are kept and restored if the photo wasn't changed meanwhile |
 | `shutdown` | close and exit (SIGTERM does the same) |
@@ -145,7 +146,8 @@ about 1/255 (mean absolute difference).
 - settings the GUI adjusts alongside a change (`gui_changed`), pickers and
   other operations whose logic lives in GUI code
 - array fields (e.g. channel mixer coefficients), masks, module instances
-  and order, styles, export, tags and metadata, import
+  and order, styles, tags and metadata, import; export to storages other
+  than disk
 - perspective correction (ashift's line detection and fitting); the
   geometry calls cover orientation, straightening and crop only
 - `shutdown` stops the engine for every client

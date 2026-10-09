@@ -115,6 +115,18 @@
                                     database and caches, reloads darktablerc
                                     and restores each draft whose image was
                                     not changed meanwhile
+     export {imgid, format, quality, max_width, max_height, high_quality,
+             upscale, style, path, on_conflict, save}
+                                 -> exports the image's saved edit as
+                                    darktable's export module does (its
+                                    settings unless given): format and disk
+                                    storage modules, metadata, tags. path is
+                                    a variable pattern without extension.
+                                    on_conflict: unique, overwrite,
+                                    overwrite_if_changed or skip.
+                                    save: true saves unsaved changes first;
+                                    without it they are refused. replies
+                                    the file written, or skipped
      render {width, height, path, quality, uncropped}
                                  -> writes an sRGB JPEG fitted inside
                                     width x height to path; uncropped
@@ -140,10 +152,15 @@
 #include "common/iop_order.h"
 #include "common/mipmap_cache.h"
 #include "common/ratings.h"
+#include "common/styles.h"
+#include "common/tags.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
 #include "develop/pixelpipe_hb.h"
 #include "imageio/imageio_jpeg.h"
+#include "imageio/imageio_module.h"
+#include "common/datetime.h"
+#include "common/variables.h"
 #include "control/signal.h"
 #include "views/view.h"
 
@@ -868,6 +885,26 @@ static gboolean _history_end(JsonObject *params, JsonBuilder *b, gchar **err)
   return TRUE;
 }
 
+static gboolean _save_session(_session_t *s)
+{
+  const dt_imgid_t imgid = s->dev->image_storage.id;
+  // the history hash alone can miss a change: a draft restored after a
+  // release can match the hash of an older thumbnail
+  const gboolean was_dirty = s->dirty;
+  dt_dev_write_history(s->dev);
+  s->dirty = FALSE;
+  const gboolean changed = was_dirty || !dt_history_hash_is_mipmap_synced(imgid);
+  if(changed)
+  {
+    dt_image_cache_set_change_timestamp(imgid);
+    dt_mipmap_cache_remove(imgid);
+    dt_image_update_final_size(imgid);
+    dt_image_write_sidecar_file(imgid);
+    dt_history_hash_set_mipmap(imgid);
+  }
+  return changed;
+}
+
 // what the darkroom does when it leaves an image (views/darkroom.c, leave()):
 // write the history, then invalidate the thumbnails and write the sidecar if
 // the edit changed. the sidecar follows write_sidecar_files, so a library
@@ -879,22 +916,8 @@ static gboolean _save(JsonBuilder *b, gchar **err)
     *err = g_strdup("no open session");
     return FALSE;
   }
-  const dt_imgid_t imgid = _cur->dev->image_storage.id;
   const gint64 t0 = g_get_monotonic_time();
-  // the history hash alone can miss a change: a draft restored after a
-  // release can match the hash of an older thumbnail
-  const gboolean was_dirty = _cur->dirty;
-  dt_dev_write_history(_cur->dev);
-  _cur->dirty = FALSE;
-  const gboolean changed = was_dirty || !dt_history_hash_is_mipmap_synced(imgid);
-  if(changed)
-  {
-    dt_image_cache_set_change_timestamp(imgid);
-    dt_mipmap_cache_remove(imgid);
-    dt_image_update_final_size(imgid);
-    dt_image_write_sidecar_file(imgid);
-    dt_history_hash_set_mipmap(imgid);
-  }
+  const gboolean changed = _save_session(_cur);
   json_builder_set_member_name(b, "changed");
   json_builder_add_boolean_value(b, changed);
   json_builder_set_member_name(b, "history_end");
@@ -1366,6 +1389,317 @@ static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
     json_builder_set_member_name(b, "autocrop_fitted");
     json_builder_add_boolean_value(b, autocropped);
   }
+  return TRUE;
+}
+
+// ---- export ----------------------------------------------------------------
+// darktable's export: the disk storage and a format module, with the export
+// module's settings (libs/export.c) unless the request overrides them, as
+// _control_export_job_run (control/jobs/control_jobs.c) runs it. it exports
+// the image's saved history, as the lighttable does
+
+// the file the disk storage would write for imgid (imageio/storage/disk.c,
+// store()): the pattern expanded, a directory getting $(FILE_NAME), the
+// folder created, the extension added and the conflict setting applied.
+// worked out here because the storage doesn't report its file, and its
+// signal (DT_SIGNAL_IMAGE_EXPORT_TMPFILE) isn't raised without darktable's
+// control running, as in the engine. NULL with *skipped when the conflict
+// setting leaves an existing file alone
+static gchar *_export_target(const dt_imgid_t imgid, const char *pattern_in, const int on_conflict,
+                             dt_imageio_module_format_t *format, dt_imageio_module_data_t *fdata,
+                             const gboolean upscale, gboolean *skipped, gchar **err)
+{
+  *skipped = FALSE;
+  char input[PATH_MAX] = { 0 };
+  dt_image_full_path(imgid, input, sizeof(input), NULL);
+  dt_variables_params_t *vp = NULL;
+  dt_variables_params_init(&vp);
+  dt_variables_set_max_width_height(vp, fdata->max_width, fdata->max_height);
+  dt_variables_set_upscale(vp, upscale);
+  vp->filename = input;
+  vp->jobcode = "export";
+  vp->imgid = imgid;
+  vp->sequence = 1;
+
+  gchar *pattern = dt_util_fix_path(pattern_in);
+  gchar *base = dt_variables_expand_path(vp, pattern, TRUE);
+  const size_t n = base ? strlen(base) : 0;
+  if(n && (base[n - 1] == '/' || base[n - 1] == '\\'))
+  {
+    // a pattern that expands to a directory gets $(FILE_NAME)
+    size_t k = strlen(pattern);
+    while(k > 1 && (pattern[k - 1] == '/' || pattern[k - 1] == '\\')) pattern[--k] = '\0';
+    gchar *p2 = g_strconcat(pattern, G_DIR_SEPARATOR_S "$(FILE_NAME)", NULL);
+    g_free(base);
+    base = dt_variables_expand_path(vp, p2, TRUE);
+    g_free(p2);
+  }
+  g_free(pattern);
+  dt_variables_params_destroy(vp);
+  if(!base || !*base)
+  {
+    g_free(base);
+    *err = g_strdup_printf("the path pattern '%s' expands to nothing", pattern_in);
+    return NULL;
+  }
+
+  gchar *dir = g_path_get_dirname(base);
+  if(g_mkdir_with_parents(dir, 0755) || g_access(dir, W_OK | X_OK))
+  {
+    *err = g_strdup_printf("cannot write to the folder '%s'", dir);
+    g_free(dir);
+    g_free(base);
+    return NULL;
+  }
+  g_free(dir);
+
+  const char *ext = format->extension(fdata);
+  gchar *file = g_strdup_printf("%s.%s", base, ext);
+  if(g_file_test(file, G_FILE_TEST_EXISTS))
+  {
+    if(on_conflict == 0)          // a unique name: _01, _02, ...
+      for(int seq = 1; g_file_test(file, G_FILE_TEST_EXISTS); seq++)
+      {
+        g_free(file);
+        file = g_strdup_printf("%s_%.2d.%s", base, seq, ext);
+      }
+    else if(on_conflict == 3)     // skip
+      *skipped = TRUE;
+    else if(on_conflict == 2)     // overwrite if the edit changed since
+    {
+      GStatBuf st;
+      const dt_image_t *img = dt_image_cache_get(imgid, 'r');
+      const GTimeSpan changed = img ? img->change_timestamp : 0;
+      dt_image_cache_read_release(img);
+      if(!g_stat(file, &st))
+      {
+        GDateTime *gdt = g_date_time_new_from_unix_local(st.st_mtime);
+        *skipped = dt_datetime_gdatetime_to_gtimespan(gdt) > changed;
+        g_date_time_unref(gdt);
+      }
+    }
+  }
+  g_free(base);
+  if(*skipped)
+  {
+    g_free(file);
+    return NULL;
+  }
+  return file;
+}
+
+// a conf key set for one request, then put back
+typedef struct _conf_override_t
+{
+  gchar *key;
+  gchar *saved;
+} _conf_override_t;
+
+static void _conf_override(GList **list, const char *key, const char *value)
+{
+  _conf_override_t *o = g_new0(_conf_override_t, 1);
+  o->key = g_strdup(key);
+  o->saved = dt_conf_key_exists(key) ? dt_conf_get_string(key) : NULL;
+  dt_conf_set_string(key, value);
+  *list = g_list_prepend(*list, o);
+}
+
+static void _conf_restore(GList *list)
+{
+  for(GList *l = list; l; l = g_list_next(l))
+  {
+    _conf_override_t *o = l->data;
+    dt_conf_set_string(o->key, o->saved ? o->saved : "");
+    g_free(o->key);
+    g_free(o->saved);
+    g_free(o);
+  }
+  g_list_free(list);
+}
+
+static gboolean _export(JsonObject *params, const dt_imgid_t current, gboolean *saved,
+                        JsonBuilder *b, gchar **err)
+{
+  const dt_imgid_t imgid = params && json_object_has_member(params, "imgid")
+    ? json_object_get_int_member(params, "imgid") : current;
+  if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
+  {
+    *err = g_strdup_printf("no image with id %d", imgid);
+    return FALSE;
+  }
+  const gchar *fmt_name = params ? json_object_get_string_member_with_default(params, "format", NULL) : NULL;
+  const gchar *pattern = params ? json_object_get_string_member_with_default(params, "path", NULL) : NULL;
+  const gchar *conflict = params ? json_object_get_string_member_with_default(params, "on_conflict", NULL) : NULL;
+  const gchar *style = params ? json_object_get_string_member_with_default(params, "style", NULL) : NULL;
+  const int quality = params ? json_object_get_int_member_with_default(params, "quality", 0) : 0;
+  const int max_w = params ? json_object_get_int_member_with_default(params, "max_width", -1) : -1;
+  const int max_h = params ? json_object_get_int_member_with_default(params, "max_height", -1) : -1;
+  const gboolean save = params ? json_object_get_boolean_member_with_default(params, "save", FALSE) : FALSE;
+  const gboolean hq = params && json_object_has_member(params, "high_quality")
+    ? json_object_get_boolean_member(params, "high_quality")
+    : dt_conf_get_bool("plugins/lighttable/export/high_quality_processing");
+  const gboolean upscale = params && json_object_has_member(params, "upscale")
+    ? json_object_get_boolean_member(params, "upscale")
+    : dt_conf_get_bool("plugins/lighttable/export/upscale");
+
+  // in the disk storage's numbering (imageio/storage/disk.c:54); the
+  // default is its setting
+  static const char *conflicts[] = { "unique", "overwrite", "overwrite_if_changed", "skip", NULL };
+  int conflict_action = -1;
+  for(int k = 0; conflict && conflicts[k]; k++)
+    if(!g_strcmp0(conflict, conflicts[k])) conflict_action = k;
+  if(conflict && conflict_action < 0)
+  {
+    *err = g_strdup("on_conflict: unique, overwrite, overwrite_if_changed or skip");
+    return FALSE;
+  }
+  if(max_w < -1 || max_h < -1)
+  {
+    *err = g_strdup("max_width/max_height: pixels, 0 for no limit");
+    return FALSE;
+  }
+
+  // darktable knows these by other names (cli/main.c)
+  const char *want = fmt_name ? fmt_name : dt_conf_get_string_const("plugins/lighttable/export/format_name");
+  if(!g_ascii_strcasecmp(want, "jpg")) want = "jpeg";
+  else if(!g_ascii_strcasecmp(want, "tif")) want = "tiff";
+  else if(!g_ascii_strcasecmp(want, "jxl")) want = "jpegxl";
+  dt_imageio_module_format_t *format = dt_imageio_get_format_by_name(want);
+  dt_imageio_module_storage_t *storage = dt_imageio_get_storage_by_name("disk");
+  if(!format || !storage)
+  {
+    *err = g_strdup_printf(format ? "no disk storage module" : "unknown format '%s'", want);
+    return FALSE;
+  }
+  if(style && *style && !dt_styles_exists(style))
+  {
+    *err = g_strdup_printf("no style '%s'", style);
+    return FALSE;
+  }
+
+  // the export reads the saved history: unsaved changes are saved first on
+  // request, else refused. the darkroom's edit is saved as its autosave does
+  _session_t *s = _session_find(imgid);
+  *saved = FALSE;
+  if(s && s->gui)
+    dt_dev_write_history(s->dev);
+  else if(s && s->dirty)
+  {
+    if(!save)
+    {
+      *err = g_strdup("the image has unsaved changes, and export uses the saved edit: save first,"
+                      " or pass save: true");
+      return FALSE;
+    }
+    _save_session(s);
+    *saved = TRUE;
+  }
+
+  const gint64 t0 = g_get_monotonic_time();
+  // the format module reads its settings from darktablerc in get_params,
+  // so the request's quality goes there for the duration
+  GList *overrides = NULL;
+  gchar *qkey = g_strdup_printf("plugins/imageio/format/%s/quality", format->plugin_name);
+  if(quality > 0 && dt_conf_key_exists(qkey))
+  {
+    gchar *v = g_strdup_printf("%d", CLAMP(quality, 1, 100));
+    _conf_override(&overrides, qkey, v);
+    g_free(v);
+  }
+  g_free(qkey);
+  dt_imageio_module_data_t *sdata = storage->get_params(storage);
+  dt_imageio_module_data_t *fdata = format->get_params(format);
+  _conf_restore(overrides);
+  if(!sdata || !fdata)
+  {
+    if(sdata) storage->free_params(storage, sdata);
+    if(fdata) format->free_params(format, fdata);
+    *err = g_strdup("the export modules returned no settings");
+    return FALSE;
+  }
+
+  // the size: the request's, else the export module's, within what the
+  // format and storage allow (as _control_export_job_run)
+  uint32_t mw = max_w >= 0 ? max_w : dt_conf_get_int("plugins/lighttable/export/width");
+  uint32_t mh = max_h >= 0 ? max_h : dt_conf_get_int("plugins/lighttable/export/height");
+  if(upscale)
+  {
+    if(mw == 0 && mh != 0) mw = mh * 100;
+    else if(mh == 0 && mw != 0) mh = mw * 100;
+  }
+  uint32_t fw = 0, fh = 0, sw = 0, sh = 0;
+  storage->dimension(storage, sdata, &sw, &sh);
+  format->dimension(format, fdata, &fw, &fh);
+  const uint32_t w = (sw == 0 || fw == 0) ? MAX(sw, fw) : MIN(sw, fw);
+  const uint32_t h = (sh == 0 || fh == 0) ? MAX(sh, fh) : MIN(sh, fh);
+  fdata->max_width = (mw != 0 && w != 0) ? MIN(w, mw) : MAX(w, mw);
+  fdata->max_height = (mh != 0 && h != 0) ? MIN(h, mh) : MAX(h, mh);
+  g_strlcpy(fdata->style, style ? style : dt_conf_get_string_const("plugins/lighttable/export/style"),
+            sizeof(fdata->style));
+  fdata->style_append = dt_conf_get_bool("plugins/lighttable/export/style_append");
+
+  // the metadata the export module is set to write
+  gchar *mconf = dt_lib_export_metadata_get_conf();
+  if(!g_strstr_len(mconf, -1, "Iptc.Envelope.CharacterSet"))
+    dt_util_str_cat(&mconf, "\1%s\1%s", "Iptc.Envelope.CharacterSet", "\x1b%G");
+  dt_export_metadata_t metadata = { 0 };
+  metadata.list = dt_util_str_to_glist("\1", mconf);
+  g_free(mconf);
+  if(metadata.list)
+  {
+    metadata.flags = strtol(metadata.list->data, NULL, 16);
+    metadata.list = g_list_remove(metadata.list, metadata.list->data);
+  }
+
+  const dt_colorspaces_color_profile_type_t icc_type = dt_conf_get_int("plugins/lighttable/export/icctype");
+  gchar *icc_filename = dt_conf_get_string("plugins/lighttable/export/iccprofile");
+  const dt_iop_color_intent_t icc_intent = dt_conf_get_int("plugins/lighttable/export/iccintent");
+
+  const char *pat = pattern ? pattern : dt_conf_get_string_const("plugins/imageio/storage/disk/file_directory");
+  const int on_conflict = conflict ? conflict_action : dt_conf_get_int("plugins/imageio/storage/disk/overwrite");
+  gboolean skipped = FALSE;
+  gchar *file = _export_target(imgid, pat, on_conflict, format, fdata, upscale, &skipped, err);
+  // as the disk storage's store() does
+  const gboolean failed = file && dt_imageio_export(imgid, file, format, fdata, hq, upscale, FALSE, 1.0,
+                                                    TRUE, FALSE, icc_type, icc_filename, icc_intent,
+                                                    storage, sdata, 1, 1, &metadata);
+  g_list_free_full(metadata.list, g_free);
+  g_free(icc_filename);
+  storage->free_params(storage, sdata);
+  format->free_params(format, fdata);
+  if(!file && !skipped) return FALSE;
+  if(failed)
+  {
+    *err = g_strdup_printf("could not export to '%s'", file);
+    g_free(file);
+    return FALSE;
+  }
+  if(file)
+  {
+    // as the export job: tagged exported, no longer changed
+    guint tagid = 0, etagid = 0;
+    dt_tag_new("darktable|changed", &tagid);
+    dt_tag_new("darktable|exported", &etagid);
+    dt_tag_detach(tagid, imgid, FALSE, FALSE);
+    dt_tag_attach(etagid, imgid, FALSE, FALSE);
+    dt_image_cache_set_export_timestamp(imgid);
+  }
+
+  json_builder_set_member_name(b, "imgid");
+  json_builder_add_int_value(b, imgid);
+  json_builder_set_member_name(b, "file");
+  if(file) json_builder_add_string_value(b, file);
+  else json_builder_add_null_value(b);
+  // the conflict setting can leave an existing file alone
+  json_builder_set_member_name(b, "skipped");
+  json_builder_add_boolean_value(b, skipped);
+  json_builder_set_member_name(b, "format");
+  json_builder_add_string_value(b, format->plugin_name);
+  json_builder_set_member_name(b, "saved");
+  json_builder_add_boolean_value(b, *saved);
+  json_builder_set_member_name(b, "ms");
+  json_builder_add_int_value(b, (g_get_monotonic_time() - t0) / 1000);
+  g_free(file);
   return TRUE;
 }
 
@@ -2377,6 +2711,16 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _image_info(params, b, &err);
   else if(!g_strcmp0(method, "thumbnail"))
     _thumbnail(params, b, &err);
+  else if(!g_strcmp0(method, "export"))
+  {
+    gboolean saved = FALSE;
+    if(_export(params, c->current, &saved, b, &err) && saved)
+    {
+      event = "saved";
+      event_img = params && json_object_has_member(params, "imgid")
+        ? json_object_get_int_member(params, "imgid") : c->current;
+    }
+  }
   else if(!g_strcmp0(method, "set_rating") || !g_strcmp0(method, "set_label"))
   {
     if(!g_strcmp0(method, "set_rating") ? _set_rating(params, b, &err) : _set_label(params, b, &err))

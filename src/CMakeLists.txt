@@ -183,6 +183,13 @@ FILE(GLOB SOURCE_FILES
   "views/view.c"
   )
 
+# the darktable-api request server, used by the darktable-api engine and by
+# darktable's window (--api)
+if(USE_MCP)
+  list(APPEND SOURCE_FILES "api/server.c")
+  add_definitions(-DHAVE_API)
+endif()
+
 FILE(GLOB HEADER_FILES "*.h" "common/*.h" "external/OpenCL/CL/*.h" "control/*.h" "iop/*.h" "libs/*.h" "views/*.h")
 
 if(APPLE)
@@ -1227,7 +1234,9 @@ add_subdirectory(cli)
 # have a Model Context Protocol server exposing the raw engine to AI agents
 if(USE_MCP)
   add_subdirectory(mcp)
-  # long-running edit engine (proof of concept), built with the MCP server
+  # long-running edit engine (proof of concept), built with the MCP server;
+  # its request server is part of libdarktable (see below), so that
+  # darktable's window can serve the same API
   add_subdirectory(api)
 endif()
 

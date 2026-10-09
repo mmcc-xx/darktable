@@ -482,6 +482,10 @@ extern const dt_masks_functions_t dt_masks_functions_brush;
 extern const dt_masks_functions_t dt_masks_functions_path;
 extern const dt_masks_functions_t dt_masks_functions_gradient;
 extern const dt_masks_functions_t dt_masks_functions_group;
+/** smooth control points through a path's or brush's corners, for points
+ * made in code (as the shape tools do for drawn ones) */
+void dt_masks_path_init_ctrl_points(dt_masks_form_t *form);
+void dt_masks_brush_init_ctrl_points(dt_masks_form_t *form);
 #ifdef HAVE_AI
 extern const dt_masks_functions_t dt_masks_functions_object;
 /** check if AI object mask model is downloaded and AI is enabled */

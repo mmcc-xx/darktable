@@ -124,12 +124,14 @@ message.
 | `preset_list {operation, instance}` / `preset_apply {operation, instance, name}` | the module's presets for its version (`name`, `label` as the menu shows it, `builtin`, `autoapply`); apply one by name or label as the presets menu does: settings, on/off, blending and the module's label, one history item |
 | `module_enable {operation, instance, enabled}` | module on/off |
 | `history_list`, `history_end {end}` | history items; undo/redo to a step (0 = original) |
+| `history_compress {truncate}` | compress the history stack as the history panel does (`truncate`: only drop the steps above `history_end`); it works on the library, so the edit is saved first |
+| `module_add {operation, instance, copy}` / `module_remove` / `module_rename {name}` | module instances: a new one after the given one (`copy`: duplicate its settings and blending; headless, drawn shapes aren't copied), delete one (not a module's only instance; its history steps go), label one |
 | `geometry_get` | orientation (`rotation` clockwise from the raw file, `mirrored`), straightening `angle` and `autocrop` (rotate and perspective), `crop` box (`left`, `top`, `right`, `bottom`, fractions of the uncropped image), `aspect`, and the uncropped (`frame_width`/`frame_height`) and final sizes |
 | `geometry_set {rotate, flip, angle, autocrop, crop, aspect}` | as the darkroom does, all or nothing: `rotate` turns by 90° steps (clockwise; -90 left) and `flip` (`horizontal`/`vertical`) mirrors in the flip module, and an existing crop box follows; `angle` straightens (degrees, positive turns counter-clockwise) and the automatic crop is refitted as ashift's GUI does; `crop` sets the box (`null` removes it); `aspect` (`free`, `original`, `square`, `W:H`) fits the largest box of that ratio inside the given or current one |
 | `save` | write the history to the library (and the sidecar, if `write_sidecar_files` asks for it), as leaving the darkroom does |
 | `reset` | discard the history and reload, so darktable applies the workflow defaults and auto-apply presets again |
 | `export {imgid, format, quality, max_width, max_height, high_quality, upscale, style, path, on_conflict, save}` | darktable's export of the image's saved edit through a format module, as the export module does: its settings (format, size, quality, output pattern `$(FILE_FOLDER)/darktable_exported/$(FILE_NAME)`, conflict handling, metadata, ICC profile) unless given; tags the image `darktable|exported`. Unsaved changes are refused unless `save` is true. Replies `file`, or `skipped` when `on_conflict` (`unique`, `overwrite`, `overwrite_if_changed`, `skip`) leaves an existing file alone. Runs on the request thread (darktable's window pauses while it exports) |
-| `render {width, height, path, quality, uncropped, zoom, center_x, center_y}` | sRGB JPEG fitted inside width x height; `uncropped` leaves crop's box out (as the darkroom shows the image while crop has the focus), to draw a box on; `zoom` (1 = 100%, up to 2) renders the width x height region around `center_x`/`center_y` (fractions) at that scale, as the darkroom zoomed in, and replies its `region` |
+| `render {width, height, path, quality, uncropped, zoom, center_x, center_y, history_end}` | sRGB JPEG fitted inside width x height; `uncropped` leaves crop's box out (as the darkroom shows the image while crop has the focus), to draw a box on; `zoom` (1 = 100%, up to 2) renders the width x height region around `center_x`/`center_y` (fractions) at that scale, as the darkroom zoomed in, and replies its `region`; `history_end` renders an earlier step (before/after) without undoing (also for `sample`) |
 | `library_status` / `library_release` / `library_acquire` | hand the library to darktable's GUI and take it back while running; unsaved edits of every open photo are kept and restored if the photo wasn't changed meanwhile |
 | `shutdown` | close and exit (SIGTERM does the same) |
 
@@ -153,7 +155,7 @@ about 1/255 (mean absolute difference).
 - settings the GUI adjusts alongside a change (`gui_changed`), pickers and
   other operations whose logic lives in GUI code
 - arrays of structs (curve nodes) and integer arrays, path and brush shapes,
-  raster masks, module instances
+  raster masks, module order
   and order, styles, tags and metadata, import; export to storages other
   than disk
 - perspective correction (ashift's line detection and fitting); the

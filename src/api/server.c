@@ -89,10 +89,16 @@
                                     and "uncropped" (crop's input)
      retouch_list                -> retouch's shapes: type, circle center,
                                     radius and feather, source (raw space),
-                                    algorithm
-     retouch_heal {spots: [{x, y, r, sx, sy}]}
-                                 -> adds heal circles (raw space; r relative
-                                    to the shorter side) as one history item
+                                    algorithm and its options
+     retouch_add {spots: [{x, y, r, algorithm, sx, sy, blur_type,
+                  blur_radius, fill_mode, fill_color, fill_brightness}]}
+                                 -> adds circles (raw space; r relative to
+                                    the shorter side) that clone or heal
+                                    from a source, blur or fill, as one
+                                    history item; retouch_heal: heal default
+     retouch_set {formid, x, y, r, sx, sy, algorithm, ...}
+                                 -> moves, resizes or changes one spot
+     retouch_remove {formids}    -> deletes spots, as one history item
      module_add {operation, instance, copy}
                                  -> a new instance after the given one ("new
                                     instance", or "duplicate" with copy)
@@ -112,6 +118,17 @@
      image_duplicate {imgid, virgin, save}
                                  -> a duplicate (virtual copy) with the saved
                                     edit, or none (virgin)
+     style_list {filter} / style_create {name, imgid, modules} /
+     style_delete {name}         -> darktable's styles
+     style_apply {name, imgids, save}
+     history_paste {from, imgids, mode, modules, save}
+                                 -> a style, or an image's saved edit, onto
+                                    images in the library as the lighttable
+                                    does; open ones saved first, reopened
+     picker_list / picker_apply {operation, instance, control, box | point}
+                                 -> darktable's window, the darkroom's photo:
+                                    a module's pickers and auto buttons,
+                                    pressed as a click does (a job)
      module_remove {operation, instance}
                                  -> deletes an instance (not a module's last)
      module_rename {operation, instance, name}
@@ -230,6 +247,7 @@
 #include "common/ratings.h"
 #include "common/styles.h"
 #include "common/tags.h"
+#include "common/utility.h"
 #include "develop/blend.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -248,6 +266,13 @@
 #include "common/metadata.h"
 #include "imageio/imageio_dng.h"
 #include "control/jobs.h"
+#include "bauhaus/bauhaus.h"
+#include "common/color_picker.h"
+#include "dtgtk/paint.h"
+#include "gui/accelerators.h"
+#include "gui/color_picker_proxy.h"
+#include "libs/colorpicker.h"
+#include "libs/lib.h"
 #ifdef HAVE_AI
 #include "common/ai/segmentation.h"
 #include "common/ai/restore.h"
@@ -1927,6 +1952,20 @@ static int _enum_value(const dt_introspection_field_t *f, const char *name)
   return -1;
 }
 
+// a retouch enum value by its short name: "blur" in "DT_IOP_RETOUCH_" is
+// DT_IOP_RETOUCH_BLUR
+static int _rt_enum(dt_iop_module_t *m, const char *field, const char *prefix, const char *name)
+{
+  dt_introspection_field_t *f = _field(m, field);
+  gchar *up = g_ascii_strup(name, -1);
+  // the full names retouch_list shows work too
+  gchar *full = g_str_has_prefix(up, prefix) ? g_strdup(up) : g_strconcat(prefix, up, NULL);
+  const int v = f ? _enum_value(f, full) : -1;
+  g_free(up);
+  g_free(full);
+  return v;
+}
+
 // retouch's shapes: type, circle center/radius/source in raw space, and the
 // algorithm retouch applies to each
 static gboolean _retouch_list(JsonObject *params, JsonBuilder *b, gchar **err)
@@ -1989,6 +2028,25 @@ static gboolean _retouch_list(JsonObject *params, JsonBuilder *b, gchar **err)
       {
         json_builder_set_member_name(b, "algorithm");
         _add_field_value(b, f, (const uint8_t *)algo - f->header.offset);
+        // the tool's options, as retouch shows them for a selected spot
+        static const char *blur[] = { "blur_type", "blur_radius", NULL };
+        static const char *fill[] = { "fill_mode", "fill_color", "fill_brightness", NULL };
+        const char **opts = *algo == _rt_enum(m, "algorithm", "DT_IOP_RETOUCH_", "blur") ? blur
+                            : *algo == _rt_enum(m, "algorithm", "DT_IOP_RETOUCH_", "fill") ? fill : NULL;
+        for(; opts && *opts; opts++)
+        {
+          const void *p = _rt_form_field(m, k, *opts, &f);
+          if(!p) continue;
+          json_builder_set_member_name(b, *opts);
+          if(f->header.type == DT_INTROSPECTION_TYPE_ARRAY)
+          {
+            json_builder_begin_array(b);
+            for(int c = 0; c < f->Array.count; c++) json_builder_add_double_value(b, ((const float *)p)[c]);
+            json_builder_end_array(b);
+          }
+          else
+            _add_field_value(b, f, (const uint8_t *)p - f->header.offset);
+        }
       }
       break;
     }
@@ -1998,56 +2056,318 @@ static gboolean _retouch_list(JsonObject *params, JsonBuilder *b, gchar **err)
   return TRUE;
 }
 
-// heal circles in retouch, as clicking with its circle tool does: a clone
-// circle per spot with the user's circle feather, healing from its source,
-// all in one history step. in darktable's window, the darkroom's image goes
-// through the darkroom's own path (darkroom.c heal_spots, patched 5.6);
-// elsewhere retouch's window code isn't there to list new forms in its
-// params (rt_resynch_params), so that is done here
-static gboolean _retouch_heal(JsonObject *params, JsonBuilder *b, gchar **err)
+// retouch's spots: circles in its mask group, and per spot in rt_forms[]
+// (in group order, retouch.c rt_resynch_params) the tool and its options
+static dt_introspection_field_t *_rt_forms_field(dt_iop_module_t *m)
+{
+  for(dt_introspection_field_t *i = m->so->get_introspection_linear();
+      i && i->header.type != DT_INTROSPECTION_TYPE_NONE; i++)
+    if(!g_strcmp0(i->header.name, "rt_forms")) return i;
+  return NULL;
+}
+
+static int _rt_index(dt_iop_module_t *m, const dt_mask_id_t formid)
+{
+  const int count = _rt_forms_count(m);
+  for(int k = 0; k < count; k++)
+  {
+    dt_introspection_field_t *f = NULL;
+    const dt_mask_id_t *id = _rt_form_field(m, k, "formid", &f);
+    if(id && *id == formid) return k;
+  }
+  return -1;
+}
+
+static gboolean _rt_cloning(dt_iop_module_t *m, const int algorithm)
+{
+  return algorithm == _rt_enum(m, "algorithm", "DT_IOP_RETOUCH_", "clone")
+         || algorithm == _rt_enum(m, "algorithm", "DT_IOP_RETOUCH_", "heal");
+}
+
+// rt_resynch_params for any session: entries follow the group's shapes,
+// new shapes get the current scale and distortion mode 2. retouch's own
+// version runs on darktable.develop, which is only the darkroom's image
+static void _rt_resync(dt_iop_module_t *m)
+{
+  dt_introspection_field_t *forms = _rt_forms_field(m);
+  const int count = forms ? forms->Array.count : 0;
+  if(!count) return;
+  const size_t size = forms->header.size / count;
+  uint8_t *base = (uint8_t *)m->params + forms->header.offset;
+  uint8_t *out = g_malloc0(forms->header.size);
+  gboolean *fresh = g_new0(gboolean, count);
+  dt_mask_id_t *ids = g_new0(dt_mask_id_t, count);
+  int n = 0;
+  dt_masks_form_t *grp = dt_masks_get_from_id(_cur->dev, m->blend_params->mask_id);
+  for(GList *l = grp && (grp->type & DT_MASKS_GROUP) ? grp->points : NULL; l && n < count; l = g_list_next(l))
+  {
+    const dt_masks_point_group_t *gp = l->data;
+    if(!dt_masks_get_from_id(_cur->dev, gp->formid)) continue;
+    const int k = _rt_index(m, gp->formid);
+    if(k >= 0)
+      memcpy(out + n * size, base + k * size, size);
+    else
+      fresh[n] = TRUE;
+    ids[n++] = gp->formid;
+  }
+  memcpy(base, out, forms->header.size);
+  const int *curr = m->get_p(m->params, "curr_scale");
+  const int *algo = m->get_p(m->params, "algorithm");
+  for(int k = 0; k < n; k++)
+  {
+    if(!fresh[k]) continue;
+    dt_introspection_field_t *f = NULL;
+    dt_mask_id_t *id = _rt_form_field(m, k, "formid", &f);
+    if(id) *id = ids[k];
+    int *scale = _rt_form_field(m, k, "scale", &f);
+    if(scale && curr) *scale = *curr;
+    int *a = _rt_form_field(m, k, "algorithm", &f);
+    if(a && algo) *a = *algo;
+    int *mode = _rt_form_field(m, k, "distort_mode", &f);
+    if(mode) *mode = 2;
+  }
+  g_free(out);
+  g_free(fresh);
+  g_free(ids);
+}
+
+// a spot from a request: where (circle, raw space) and the tool with its
+// options; has[] says which were given
+enum { RT_X, RT_Y, RT_R, RT_SX, RT_SY, RT_ALGO, RT_BLUR_TYPE, RT_BLUR_RADIUS, RT_FILL_MODE, RT_FILL_COLOR,
+       RT_FILL_BRIGHTNESS, RT_N };
+
+typedef struct _rt_spot_t
+{
+  gboolean has[RT_N];
+  float v[5]; // x, y, r, sx, sy
+  int algorithm, blur_type, fill_mode;
+  float blur_radius, fill_color[3], fill_brightness;
+} _rt_spot_t;
+
+static gboolean _rt_number(JsonNode *x, float *out)
+{
+  if(!x || !JSON_NODE_HOLDS_VALUE(x)
+     || (json_node_get_value_type(x) != G_TYPE_DOUBLE && json_node_get_value_type(x) != G_TYPE_INT64))
+    return FALSE;
+  *out = json_node_get_double(x);
+  return TRUE;
+}
+
+static gboolean _rt_choice(dt_iop_module_t *m, JsonObject *o, const char *key, const char *field,
+                           const char *prefix, const char *names, int *v, gboolean *has, gchar **err)
+{
+  if(!json_object_has_member(o, key)) return TRUE;
+  JsonNode *x = json_object_get_member(o, key);
+  const char *s = JSON_NODE_HOLDS_VALUE(x) && json_node_get_value_type(x) == G_TYPE_STRING
+                  ? json_node_get_string(x) : "";
+  *v = _rt_enum(m, field, prefix, s);
+  // DT_IOP_RETOUCH_NONE is an empty slot, not a tool
+  if(*v < 0 || (*v == 0 && !g_strcmp0(key, "algorithm")))
+  {
+    *err = g_strdup_printf("%s is one of %s", key, names);
+    return FALSE;
+  }
+  *has = TRUE;
+  return TRUE;
+}
+
+static gboolean _rt_parse(dt_iop_module_t *m, JsonObject *o, _rt_spot_t *s, gchar **err)
+{
+  static const char *keys[5] = { "x", "y", "r", "sx", "sy" };
+  memset(s, 0, sizeof(*s));
+  if(!o)
+  {
+    *err = g_strdup("a spot is an object");
+    return FALSE;
+  }
+  for(int k = 0; k < 5; k++)
+  {
+    if(!json_object_has_member(o, keys[k])) continue;
+    if(!_rt_number(json_object_get_member(o, keys[k]), &s->v[k])
+       || (k == RT_R ? !(s->v[k] > 0.f && s->v[k] < 0.5f) : !(s->v[k] >= 0.f && s->v[k] <= 1.f)))
+    {
+      *err = g_strdup("x, y, sx, sy are in 0..1 and r in 0..0.5 (raw space, see coords)");
+      return FALSE;
+    }
+    s->has[k] = TRUE;
+  }
+  if(!_rt_choice(m, o, "algorithm", "algorithm", "DT_IOP_RETOUCH_", "clone, heal, blur, fill",
+                 &s->algorithm, &s->has[RT_ALGO], err)
+     || !_rt_choice(m, o, "blur_type", "blur_type", "DT_IOP_RETOUCH_BLUR_", "gaussian, bilateral",
+                    &s->blur_type, &s->has[RT_BLUR_TYPE], err)
+     || !_rt_choice(m, o, "fill_mode", "fill_mode", "DT_IOP_RETOUCH_FILL_", "erase, color",
+                    &s->fill_mode, &s->has[RT_FILL_MODE], err))
+    return FALSE;
+  if(json_object_has_member(o, "blur_radius"))
+  {
+    if(!_rt_number(json_object_get_member(o, "blur_radius"), &s->blur_radius)
+       || s->blur_radius < 0.1f || s->blur_radius > 200.f)
+    {
+      *err = g_strdup("blur_radius is 0.1..200");
+      return FALSE;
+    }
+    s->has[RT_BLUR_RADIUS] = TRUE;
+  }
+  if(json_object_has_member(o, "fill_brightness"))
+  {
+    if(!_rt_number(json_object_get_member(o, "fill_brightness"), &s->fill_brightness)
+       || fabsf(s->fill_brightness) > 1.f)
+    {
+      *err = g_strdup("fill_brightness is -1..1");
+      return FALSE;
+    }
+    s->has[RT_FILL_BRIGHTNESS] = TRUE;
+  }
+  if(json_object_has_member(o, "fill_color"))
+  {
+    JsonNode *n = json_object_get_member(o, "fill_color");
+    JsonArray *a = JSON_NODE_HOLDS_ARRAY(n) ? json_node_get_array(n) : NULL;
+    gboolean ok = a && json_array_get_length(a) == 3;
+    for(int c = 0; ok && c < 3; c++)
+      ok = _rt_number(json_array_get_element(a, c), &s->fill_color[c])
+           && s->fill_color[c] >= 0.f && s->fill_color[c] <= 1.f;
+    if(!ok)
+    {
+      *err = g_strdup("fill_color is [r, g, b] in 0..1, the module's working RGB");
+      return FALSE;
+    }
+    s->has[RT_FILL_COLOR] = TRUE;
+  }
+  return TRUE;
+}
+
+// options that don't belong to the spot's tool are refused, as are a
+// source for blur and fill (they have none)
+static gboolean _rt_check(dt_iop_module_t *m, const _rt_spot_t *s, const int algorithm, gchar **err)
+{
+  const gboolean blur = algorithm == _rt_enum(m, "algorithm", "DT_IOP_RETOUCH_", "blur");
+  const gboolean fill = algorithm == _rt_enum(m, "algorithm", "DT_IOP_RETOUCH_", "fill");
+  if(!_rt_cloning(m, algorithm) && (s->has[RT_SX] || s->has[RT_SY]))
+    *err = g_strdup("blur and fill spots have no source (sx, sy)");
+  else if(!blur && (s->has[RT_BLUR_TYPE] || s->has[RT_BLUR_RADIUS]))
+    *err = g_strdup("blur_type and blur_radius are for blur spots");
+  else if(!fill && (s->has[RT_FILL_MODE] || s->has[RT_FILL_COLOR] || s->has[RT_FILL_BRIGHTNESS]))
+    *err = g_strdup("fill_mode, fill_color and fill_brightness are for fill spots");
+  return *err == NULL;
+}
+
+// a spot's tool and options into rt_forms[k]. a new spot takes options
+// not given from the module's current ones, as drawing it in the darkroom
+// does (rt_resynch_params)
+static void _rt_apply(dt_iop_module_t *m, const int k, const _rt_spot_t *s, const gboolean fresh)
+{
+  dt_introspection_field_t *f = NULL;
+  int *algo = _rt_form_field(m, k, "algorithm", &f);
+  if(algo && s->has[RT_ALGO]) *algo = s->algorithm;
+  if(!algo) return;
+  if(*algo == _rt_enum(m, "algorithm", "DT_IOP_RETOUCH_", "blur"))
+  {
+    int *t = _rt_form_field(m, k, "blur_type", &f);
+    float *r = _rt_form_field(m, k, "blur_radius", &f);
+    const int *pt = m->get_p(m->params, "blur_type");
+    const float *pr = m->get_p(m->params, "blur_radius");
+    if(t) *t = s->has[RT_BLUR_TYPE] ? s->blur_type : fresh && pt ? *pt : *t;
+    if(r) *r = s->has[RT_BLUR_RADIUS] ? s->blur_radius : fresh && pr ? *pr : *r;
+  }
+  else if(*algo == _rt_enum(m, "algorithm", "DT_IOP_RETOUCH_", "fill"))
+  {
+    int *mode = _rt_form_field(m, k, "fill_mode", &f);
+    float *color = _rt_form_field(m, k, "fill_color", &f);
+    float *bright = _rt_form_field(m, k, "fill_brightness", &f);
+    const int *pm = m->get_p(m->params, "fill_mode");
+    const float *pc = m->get_p(m->params, "fill_color");
+    const float *pb = m->get_p(m->params, "fill_brightness");
+    if(mode) *mode = s->has[RT_FILL_MODE] ? s->fill_mode : fresh && pm ? *pm : *mode;
+    for(int c = 0; color && c < 3; c++)
+      color[c] = s->has[RT_FILL_COLOR] ? s->fill_color[c] : fresh && pc ? pc[c] : color[c];
+    if(bright) *bright = s->has[RT_FILL_BRIGHTNESS] ? s->fill_brightness : fresh && pb ? *pb : *bright;
+  }
+}
+
+static dt_iop_module_t *_rt_module(gchar **err)
 {
   if(!_cur)
   {
     *err = g_strdup("no open session");
-    return FALSE;
+    return NULL;
   }
-  dt_develop_t *dev = _cur->dev;
-  dt_iop_module_t *m = dt_iop_get_module_by_op_priority(dev->iop, "retouch", 0);
-  if(!m)
+  dt_iop_module_t *m = dt_iop_get_module_by_op_priority(_cur->dev->iop, "retouch", 0);
+  if(!m) *err = g_strdup("this darktable has no retouch module");
+  return m;
+}
+
+// recording a retouch change: in the window through the darkroom's history
+// (retouch then lists the shapes in its own view, dt_masks_iop_update),
+// elsewhere as a history item carrying the forms; no_image, as _record
+static void _rt_begin(void)
+{
+  if(!_cur->gui) return;
+  _gui_focus();
+  _api_editing = TRUE;
+  dt_dev_undo_start_record(_cur->dev);
+}
+
+static void _rt_end(dt_iop_module_t *m)
+{
+  if(_cur->gui)
   {
-    *err = g_strdup("this darktable has no retouch module");
-    return FALSE;
+    dt_masks_iop_update(m);
+    dt_dev_add_masks_history_item(_cur->dev, m, TRUE);
+    dt_dev_undo_end_record(_cur->dev);
+    _api_editing = FALSE;
+    _gui_changed_by_api();
   }
+  else
+  {
+    m->enabled = TRUE;
+    dt_dev_add_masks_history_item_ext(_cur->dev, m, TRUE, TRUE);
+    _cur->pipe_changed = TRUE;
+    _cur->dirty = TRUE;
+  }
+}
+
+// spots in retouch, as its circle tool draws them: a circle per spot with
+// the user's circle feather, cloning or healing from a source, or blurring
+// or filling, all in one history step
+static gboolean _retouch_add(JsonObject *params, const char *algorithm, JsonBuilder *b, gchar **err)
+{
+  dt_iop_module_t *m = _rt_module(err);
+  if(!m) return FALSE;
+  dt_develop_t *dev = _cur->dev;
   JsonArray *spots = params && json_object_has_member(params, "spots")
                      && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "spots"))
                        ? json_object_get_array_member(params, "spots") : NULL;
   const guint n = spots ? json_array_get_length(spots) : 0;
   if(!n)
   {
-    *err = g_strdup("retouch_heal needs spots [{x, y, r, sx, sy}] in raw space (coords)");
+    *err = g_strdup("needs spots [{x, y, r, algorithm, sx, sy, ...}] in raw space (coords)");
     return FALSE;
   }
-  float (*v)[5] = g_malloc0_n(n, sizeof(*v));
-  static const char *keys[5] = { "x", "y", "r", "sx", "sy" };
+  const int dflt = _rt_enum(m, "algorithm", "DT_IOP_RETOUCH_", algorithm);
+  _rt_spot_t *s = g_new0(_rt_spot_t, n);
   for(guint i = 0; i < n; i++)
   {
-    JsonObject *o = JSON_NODE_HOLDS_OBJECT(json_array_get_element(spots, i))
-                    ? json_array_get_object_element(spots, i) : NULL;
-    gboolean ok = o != NULL;
-    for(int k = 0; ok && k < 5; k++)
+    JsonNode *e = json_array_get_element(spots, i);
+    gchar *e_err = NULL;
+    if(_rt_parse(m, JSON_NODE_HOLDS_OBJECT(e) ? json_node_get_object(e) : NULL, &s[i], &e_err))
     {
-      JsonNode *x = json_object_get_member(o, keys[k]);
-      ok = x && JSON_NODE_HOLDS_VALUE(x)
-           && (json_node_get_value_type(x) == G_TYPE_DOUBLE || json_node_get_value_type(x) == G_TYPE_INT64);
-      if(ok) v[i][k] = json_node_get_double(x);
+      if(!s[i].has[RT_ALGO])
+      {
+        s[i].algorithm = dflt;
+        s[i].has[RT_ALGO] = TRUE;
+      }
+      if(!s[i].has[RT_X] || !s[i].has[RT_Y] || !s[i].has[RT_R])
+        e_err = g_strdup("needs x, y and r");
+      else if(_rt_cloning(m, s[i].algorithm) && (!s[i].has[RT_SX] || !s[i].has[RT_SY]))
+        e_err = g_strdup("clone and heal spots need a source (sx, sy)");
+      else
+        _rt_check(m, &s[i], s[i].algorithm, &e_err);
     }
-    ok = ok && v[i][0] >= 0.f && v[i][0] <= 1.f && v[i][1] >= 0.f && v[i][1] <= 1.f
-            && v[i][2] > 0.f && v[i][2] < 0.5f
-            && v[i][3] >= 0.f && v[i][3] <= 1.f && v[i][4] >= 0.f && v[i][4] <= 1.f;
-    if(!ok)
+    if(e_err)
     {
-      g_free(v);
-      *err = g_strdup_printf("spot %u: needs x, y, sx, sy in 0..1 and r in 0..0.5 (raw space)", i);
+      *err = g_strdup_printf("spot %u: %s", i, e_err);
+      g_free(e_err);
+      g_free(s);
       return FALSE;
     }
   }
@@ -2061,84 +2381,158 @@ static gboolean _retouch_heal(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   if(used + (int)n > count)
   {
-    g_free(v);
+    g_free(s);
     *err = g_strdup_printf("retouch holds at most %d shapes; it has %d", count, used);
     return FALSE;
   }
 
-  dt_introspection_field_t *af = _field(m, "algorithm");
-  const int heal = af ? _enum_value(af, "DT_IOP_RETOUCH_HEAL") : -1;
   const float border = dt_conf_get_float("plugins/darkroom/spots/circle_border");
-  if(_cur->gui)
-  {
-    _api_editing = TRUE;
-    dt_dev_undo_start_record(dev);
-  }
+  _rt_begin();
   // in the window, a history item of its own, so the spots don't merge into
   // a retouch step on top of the history (as heal_spots does)
   if(_cur->gui) dt_dev_add_new_history_item(dev, m, TRUE);
-  if(af && heal >= 0) _set_num(af, (uint8_t *)m->params + af->header.offset, heal);
   JsonBuilder *ids = json_builder_new();
   json_builder_begin_array(ids);
+  dt_mask_id_t *formids = g_new0(dt_mask_id_t, n);
   for(guint i = 0; i < n; i++)
   {
-    dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE | DT_MASKS_CLONE);
+    const gboolean cloning = _rt_cloning(m, s[i].algorithm);
+    dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE | (cloning ? DT_MASKS_CLONE : DT_MASKS_NON_CLONE));
     dt_masks_point_circle_t *circle = malloc(sizeof(dt_masks_point_circle_t));
-    circle->center[0] = v[i][0];
-    circle->center[1] = v[i][1];
-    circle->radius = v[i][2];
+    circle->center[0] = s[i].v[RT_X];
+    circle->center[1] = s[i].v[RT_Y];
+    circle->radius = s[i].v[RT_R];
     circle->border = border;
     form->points = g_list_append(form->points, circle);
-    form->source[0] = v[i][3];
-    form->source[1] = v[i][4];
-    dt_masks_gui_form_save_creation(dev, m, form, NULL);
-    json_builder_add_int_value(ids, form->formid);
-    if(!_cur->gui)
+    if(cloning)
     {
-      // rt_resynch_params for the new form: retouch's current scale,
-      // healing, distortion mode 2
-      for(int k = 0; k < count; k++)
-      {
-        dt_introspection_field_t *f = NULL;
-        dt_mask_id_t *id = _rt_form_field(m, k, "formid", &f);
-        if(!id || *id) continue;
-        *id = form->formid;
-        int *scale = _rt_form_field(m, k, "scale", &f);
-        const int *curr = m->get_p(m->params, "curr_scale");
-        if(scale && curr) *scale = *curr;
-        int *algo = _rt_form_field(m, k, "algorithm", &f);
-        if(algo && heal >= 0) *algo = heal;
-        int *mode = _rt_form_field(m, k, "distort_mode", &f);
-        if(mode) *mode = 2;
-        break;
-      }
+      form->source[0] = s[i].v[RT_SX];
+      form->source[1] = s[i].v[RT_SY];
     }
+    dt_masks_gui_form_save_creation(dev, m, form, NULL);
+    formids[i] = form->formid;
+    json_builder_add_int_value(ids, form->formid);
   }
   json_builder_end_array(ids);
-  g_free(v);
-  if(_cur->gui)
+  _rt_resync(m);
+  for(guint i = 0; i < n; i++)
   {
-    dt_masks_iop_update(m);         // retouch lists the new forms (rt_resynch_params)
-    dt_dev_add_history_item(dev, m, TRUE);
-    dt_dev_undo_end_record(dev);
-    _api_editing = FALSE;
-    _gui_changed_by_api();
+    const int k = _rt_index(m, formids[i]);
+    if(k >= 0) _rt_apply(m, k, &s[i], TRUE);
   }
-  else
-  {
-    m->enabled = TRUE;
-    // a history item carrying the new forms; no_image, as _record: a
-    // session has no darkroom pipes for it to flag (develop.c marks
-    // dev->full.pipe and preview_pipe), its own pipe is synced on render
-    dt_dev_add_masks_history_item_ext(dev, m, TRUE, TRUE);
-    _cur->pipe_changed = TRUE;
-    _cur->dirty = TRUE;
-  }
+  g_free(formids);
+  g_free(s);
+  _rt_end(m);
   json_builder_set_member_name(b, "added");
   json_builder_add_int_value(b, n);
   json_builder_set_member_name(b, "formids");
   json_builder_add_value(b, json_builder_get_root(ids));
   g_object_unref(ids);
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, dev->history_end);
+  return TRUE;
+}
+
+static dt_masks_form_t *_rt_spot(dt_iop_module_t *m, const dt_mask_id_t formid, GList **link, gchar **err)
+{
+  dt_masks_form_t *grp = dt_masks_get_from_id(_cur->dev, m->blend_params->mask_id);
+  for(GList *l = grp && (grp->type & DT_MASKS_GROUP) ? grp->points : NULL; l; l = g_list_next(l))
+    if(((dt_masks_point_group_t *)l->data)->formid == formid)
+    {
+      if(link) *link = l;
+      dt_masks_form_t *form = dt_masks_get_from_id(_cur->dev, formid);
+      if(form) return form;
+    }
+  *err = g_strdup_printf("retouch has no spot %d (retouch_list)", formid);
+  return NULL;
+}
+
+// moves, resizes or changes one spot: its circle, its source, its tool
+// (clone and heal swap, as do blur and fill: the darkroom allows the same)
+// and the tool's options
+static gboolean _retouch_set(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_iop_module_t *m = _rt_module(err);
+  if(!m) return FALSE;
+  const dt_mask_id_t formid = params ? json_object_get_int_member_with_default(params, "formid", 0) : 0;
+  dt_masks_form_t *form = _rt_spot(m, formid, NULL, err);
+  if(!form) return FALSE;
+  const int k = _rt_index(m, formid);
+  dt_introspection_field_t *f = NULL;
+  const int *cur_algo = k >= 0 ? _rt_form_field(m, k, "algorithm", &f) : NULL;
+  if(!cur_algo)
+  {
+    *err = g_strdup_printf("spot %d isn't listed in retouch's settings", formid);
+    return FALSE;
+  }
+  _rt_spot_t s;
+  if(!_rt_parse(m, params, &s, err)) return FALSE;
+  const int algorithm = s.has[RT_ALGO] ? s.algorithm : *cur_algo;
+  if(_rt_cloning(m, algorithm) != _rt_cloning(m, *cur_algo))
+  {
+    *err = g_strdup("a clone or heal spot can only become clone or heal, a blur or fill spot blur or fill");
+    return FALSE;
+  }
+  if(!_rt_check(m, &s, algorithm, err)) return FALSE;
+  if((s.has[RT_X] || s.has[RT_Y] || s.has[RT_R]) && !((form->type & DT_MASKS_CIRCLE) && form->points))
+  {
+    *err = g_strdup("only circle spots can be moved or resized here");
+    return FALSE;
+  }
+  _rt_begin();
+  if(form->type & DT_MASKS_CIRCLE && form->points)
+  {
+    dt_masks_point_circle_t *c = form->points->data;
+    if(s.has[RT_X]) c->center[0] = s.v[RT_X];
+    if(s.has[RT_Y]) c->center[1] = s.v[RT_Y];
+    if(s.has[RT_R]) c->radius = s.v[RT_R];
+  }
+  if(s.has[RT_SX]) form->source[0] = s.v[RT_SX];
+  if(s.has[RT_SY]) form->source[1] = s.v[RT_SY];
+  _rt_apply(m, k, &s, FALSE);
+  _rt_end(m);
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, _cur->dev->history_end);
+  return TRUE;
+}
+
+// removes spots as deleting them in the darkroom does: out of retouch's
+// group and the image's forms (dt_masks_form_remove), all in one step
+static gboolean _retouch_remove(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_iop_module_t *m = _rt_module(err);
+  if(!m) return FALSE;
+  JsonArray *a = params && json_object_has_member(params, "formids")
+                 && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "formids"))
+                   ? json_object_get_array_member(params, "formids") : NULL;
+  const guint n = a ? json_array_get_length(a) : 0;
+  if(!n)
+  {
+    *err = g_strdup("needs formids [...] (retouch_list)");
+    return FALSE;
+  }
+  for(guint i = 0; i < n; i++)
+    if(!_rt_spot(m, json_array_get_int_element(a, i), NULL, err)) return FALSE;
+  dt_develop_t *dev = _cur->dev;
+  dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
+  _rt_begin();
+  for(guint i = 0; i < n; i++)
+  {
+    GList *link = NULL;
+    gchar *e = NULL;
+    dt_masks_form_t *form = _rt_spot(m, json_array_get_int_element(a, i), &link, &e);
+    g_free(e);
+    if(!form) continue; // listed twice
+    free(link->data);
+    grp->points = g_list_delete_link(grp->points, link);
+    // not freed, as dt_masks_form_remove: a form can be the darkroom's
+    // visible or selected one
+    dev->forms = g_list_remove(dev->forms, form);
+  }
+  _rt_resync(m);
+  _rt_end(m);
+  json_builder_set_member_name(b, "removed");
+  json_builder_add_int_value(b, n);
   json_builder_set_member_name(b, "history_end");
   json_builder_add_int_value(b, dev->history_end);
   return TRUE;
@@ -3389,6 +3783,394 @@ static gboolean _image_duplicate(JsonObject *params, const dt_imgid_t current, g
   json_object_unref(q);
   json_builder_set_member_name(b, "saved");
   json_builder_add_boolean_value(b, *saved);
+  return ok;
+}
+
+// ---- styles and copy/paste ---------------------------------------------------
+// these change an image's saved edit in the library with darktable's own
+// code (common/styles.c, common/history.c), as the lighttable does; an image
+// open here is saved first and reopened after, as the darkroom writes its
+// history before applying a style or pasting (dt_styles_apply_to_dev)
+
+// the history items of an image's saved edit that hold each module
+// instance's state (the last below history_end), or those of the modules
+// asked for: names, or {operation, instance}
+static GList *_history_nums(const dt_imgid_t imgid, JsonArray *modules, const gboolean styles_only,
+                            gchar **err)
+{
+  typedef struct { int num, prio; gchar *op; gboolean used; } _item_t;
+  GArray *items = g_array_new(FALSE, TRUE, sizeof(_item_t));
+  sqlite3_stmt *st;
+  sqlite3_prepare_v2(dt_database_get(darktable.db),
+                     "SELECT MAX(h.num), h.operation, h.multi_priority"
+                     " FROM main.history AS h"
+                     " JOIN main.images AS i ON i.id = h.imgid"
+                     " WHERE h.imgid = ?1 AND h.num < i.history_end"
+                     "   AND h.operation != 'mask_manager'"
+                     " GROUP BY h.operation, h.multi_priority"
+                     " ORDER BY 1",
+                     -1, &st, NULL);
+  sqlite3_bind_int(st, 1, imgid);
+  while(sqlite3_step(st) == SQLITE_ROW)
+  {
+    _item_t it = { sqlite3_column_int(st, 0), sqlite3_column_int(st, 2),
+                   g_strdup((const char *)sqlite3_column_text(st, 1)), FALSE };
+    g_array_append_val(items, it);
+  }
+  sqlite3_finalize(st);
+
+  const guint n = modules ? json_array_get_length(modules) : 0;
+  for(guint i = 0; i < n && !*err; i++)
+  {
+    JsonNode *e = json_array_get_element(modules, i);
+    const char *op = NULL;
+    int prio = -1;
+    if(JSON_NODE_HOLDS_VALUE(e) && json_node_get_value_type(e) == G_TYPE_STRING)
+      op = json_node_get_string(e);
+    else if(JSON_NODE_HOLDS_OBJECT(e))
+    {
+      JsonObject *o = json_node_get_object(e);
+      op = json_object_get_string_member_with_default(o, "operation", NULL);
+      prio = json_object_get_int_member_with_default(o, "instance", -1);
+    }
+    gboolean found = FALSE;
+    for(guint k = 0; op && k < items->len; k++)
+    {
+      _item_t *it = &g_array_index(items, _item_t, k);
+      if(!g_strcmp0(it->op, op) && (prio < 0 || prio == it->prio)) found = it->used = TRUE;
+    }
+    if(!found)
+      *err = op ? g_strdup_printf("the saved edit of %d has no module '%s'%s", imgid, op,
+                                  prio >= 0 ? " with that instance" : "")
+                : g_strdup("modules are names or {operation, instance}");
+  }
+  GList *nums = NULL;
+  for(guint k = 0; k < items->len; k++)
+  {
+    _item_t *it = &g_array_index(items, _item_t, k);
+    const gboolean take = n ? it->used
+                            : !styles_only || (dt_iop_get_module_flags(it->op) & IOP_FLAGS_INCLUDE_IN_STYLES);
+    if(take && !*err) nums = g_list_append(nums, GINT_TO_POINTER(it->num));
+    g_free(it->op);
+  }
+  g_array_free(items, TRUE);
+  if(*err)
+  {
+    g_list_free(nums);
+    return NULL;
+  }
+  if(!nums) *err = g_strdup_printf("the saved edit of %d has no modules to take", imgid);
+  return nums;
+}
+
+// the images a call changes: imgids, else the client's image. each must
+// exist, and one open here with unsaved changes needs save: true
+static GArray *_targets(JsonObject *params, const dt_imgid_t current, const dt_imgid_t source, gchar **err)
+{
+  GArray *ids = g_array_new(FALSE, FALSE, sizeof(dt_imgid_t));
+  JsonArray *a = params && json_object_has_member(params, "imgids")
+                 && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "imgids"))
+                   ? json_object_get_array_member(params, "imgids") : NULL;
+  if(a)
+    for(guint i = 0; i < json_array_get_length(a); i++)
+    {
+      const dt_imgid_t id = json_array_get_int_element(a, i);
+      g_array_append_val(ids, id);
+    }
+  else if(dt_is_valid_imgid(current))
+    g_array_append_val(ids, current);
+  const gboolean save = params ? json_object_get_boolean_member_with_default(params, "save", FALSE) : FALSE;
+  if(!ids->len) *err = g_strdup("no image: pass imgids, or open one first");
+  for(guint i = 0; i < ids->len && !*err; i++)
+  {
+    const dt_imgid_t id = g_array_index(ids, dt_imgid_t, i);
+    const _session_t *s = _session_find(id);
+    if(!dt_is_valid_imgid(id) || !_image_exists(id))
+      *err = g_strdup_printf("no image with id %d", id);
+    else if(id == source)
+      *err = g_strdup_printf("image %d is the source", id);
+    else if(s && !s->gui && s->dirty && !save)
+      *err = g_strdup_printf("image %d has unsaved changes, which this saves: save first, or pass save: true", id);
+  }
+  if(*err)
+  {
+    g_array_free(ids, TRUE);
+    return NULL;
+  }
+  return ids;
+}
+
+typedef gboolean (*_library_edit_t)(const dt_imgid_t imgid, const gboolean darkroom, gpointer data);
+
+// runs a change of saved edits on each target: the darkroom's image through
+// the darkroom (edit is told so), a session here saved before and reopened
+// after. changed lists the images done, for their events
+static gboolean _edit_saved(GArray *ids, _library_edit_t edit, gpointer data, GArray *changed,
+                            JsonBuilder *b, gchar **err)
+{
+  json_builder_set_member_name(b, "images");
+  json_builder_begin_array(b);
+  for(guint i = 0; i < ids->len; i++)
+  {
+    const dt_imgid_t id = g_array_index(ids, dt_imgid_t, i);
+    _session_t *s = _session_find(id);
+    gboolean saved = FALSE;
+    if(s && !s->gui && s->dirty)
+    {
+      _save_session(s);
+      saved = TRUE;
+    }
+    if(s && s->gui)
+    {
+      _api_editing = TRUE;
+      edit(id, TRUE, data);
+      _api_editing = FALSE;
+      _gui_changed_by_api();
+    }
+    else
+      edit(id, FALSE, data);
+    gboolean reopened = FALSE;
+    if(s && !s->gui)
+    {
+      _session_close(s);
+      reopened = _session_load(id, err) != NULL;
+    }
+    g_array_append_val(changed, id);
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "imgid");
+    json_builder_add_int_value(b, id);
+    json_builder_set_member_name(b, "saved_first");
+    json_builder_add_boolean_value(b, saved);
+    json_builder_set_member_name(b, "reopened");
+    json_builder_add_boolean_value(b, reopened || (s && s->gui));
+    json_builder_end_object(b);
+    if(*err) break;
+  }
+  json_builder_end_array(b);
+  return *err == NULL;
+}
+
+static gboolean _style_list(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  const char *filter = params ? json_object_get_string_member_with_default(params, "filter", "") : "";
+  GList *styles = dt_styles_get_list(filter);
+  json_builder_set_member_name(b, "styles");
+  json_builder_begin_array(b);
+  for(GList *l = styles; l; l = g_list_next(l))
+  {
+    const dt_style_t *style = l->data;
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "name");
+    json_builder_add_string_value(b, style->name);
+    // as the styles module shows it: darktable's own styles carry
+    // translation markers ("_l10n_darktable|_l10n_examples|...")
+    gchar *label = dt_util_localize_segmented_name(style->name, TRUE);
+    json_builder_set_member_name(b, "label");
+    json_builder_add_string_value(b, label);
+    g_free(label);
+    gchar *desc = dt_util_localize_segmented_name(style->description ? style->description : "", FALSE);
+    json_builder_set_member_name(b, "description");
+    json_builder_add_string_value(b, desc);
+    g_free(desc);
+    json_builder_set_member_name(b, "module_order");
+    json_builder_add_boolean_value(b, dt_styles_has_module_order(style->name));
+    json_builder_set_member_name(b, "items");
+    json_builder_begin_array(b);
+    GList *items = dt_styles_get_item_list(style->name, FALSE, NO_IMGID, FALSE);
+    for(GList *i = items; i; i = g_list_next(i))
+    {
+      const dt_style_item_t *it = i->data;
+      json_builder_begin_object(b);
+      json_builder_set_member_name(b, "operation");
+      json_builder_add_string_value(b, it->operation);
+      json_builder_set_member_name(b, "instance");
+      json_builder_add_int_value(b, it->multi_priority);
+      json_builder_set_member_name(b, "name");
+      json_builder_add_string_value(b, it->multi_name ? it->multi_name : "");
+      json_builder_set_member_name(b, "enabled");
+      json_builder_add_boolean_value(b, it->enabled);
+      json_builder_end_object(b);
+    }
+    g_list_free_full(items, dt_style_item_free);
+    json_builder_end_array(b);
+    json_builder_end_object(b);
+  }
+  json_builder_end_array(b);
+  g_list_free_full(styles, dt_style_free);
+  return TRUE;
+}
+
+static gboolean _style_apply_one(const dt_imgid_t imgid, const gboolean darkroom, gpointer data)
+{
+  if(darkroom)
+    dt_styles_apply_to_dev(data, imgid);
+  else
+    dt_styles_apply_to_image(data, FALSE, FALSE, imgid);
+  return TRUE;
+}
+
+// a style onto images: its modules added to each edit as new history items,
+// as applying it in the lighttable or darkroom does
+static gboolean _style_apply(JsonObject *params, const dt_imgid_t current, GArray *changed, JsonBuilder *b,
+                             gchar **err)
+{
+  const char *name = params ? json_object_get_string_member_with_default(params, "name", NULL) : NULL;
+  if(!name || !dt_styles_exists(name))
+  {
+    *err = g_strdup_printf("no style named '%s' (style_list)", name ? name : "");
+    return FALSE;
+  }
+  GArray *ids = _targets(params, current, NO_IMGID, err);
+  if(!ids) return FALSE;
+  const gboolean ok = _edit_saved(ids, _style_apply_one, (gpointer)name, changed, b, err);
+  g_array_free(ids, TRUE);
+  return ok;
+}
+
+// a style from an image's saved edit: the modules darktable's create style
+// dialog ticks (those meant for styles), or the ones asked for
+static gboolean _style_create(JsonObject *params, const dt_imgid_t current, JsonBuilder *b, gchar **err)
+{
+  const char *name = params ? json_object_get_string_member_with_default(params, "name", NULL) : NULL;
+  const dt_imgid_t imgid = params && json_object_has_member(params, "imgid")
+    ? json_object_get_int_member(params, "imgid") : current;
+  if(!name || !*name)
+  {
+    *err = g_strdup("needs a name");
+    return FALSE;
+  }
+  if(dt_styles_exists(name))
+  {
+    *err = g_strdup_printf("a style named '%s' exists", name);
+    return FALSE;
+  }
+  if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
+  {
+    *err = g_strdup_printf("no image with id %d", imgid);
+    return FALSE;
+  }
+  const _session_t *s = _session_find(imgid);
+  if(s && s->gui)
+    dt_dev_write_history(s->dev);
+  else if(s && s->dirty)
+  {
+    *err = g_strdup_printf("image %d has unsaved changes and a style takes the saved edit: save first", imgid);
+    return FALSE;
+  }
+  JsonArray *modules = params && json_object_has_member(params, "modules")
+                       && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "modules"))
+                         ? json_object_get_array_member(params, "modules") : NULL;
+  GList *nums = _history_nums(imgid, modules, TRUE, err);
+  if(!nums) return FALSE;
+  const char *desc = json_object_get_string_member_with_default(params, "description", "");
+  const gboolean order = json_object_get_boolean_member_with_default(params, "module_order", FALSE);
+  const gboolean ok = dt_styles_create_from_image(name, desc, imgid, nums, order);
+  g_list_free(nums);
+  if(!ok)
+  {
+    *err = g_strdup("darktable couldn't create the style");
+    return FALSE;
+  }
+  json_builder_set_member_name(b, "name");
+  json_builder_add_string_value(b, name);
+  JsonObject *q = json_object_new();
+  json_object_set_string_member(q, "filter", name);
+  // the new style's items, as style_list shows them
+  JsonBuilder *lb = json_builder_new();
+  json_builder_begin_object(lb);
+  _style_list(q, lb, err);
+  json_builder_end_object(lb);
+  JsonNode *root = json_builder_get_root(lb);
+  JsonArray *all = json_object_get_array_member(json_node_get_object(root), "styles");
+  for(guint i = 0; i < json_array_get_length(all); i++)
+  {
+    JsonObject *o = json_array_get_object_element(all, i);
+    if(g_strcmp0(json_object_get_string_member(o, "name"), name)) continue;
+    json_builder_set_member_name(b, "items");
+    json_builder_add_value(b, json_node_copy(json_object_get_member(o, "items")));
+  }
+  json_node_unref(root);
+  g_object_unref(lb);
+  json_object_unref(q);
+  return TRUE;
+}
+
+static gboolean _style_delete(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  const char *name = params ? json_object_get_string_member_with_default(params, "name", NULL) : NULL;
+  if(!name || !dt_styles_exists(name))
+  {
+    *err = g_strdup_printf("no style named '%s' (style_list)", name ? name : "");
+    return FALSE;
+  }
+  dt_styles_delete_by_name(name);
+  json_builder_set_member_name(b, "deleted");
+  json_builder_add_string_value(b, name);
+  return TRUE;
+}
+
+typedef struct _paste_t
+{
+  dt_imgid_t from;
+  gboolean merge, order, full;
+  GList *nums;
+} _paste_t;
+
+static gboolean _paste_one(const dt_imgid_t imgid, const gboolean darkroom, gpointer data)
+{
+  const _paste_t *p = data;
+  // writes the darkroom's history first and reloads it after when imgid
+  // is the darkroom's image
+  return dt_history_copy_and_paste_on_image(p->from, imgid, p->merge, p->nums, p->order, p->full, TRUE);
+}
+
+// one image's saved edit onto others, as the lighttable's copy and paste:
+// all of it (as "copy"), or the modules asked for (as "selective copy"),
+// appended to each edit or replacing it
+static gboolean _history_paste(JsonObject *params, const dt_imgid_t current, GArray *changed, JsonBuilder *b,
+                               gchar **err)
+{
+  const dt_imgid_t from = params ? json_object_get_int_member_with_default(params, "from", NO_IMGID) : NO_IMGID;
+  if(!dt_is_valid_imgid(from) || !_image_exists(from))
+  {
+    *err = g_strdup_printf("no source image %d (from)", from);
+    return FALSE;
+  }
+  const _session_t *s = _session_find(from);
+  if(s && !s->gui && s->dirty)
+  {
+    *err = g_strdup_printf("image %d has unsaved changes and pasting takes the saved edit: save first", from);
+    return FALSE;
+  }
+  const char *mode = json_object_get_string_member_with_default(params, "mode", "append");
+  if(g_strcmp0(mode, "append") && g_strcmp0(mode, "overwrite"))
+  {
+    *err = g_strdup("mode is append or overwrite");
+    return FALSE;
+  }
+  _paste_t p = { from, !g_strcmp0(mode, "append"),
+                 json_object_get_boolean_member_with_default(params, "module_order", FALSE), FALSE, NULL };
+  JsonArray *modules = json_object_has_member(params, "modules")
+                       && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "modules"))
+                         ? json_object_get_array_member(params, "modules") : NULL;
+  if(modules)
+  {
+    p.nums = _history_nums(from, modules, FALSE, err);
+    if(!p.nums) return FALSE;
+    // modules picked by hand go even when darktable's copy would skip them
+    // (dt_history_copy_parts)
+    p.full = TRUE;
+  }
+  GArray *ids = _targets(params, current, from, err);
+  if(!ids)
+  {
+    g_list_free(p.nums);
+    return FALSE;
+  }
+  if(s && s->gui) dt_dev_write_history(s->dev);
+  const gboolean ok = _edit_saved(ids, _paste_one, &p, changed, b, err);
+  g_array_free(ids, TRUE);
+  g_list_free(p.nums);
   return ok;
 }
 
@@ -5065,6 +5847,16 @@ typedef struct _job_t
   gchar *src;
   float strength;
   int status;                        // the thread's result: 0 = ok
+  // a picker or auto button in the darkroom (no thread)
+  gchar *op;
+  int prio;
+  gchar *control;
+  gboolean picker;
+  int phase, presses, phase_presses;
+  guint64 preview_mark, full_mark;   // pipe runs counted at the last step
+  void *before;                      // the module's settings when it started
+  guint watch;
+  JsonNode *result;
 } _job_t;
 
 static GList *_jobs = NULL;
@@ -5097,7 +5889,12 @@ static void _add_job(JsonBuilder *b, const _job_t *j)
   else json_builder_add_null_value(b);
   json_builder_set_member_name(b, "elapsed_ms");
   json_builder_add_int_value(b, ((j->finished ? j->finished : g_get_monotonic_time()) - j->started) / 1000);
-  if(j->state == _JOB_DONE)
+  if(j->result)
+  {
+    json_builder_set_member_name(b, "result");
+    json_builder_add_value(b, json_node_copy(j->result));
+  }
+  if(j->state == _JOB_DONE && dt_is_valid_imgid(j->new_imgid))
   {
     json_builder_set_member_name(b, "new_imgid");
     json_builder_add_int_value(b, j->new_imgid);
@@ -5493,6 +6290,510 @@ static guint _idle_source = 0;
 static gint64 _last_activity = 0;
 static gchar *_socket_path = NULL;    // our copy of _opt.socket_path
 
+// ---- pickers and auto buttons -----------------------------------------------
+// a module's pickers and auto buttons compute in its window code
+// (color_picker_apply reads its widgets), so they work on the photo in
+// darktable's darkroom only. the API presses them through darktable's
+// actions, as a shortcut would, sets the picker's area, and finishes when
+// the preview pipe's sample has been applied (a job: the pipe runs on
+// another thread)
+
+typedef struct _control_t
+{
+  dt_action_t *action;
+  GtkWidget *widget;
+  gboolean picker;
+  gchar *name;
+} _control_t;
+
+static void _control_free(gpointer p)
+{
+  _control_t *c = p;
+  g_free(c->name);
+  g_free(c);
+}
+
+// the module's pickers (bauhaus quads or buttons darktable made with
+// dt_color_picker_new) and auto buttons (tone equalizer's wands, plain
+// buttons such as rgb levels' "auto levels"), named by their action's path
+// below the module, in english: "exposure range/auto tune levels"
+static GList *_controls(dt_iop_module_t *m)
+{
+  GList *list = NULL;
+  for(GSList *l = m->widget_list; l; l = g_slist_next(l))
+  {
+    const dt_action_target_t *ref = l->data;
+    GtkWidget *w = ref ? ref->target : NULL;
+    if(!ref || !ref->action || !GTK_IS_WIDGET(w)) continue;
+    gboolean picker = FALSE;
+    if(DT_IS_BAUHAUS_WIDGET(w))
+    {
+      const dt_bauhaus_quad_paint_f paint = dt_bauhaus_widget_get_quad_paint(w);
+      if(paint == dtgtk_cairo_paint_colorpicker) picker = TRUE;
+      else if(paint != dtgtk_cairo_paint_wand) continue;
+    }
+    else if(g_object_get_data(G_OBJECT(w), DT_COLOR_PICKER_INSTANCE_KEY))
+      picker = TRUE;
+    else if(!GTK_IS_BUTTON(w) || GTK_IS_TOGGLE_BUTTON(w))
+      continue;
+    // the module's own controls; blending's are shared by all modules
+    dt_action_t *owner = ref->action;
+    GSList *labels = NULL;
+    for(; owner && owner->type >= DT_ACTION_TYPE_SECTION; owner = owner->owner)
+      labels = g_slist_prepend(labels, (gpointer)owner->label);
+    if(owner != &m->so->actions)
+    {
+      g_slist_free(labels);
+      continue;
+    }
+    GString *name = g_string_new(NULL);
+    for(GSList *k = labels; k; k = g_slist_next(k))
+      g_string_append_printf(name, "%s%s", name->len ? "/" : "", (const char *)k->data);
+    g_slist_free(labels);
+    _control_t *c = g_new0(_control_t, 1);
+    c->action = ref->action;
+    c->widget = w;
+    c->picker = picker;
+    c->name = g_string_free(name, FALSE);
+    list = g_list_append(list, c);
+  }
+  return list;
+}
+
+static dt_iop_module_t *_darkroom_module(JsonObject *params, gchar **err)
+{
+  if(!_cur || !_cur->gui)
+  {
+    *err = g_strdup("pickers and auto buttons work on the photo in darktable's darkroom, with darktable's window"
+                    " serving the API (library_status: darkroom_imgid)");
+    return NULL;
+  }
+  return _find_module(params, err);
+}
+
+static gboolean _picker_list(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_iop_module_t *m = _darkroom_module(params, err);
+  if(!m) return FALSE;
+  GList *controls = _controls(m);
+  json_builder_set_member_name(b, "controls");
+  json_builder_begin_array(b);
+  for(GList *l = controls; l; l = g_list_next(l))
+  {
+    const _control_t *c = l->data;
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "name");
+    json_builder_add_string_value(b, c->name);
+    json_builder_set_member_name(b, "kind");
+    json_builder_add_string_value(b, c->picker ? "picker" : "button");
+    if(c->picker)
+    {
+      json_builder_set_member_name(b, "active");
+      json_builder_add_boolean_value(b, dt_iop_color_picker_is_active(c->widget));
+    }
+    json_builder_end_object(b);
+  }
+  json_builder_end_array(b);
+  g_list_free_full(controls, _control_free);
+  return TRUE;
+}
+
+// darktable's path of an action ("iop/agx/exposure range/auto tune levels"),
+// its ids escaped as _action_find reads them
+static gchar *_action_path(const dt_action_t *ac)
+{
+  GSList *ids = NULL;
+  for(; ac; ac = ac->owner) ids = g_slist_prepend(ids, (gpointer)ac->id);
+  GString *path = g_string_new(NULL);
+  for(GSList *k = ids; k; k = g_slist_next(k))
+  {
+    if(path->len) g_string_append_c(path, '/');
+    for(const char *c = k->data; *c; c++)
+      if(*c == '/') g_string_append(path, "@<");
+      else if(*c == '@') g_string_append(path, "@@");
+      else g_string_append_c(path, *c);
+  }
+  g_slist_free(ids);
+  return g_string_free(path, FALSE);
+}
+
+static gboolean _press(dt_iop_module_t *m, const _control_t *c)
+{
+  // a plain button clicked through its action is activated, which GTK
+  // turns into a click a quarter second later (gtk_real_button_activate):
+  // click it now, so the pipe runs that follow see the press
+  if(GTK_IS_BUTTON(c->widget) && !c->picker && !DT_IS_BAUHAUS_WIDGET(c->widget)
+     && !g_object_get_data(G_OBJECT(c->widget), DT_ACTION_GESTURE_KEY))
+  {
+    if(!gtk_widget_is_sensitive(c->widget)) return FALSE;
+    gtk_button_clicked(GTK_BUTTON(c->widget));
+    return TRUE;
+  }
+  // the instance as darktable's actions count them: by position among the
+  // module's instances in the pipe (accelerators.c, _process_action)
+  int instance = 0;
+  for(GList *l = darktable.develop->iop; l; l = g_list_next(l))
+  {
+    const dt_iop_module_t *o = l->data;
+    if(o->so == m->so && o->iop_order != INT_MAX) instance++;
+    if(o == m) break;
+  }
+  gchar *path = _action_path(c->action);
+  // a bauhaus quad presses on any effect but on and off (bauhaus.c,
+  // _action_process_button)
+  const float r = DT_IS_BAUHAUS_WIDGET(c->widget)
+    ? dt_action_process(path, instance, "button", "toggle", 1.0f)
+    : dt_action_process(path, instance, NULL, c->picker ? "toggle" : "activate", 1.0f);
+  g_free(path);
+  // a button's action reports nothing (accelerators.c,
+  // _action_process_button): it presses when the button can be used
+  if(!DT_IS_BAUHAUS_WIDGET(c->widget) && !c->picker) return gtk_widget_is_sensitive(c->widget);
+  return !DT_ACTION_IS_INVALID(r);
+}
+
+static _control_t *_control_find(dt_iop_module_t *m, const char *name, GList **list)
+{
+  *list = _controls(m);
+  for(GList *l = *list; l; l = g_list_next(l))
+    if(!g_strcmp0(((_control_t *)l->data)->name, name)) return l->data;
+  return NULL;
+}
+
+// the darkroom's pipe runs, for auto buttons that need one before they can
+// work (tone equalizer's wands read its histogram) or after (rgb levels'
+// auto levels computes in the pipe)
+static guint64 _preview_runs = 0, _full_runs = 0;
+
+static void _gui_preview_finished_cb(gpointer instance, gpointer user_data)
+{
+  _preview_runs++;
+}
+
+static void _gui_full_finished_cb(gpointer instance, gpointer user_data)
+{
+  _full_runs++;
+}
+
+static _job_t *_pick_job(const dt_iop_module_t *m)
+{
+  for(GList *l = _jobs; l; l = g_list_next(l))
+  {
+    _job_t *j = l->data;
+    if(j->state == _JOB_RUNNING && j->control && !g_strcmp0(j->op, m->op) && j->prio == m->multi_priority)
+      return j;
+  }
+  return NULL;
+}
+
+static dt_iop_module_t *_job_module(const _job_t *j)
+{
+  return darktable.develop ? dt_iop_get_module_by_op_priority(darktable.develop->iop, j->op, j->prio) : NULL;
+}
+
+// the settings a pick or press changed, as module_get names them
+static JsonNode *_changed_settings(const dt_iop_module_t *m, const void *before)
+{
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "enabled");
+  json_builder_add_boolean_value(b, m->enabled);
+  json_builder_set_member_name(b, "changed");
+  json_builder_begin_object(b);
+  for(dt_introspection_field_t *f = m->so->get_introspection_linear();
+      before && f && f->header.type != DT_INTROSPECTION_TYPE_NONE; f++)
+  {
+    const gboolean list = _settable_list(f);
+    if(!list && !_settable(f)) continue;
+    const size_t off = f->header.offset;
+    if(!memcmp((const uint8_t *)before + off, (const uint8_t *)m->params + off, f->header.size)) continue;
+    json_builder_set_member_name(b, f->header.name);
+    if(list)
+      _add_list_value(b, f, (const uint8_t *)m->params + off);
+    else
+      _add_field_value(b, f, m->params);
+  }
+  json_builder_end_object(b);
+  json_builder_end_object(b);
+  JsonNode *n = json_builder_get_root(b);
+  g_object_unref(b);
+  return n;
+}
+
+static void _pick_end(_job_t *j, const _job_state_t state, const char *error)
+{
+  dt_iop_module_t *m = _job_module(j);
+  if(m && j->picker) dt_iop_color_picker_reset(m, FALSE);
+  if(m && state == _JOB_DONE) j->result = _changed_settings(m, j->before);
+  if(j->watch) g_source_remove(j->watch);
+  j->watch = 0;
+  if(error) j->error = g_strdup(error);
+  j->state = state;
+  j->finished = g_get_monotonic_time();
+  g_free(j->before);
+  j->before = NULL;
+  _notify_job(j);
+}
+
+// the window runs the darkroom's pipes when it draws, which it doesn't
+// while the screen sleeps: start them too. the preview pipe waits for the
+// full pipe while that is still loading the image (develop.c,
+// dt_dev_process_image_job)
+static void _run_preview(dt_develop_t *dev)
+{
+  if(dev->full.pipe->loading || dev->full.pipe->status != DT_DEV_PIXELPIPE_VALID)
+    dt_dev_process_image(dev);
+  dev->preview_pipe->status = DT_DEV_PIXELPIPE_DIRTY;
+  dt_dev_process_preview(dev);
+  dt_control_queue_redraw_center();
+}
+
+static void _run_pipes(dt_develop_t *dev)
+{
+  dt_dev_invalidate_all(dev);
+  dt_dev_process_preview(dev);
+  dt_dev_process_image(dev);
+  dt_control_queue_redraw_center();
+}
+
+// the preview pipe sampled a picker's area and darktable applied it
+// (color_picker_proxy.c connected first, so it has run)
+static void _gui_pickerdata_cb(gpointer instance, dt_iop_module_t *module, dt_dev_pixelpipe_t *pipe,
+                               gpointer user_data)
+{
+  _job_t *j = module ? _pick_job(module) : NULL;
+  if(!j || !j->picker) return;
+  if(j->phase == 0)
+  {
+    // the preview pipe was running when the area was set: this sample may
+    // be of the area before. move the area by a hair, which makes
+    // darktable apply the next sample (color_picker_proxy.c,
+    // _record_point_area)
+    dt_colorpicker_sample_t *sample = darktable.lib->proxy.colorpicker.primary_sample;
+    for(int k = 0; k < 2; k++) sample->point[k] += 1e-6f;
+    for(int k = 0; k < 8; k++) sample->box[k] += 1e-6f;
+    j->phase = 1;
+    _run_preview(darktable.develop);
+    return;
+  }
+  _pick_end(j, _JOB_DONE, NULL);
+}
+
+// pickers: cancel and time out. buttons: pressed once the pipes have run
+// with the module focused, read once they ran after the press
+static gboolean _pick_watch(gpointer data)
+{
+  _job_t *j = data;
+  dt_iop_module_t *m = _job_module(j);
+  const gint64 age = g_get_monotonic_time() - j->started;
+  if(!m || _darkroom_image() != j->imgid)
+  {
+    j->watch = 0;
+    _pick_end(j, _JOB_FAILED, "the darkroom left the photo or the module");
+    return G_SOURCE_REMOVE;
+  }
+  if(g_atomic_int_get(&j->cancel))
+  {
+    j->watch = 0;
+    _pick_end(j, _JOB_CANCELLED, NULL);
+    return G_SOURCE_REMOVE;
+  }
+  if(age > 30 * G_USEC_PER_SEC)
+  {
+    j->watch = 0;
+    _pick_end(j, _JOB_FAILED, "no result within 30 s: is darktable's window showing the darkroom?");
+    return G_SOURCE_REMOVE;
+  }
+  dt_develop_t *dev = darktable.develop;
+  const dt_iop_color_picker_t *proxy = darktable.lib->proxy.colorpicker.picker_proxy;
+  if(j->picker && (!proxy || proxy->module != m))
+  {
+    // another picker, a click in the window, or the darkroom reloading
+    // (a style applied) switched it off
+    j->watch = 0;
+    _pick_end(j, _JOB_FAILED, "the picker was switched off before darktable applied it");
+    return G_SOURCE_REMOVE;
+  }
+  if(j->picker)
+  {
+    // the preview pipe may not have run (see _run_pipes): ask again now
+    // and then
+    if(++j->presses % 20 == 0 && !dt_pipe_processing(dev->preview_pipe)) _run_preview(dev);
+    return G_SOURCE_CONTINUE;
+  }
+  // buttons: once both pipes have run since the last step and are idle,
+  // press (phase 0) or read what the press did (phase 1)
+  // (a run cut short by a newer change ends too, but leaves its pipe dirty)
+  const gboolean idle = !dt_pipe_processing(dev->full.pipe) && !dt_pipe_processing(dev->preview_pipe)
+                        && dev->full.pipe->status == DT_DEV_PIXELPIPE_VALID
+                        && dev->preview_pipe->status == DT_DEV_PIXELPIPE_VALID
+                        && _preview_runs > j->preview_mark && _full_runs > j->full_mark;
+  if(!idle)
+  {
+    if(++j->presses % 20 == 0) _run_pipes(dev);
+    return G_SOURCE_CONTINUE;
+  }
+  j->preview_mark = _preview_runs;
+  j->full_mark = _full_runs;
+  // a press may do nothing yet (a wand whose histogram isn't ready): up to
+  // three
+  if(j->phase == 1 && (memcmp(j->before, m->params, m->params_size) || j->phase_presses >= 3))
+  {
+    j->watch = 0;
+    _pick_end(j, _JOB_DONE, NULL);
+    return G_SOURCE_REMOVE;
+  }
+  GList *list = NULL;
+  const _control_t *c = _control_find(m, j->control, &list);
+  const gboolean pressed = c && _press(m, c);
+  g_list_free_full(list, _control_free);
+  if(!pressed)
+  {
+    j->watch = 0;
+    _pick_end(j, _JOB_FAILED, c ? "darktable didn't accept the press" : "the button is gone");
+    return G_SOURCE_REMOVE;
+  }
+  j->phase_presses++;
+  j->phase = 1;
+  // the press may change nothing the pipes see: run them anyway
+  _run_pipes(dev);
+  return G_SOURCE_CONTINUE;
+}
+
+static gboolean _parse_area(JsonObject *params, float box[4], gboolean *point, gchar **err)
+{
+  *point = json_object_has_member(params, "point");
+  JsonNode *n = json_object_get_member(params, *point ? "point" : "box");
+  if(!n)
+  {
+    // darktable's own area for a picker used the first time
+    // (dt_lib_colorpicker_reset_box_area)
+    box[0] = box[1] = 0.02f;
+    box[2] = box[3] = 0.98f;
+    return TRUE;
+  }
+  gboolean ok = FALSE;
+  if(*point && JSON_NODE_HOLDS_ARRAY(n) && json_array_get_length(json_node_get_array(n)) == 2)
+  {
+    JsonArray *a = json_node_get_array(n);
+    box[0] = json_array_get_double_element(a, 0);
+    box[1] = json_array_get_double_element(a, 1);
+    ok = box[0] >= 0.f && box[0] <= 1.f && box[1] >= 0.f && box[1] <= 1.f;
+  }
+  else if(!*point && JSON_NODE_HOLDS_OBJECT(n))
+  {
+    JsonObject *o = json_node_get_object(n);
+    static const char *keys[4] = { "left", "top", "right", "bottom" };
+    ok = TRUE;
+    for(int k = 0; k < 4 && ok; k++)
+    {
+      ok = json_object_has_member(o, keys[k]);
+      if(ok) box[k] = json_object_get_double_member(o, keys[k]);
+    }
+    ok = ok && box[0] >= 0.f && box[2] <= 1.f && box[1] >= 0.f && box[3] <= 1.f
+            && box[0] < box[2] && box[1] < box[3];
+  }
+  if(!ok)
+    *err = g_strdup("point is [x, y] and box {left, top, right, bottom}, in 0..1 of the image as rendered");
+  return ok;
+}
+
+// presses a picker or auto button of a module of the darkroom's photo. a
+// picker samples box (or point) in image space; without one, darktable's
+// default area for a fresh picker (nearly the whole image)
+static gboolean _picker_apply(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_iop_module_t *m = _darkroom_module(params, err);
+  if(!m) return FALSE;
+  const char *name = json_object_get_string_member_with_default(params, "control", NULL);
+  GList *list = NULL;
+  const _control_t *c = _control_find(m, name, &list);
+  if(!c)
+  {
+    g_list_free_full(list, _control_free);
+    *err = g_strdup_printf("module '%s' has no picker or button '%s' (picker_list)", m->op, name ? name : "");
+    return FALSE;
+  }
+  float area[4];
+  gboolean point = FALSE;
+  if(c->picker && !_parse_area(params, area, &point, err))
+  {
+    g_list_free_full(list, _control_free);
+    return FALSE;
+  }
+  if(_pick_job(m))
+  {
+    g_list_free_full(list, _control_free);
+    *err = g_strdup_printf("a picker of '%s' is already at work (job_list)", m->op);
+    return FALSE;
+  }
+  _job_t *j = g_new0(_job_t, 1);
+  j->id = _next_job++;
+  j->type = c->picker ? "picker" : "button";
+  j->imgid = _cur->dev->image_storage.id;
+  j->started = g_get_monotonic_time();
+  j->op = g_strdup(m->op);
+  j->prio = m->multi_priority;
+  j->control = g_strdup(c->name);
+  j->picker = c->picker;
+  j->before = g_malloc(m->params_size);
+  memcpy(j->before, m->params, m->params_size);
+  _jobs = g_list_append(_jobs, j);
+
+  dt_develop_t *dev = darktable.develop;
+  if(c->picker)
+  {
+    if(!dt_iop_color_picker_is_active(c->widget) && !_press(m, c))
+    {
+      _pick_end(j, _JOB_FAILED, "darktable didn't accept the press");
+      g_list_free_full(list, _control_free);
+      _add_job(b, j);
+      return TRUE;
+    }
+    const dt_iop_color_picker_t *proxy = darktable.lib->proxy.colorpicker.picker_proxy;
+    if(!proxy || proxy->module != m || !dt_iop_color_picker_is_active(c->widget))
+    {
+      _pick_end(j, _JOB_FAILED, "darktable didn't switch the picker on");
+      g_list_free_full(list, _control_free);
+      _add_job(b, j);
+      return TRUE;
+    }
+    // the area in darktable's picker space (the pipe's input, so it stays
+    // on the same spot when the crop changes), as dragging it does
+    // (darkroom.c, mouse_moved)
+    if(point)
+    {
+      dt_pickerpoint_t pos;
+      dt_color_picker_backtransform_box(dev, 1, area, pos);
+      dt_lib_colorpicker_set_point(darktable.lib, pos);
+    }
+    else
+    {
+      dt_pickerbox_t box;
+      dt_color_picker_backtransform_box(dev, 2, area, box);
+      dt_lib_colorpicker_set_box_area(darktable.lib, box);
+    }
+    // a run already under way samples the old area: then the first sample
+    // is not this one (_gui_pickerdata_cb)
+    j->phase = dt_pipe_processing(dev->preview_pipe) ? 0 : 1;
+    _run_preview(dev);
+  }
+  else
+  {
+    dt_iop_request_focus(m);
+    // on first, as its power button would: some buttons only switch the
+    // module on when it's off (tone equalizer's wands), others compute in
+    // a pipe run the switch cuts short (rgb levels' auto levels)
+    if(!m->enabled) _record(m, TRUE);
+    j->preview_mark = _preview_runs;
+    j->full_mark = _full_runs;
+    _run_pipes(dev);
+  }
+  j->watch = g_timeout_add(100, _pick_watch, j);
+  g_list_free_full(list, _control_free);
+  _add_job(b, j);
+  return TRUE;
+}
+
 static void _request_quit(void)
 {
   if(_opt.quit) _opt.quit();
@@ -5647,8 +6948,10 @@ static const char *_methods[] = {
   "ping", "film_rolls", "images_list", "image_info", "thumbnail", "set_rating", "set_label",
   "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
   "module_enable", "preset_list", "preset_apply", "history_list", "history_end", "geometry_get",
-  "geometry_set", "coords", "retouch_list", "retouch_heal", "blend_get", "blend_set", "mask_add", "mask_list",
-  "mask_remove", "mask_ai", "sample", "ai_denoise", "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "module_remove", "module_rename", "history_compress",
+  "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
+  "retouch_remove", "blend_get", "blend_set", "mask_add", "mask_list",
+  "mask_remove", "mask_ai", "sample", "ai_denoise", "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "style_list", "style_create", "style_delete", "style_apply",
+  "history_paste", "picker_list", "picker_apply", "module_remove", "module_rename", "history_compress",
   "render.history_end", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
   "library_status", "library_release", "library_acquire", "handover", "shutdown", NULL };
 
@@ -5657,9 +6960,10 @@ static const struct { const char *method; const char *event; } _session_methods[
   { "module_list", NULL }, { "module_get", NULL }, { "history_list", NULL }, { "render", NULL },
   { "geometry_get", NULL }, { "preset_list", NULL }, { "preset_apply", "edit" },
   { "coords", NULL }, { "retouch_list", NULL }, { "retouch_heal", "edit" },
+  { "retouch_add", "edit" }, { "retouch_set", "edit" }, { "retouch_remove", "edit" },
   { "blend_get", NULL }, { "blend_set", "edit" }, { "mask_add", "edit" }, { "mask_list", NULL },
   { "mask_remove", "edit" }, { "mask_ai", "edit" }, { "sample", NULL },
-  { "module_move", "edit" }, { "curve_get", NULL }, { "curve_set", "edit" },
+  { "module_move", "edit" }, { "picker_list", NULL }, { "picker_apply", NULL }, { "curve_get", NULL }, { "curve_set", "edit" },
   { "module_add", "edit" }, { "module_remove", "edit" }, { "module_rename", "edit" }, { "history_compress", "saved" },
   { "module_set", "edit" }, { "module_enable", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" },
   { "save", "saved" }, { "reset", "reset" }, { "session_close", "closed" }, { NULL, NULL } };
@@ -5819,6 +7123,31 @@ static gboolean _handle(_client_t *c, const gchar *line)
         ? json_object_get_int_member(params, "imgid") : c->current;
     }
   }
+  else if(!g_strcmp0(method, "style_list"))
+    _style_list(params, b, &err);
+  else if(!g_strcmp0(method, "style_create"))
+    _style_create(params, c->current, b, &err);
+  else if(!g_strcmp0(method, "style_delete"))
+    _style_delete(params, b, &err);
+  else if(!g_strcmp0(method, "style_apply") || !g_strcmp0(method, "history_paste"))
+  {
+    GArray *changed = g_array_new(FALSE, FALSE, sizeof(dt_imgid_t));
+    if(!g_strcmp0(method, "style_apply"))
+      _style_apply(params, c->current, changed, b, &err);
+    else
+      _history_paste(params, c->current, changed, b, &err);
+    // images done before an error changed too
+    for(guint i = 0; i < changed->len; i++)
+    {
+      _notify(c, _session_find(g_array_index(changed, dt_imgid_t, i)) ? "reopened" : "image",
+              g_array_index(changed, dt_imgid_t, i));
+    }
+    g_array_free(changed, TRUE);
+  }
+  else if(!g_strcmp0(method, "picker_list"))
+    _picker_list(params, b, &err);
+  else if(!g_strcmp0(method, "picker_apply"))
+    _picker_apply(params, b, &err);
   else if(!g_strcmp0(method, "module_add"))
     _module_add(params, b, &err);
   else if(!g_strcmp0(method, "module_remove"))
@@ -5846,7 +7175,13 @@ static gboolean _handle(_client_t *c, const gchar *line)
   else if(!g_strcmp0(method, "retouch_list"))
     _retouch_list(params, b, &err);
   else if(!g_strcmp0(method, "retouch_heal"))
-    _retouch_heal(params, b, &err);
+    _retouch_add(params, "heal", b, &err);
+  else if(!g_strcmp0(method, "retouch_add"))
+    _retouch_add(params, "heal", b, &err);
+  else if(!g_strcmp0(method, "retouch_set"))
+    _retouch_set(params, b, &err);
+  else if(!g_strcmp0(method, "retouch_remove"))
+    _retouch_remove(params, b, &err);
   else if(!g_strcmp0(method, "geometry_get"))
     _geometry_get(b, &err);
   else if(!g_strcmp0(method, "geometry_set"))
@@ -6141,6 +7476,9 @@ void dt_api_start(const dt_api_options_t *options)
     DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_IMAGE_CHANGED, _gui_image_cb, NULL);
     DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_IMAGE_INFO_CHANGED, _gui_info_cb, NULL);
     DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_VIEWMANAGER_VIEW_CHANGED, _gui_view_cb, NULL);
+    DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_CONTROL_PICKERDATA_READY, _gui_pickerdata_cb, NULL);
+    DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED, _gui_preview_finished_cb, NULL);
+    DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_UI_PIPE_FINISHED, _gui_full_finished_cb, NULL);
   }
   // unsaved edits handed over by an engine (dt_api_handover) or kept by the
   // last server that stopped
@@ -6224,6 +7562,9 @@ gboolean dt_api_stop(void)
     DT_CONTROL_SIGNAL_DISCONNECT(_gui_image_cb, NULL);
     DT_CONTROL_SIGNAL_DISCONNECT(_gui_info_cb, NULL);
     DT_CONTROL_SIGNAL_DISCONNECT(_gui_view_cb, NULL);
+    DT_CONTROL_SIGNAL_DISCONNECT(_gui_pickerdata_cb, NULL);
+    DT_CONTROL_SIGNAL_DISCONNECT(_gui_preview_finished_cb, NULL);
+    DT_CONTROL_SIGNAL_DISCONNECT(_gui_full_finished_cb, NULL);
     if(_gui_session.mirror) _session_free(_gui_session.mirror);
     _gui_session.mirror = NULL;
   }

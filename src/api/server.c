@@ -125,6 +125,11 @@
                                  -> a style, or an image's saved edit, onto
                                     images in the library as the lighttable
                                     does; open ones saved first, reopened
+     image_metadata / set_tags / set_metadata / set_location / tag_list
+                                 -> tags, metadata fields and location, as
+                                    darktable's tagging, metadata editor
+                                    and geotagging set them
+     mask_ai_encode              -> encodes the photo for AI masks (a job)
      picker_list / picker_apply {operation, instance, control, box | point}
                                  -> darktable's window, the darkroom's photo:
                                     a module's pickers and auto buttons,
@@ -251,6 +256,7 @@
 #include "develop/blend.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
+#include "develop/imageop_math.h"
 #include "develop/masks.h"
 #include "develop/pixelpipe_hb.h"
 #include "gui/presets.h"
@@ -2717,6 +2723,20 @@ static void _add_blend(JsonBuilder *b, const dt_iop_module_t *m)
   json_builder_begin_array(b);
   for(const _channel_t *c = _channels_of(bp); c->name; c++) json_builder_add_string_value(b, c->name);
   json_builder_end_array(b);
+  json_builder_set_member_name(b, "raster_source");
+  if(bp->raster_mask_source[0])
+  {
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "operation");
+    json_builder_add_string_value(b, bp->raster_mask_source);
+    json_builder_set_member_name(b, "instance");
+    json_builder_add_int_value(b, bp->raster_mask_instance);
+    json_builder_end_object(b);
+  }
+  else
+    json_builder_add_null_value(b);
+  json_builder_set_member_name(b, "raster_inverted");
+  json_builder_add_boolean_value(b, bp->raster_mask_invert);
 }
 
 static gboolean _blend_get(JsonObject *params, JsonBuilder *b, gchar **err)
@@ -2748,7 +2768,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
     return FALSE;
   }
   dt_develop_blend_params_t bp = *m->blend_params;
-  gboolean parametric = FALSE, ok = TRUE;
+  gboolean parametric = FALSE, raster = FALSE, ok = TRUE;
   GList *names = json_object_get_members(values);
   for(GList *n = names; n && ok; n = g_list_next(n))
   {
@@ -2913,11 +2933,55 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
       }
       g_list_free(keys);
     }
+    else if(!g_strcmp0(name, "raster_source"))
+    {
+      // another module's mask, as the raster mask menu picks it: a module
+      // before this one with a mask of its own, as dt_iop_advertise_rastermask
+      // decides (asked directly: the window advertises when its pipe runs)
+      JsonObject *o = JSON_NODE_HOLDS_OBJECT(v) ? json_node_get_object(v) : NULL;
+      const char *sop = is_str ? json_node_get_string(v)
+                               : o ? json_object_get_string_member_with_default(o, "operation", NULL) : NULL;
+      const int sprio = o ? json_object_get_int_member_with_default(o, "instance", 0) : 0;
+      dt_iop_module_t *src = sop ? dt_iop_get_module_by_op_priority(_cur->dev->iop, sop, sprio) : NULL;
+      if(JSON_NODE_HOLDS_NULL(v))
+      {
+        memset(bp.raster_mask_source, 0, sizeof(bp.raster_mask_source));
+        bp.raster_mask_instance = 0;
+        bp.raster_mask_id = INVALID_MASKID;
+        bp.mask_mode &= ~DEVELOP_MASK_RASTER;
+      }
+      else if(!src || src == m || src->iop_order >= m->iop_order
+              || !((src->blend_params->mask_mode & DEVELOP_MASK_ENABLED
+                    && !(src->blend_params->mask_mode & DEVELOP_MASK_RASTER))
+                   || (src->flags() & IOP_FLAGS_WRITE_RASTER)))
+      {
+        *err = g_strdup("'raster_source': {operation, instance} of a module before this one that has a mask,"
+                        " or null");
+        ok = FALSE;
+      }
+      else
+      {
+        g_strlcpy(bp.raster_mask_source, src->op, sizeof(bp.raster_mask_source));
+        bp.raster_mask_instance = src->multi_priority;
+        bp.raster_mask_id = BLEND_RASTER_ID;
+        raster = TRUE;
+      }
+    }
+    else if(!g_strcmp0(name, "raster_inverted"))
+    {
+      if(!(JSON_NODE_HOLDS_VALUE(v) && json_node_get_value_type(v) == G_TYPE_BOOLEAN))
+      {
+        *err = g_strdup("'raster_inverted': true or false");
+        ok = FALSE;
+      }
+      else
+        bp.raster_mask_invert = json_node_get_boolean(v);
+    }
     else
     {
       *err = g_strdup_printf("blend_set: no setting '%s' (masks, blend_mode, reverse, opacity,"
                              " blend_parameter, feathering_radius, blur_radius, brightness, contrast, details,"
-                             " combine, feathering_guide, parametric)", name);
+                             " combine, feathering_guide, parametric, raster_source, raster_inverted)", name);
       ok = FALSE;
     }
   }
@@ -2926,7 +2990,12 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
   // ranges set: the parametric tab is on, keeping drawn shapes if any
   if(parametric && !(bp.mask_mode & DEVELOP_MASK_CONDITIONAL))
     bp.mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL | (bp.mask_mode & DEVELOP_MASK_MASK);
-  *m->blend_params = bp;
+  // a source set: the raster tab on (raster masks don't combine with the
+  // others, develop/blend.c)
+  if(raster) bp.mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER;
+  // the sink registered with its source, so the source keeps its mask
+  // (dt_iop_commit_blend_params, as the raster mask menu's history item)
+  dt_iop_commit_blend_params(m, &bp, NULL);
   _record(m, TRUE);
   json_builder_set_member_name(b, "history_end");
   json_builder_add_int_value(b, _cur->dev->history_end);
@@ -3016,10 +3085,80 @@ static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
   }
 #define _NUM(o, k, d) json_object_get_double_member_with_default((o), (k), (d))
   dt_masks_form_t *form = NULL;
+  if(!g_strcmp0(type, "path") || !g_strcmp0(type, "brush"))
+  {
+    // corners in raw space; control points smoothed through them as the
+    // path and brush tools draw them
+    const gboolean brush = !g_strcmp0(type, "brush");
+    JsonArray *pts = json_object_has_member(sh, "points")
+                     && JSON_NODE_HOLDS_ARRAY(json_object_get_member(sh, "points"))
+                       ? json_object_get_array_member(sh, "points") : NULL;
+    const guint n = pts ? json_array_get_length(pts) : 0;
+    const double border = _NUM(sh, brush ? "width" : "border",
+                               brush ? dt_conf_get_float("plugins/darkroom/masks/brush/border")
+                                     : dt_conf_get_float("plugins/darkroom/masks/path/border"));
+    const double hardness = _NUM(sh, "hardness", dt_conf_get_float("plugins/darkroom/masks/brush/hardness"));
+    const double density = _NUM(sh, "density", dt_conf_get_float("plugins/darkroom/masks/brush/density"));
+    gboolean ok = n >= (brush ? 2 : 3) && border > 0.0 && border <= 1.0
+                  && hardness >= 0.0 && hardness <= 1.0 && density >= 0.0 && density <= 1.0;
+    for(guint k = 0; ok && k < n; k++)
+    {
+      JsonNode *e = json_array_get_element(pts, k);
+      JsonArray *p = JSON_NODE_HOLDS_ARRAY(e) ? json_node_get_array(e) : NULL;
+      ok = p && json_array_get_length(p) == 2;
+      for(int c = 0; ok && c < 2; c++)
+      {
+        const double v = json_array_get_double_element(p, c);
+        ok = v >= 0.0 && v <= 1.0;
+      }
+    }
+    if(!ok)
+    {
+      *err = g_strdup(brush ? "brush: points [[x, y], ...] (2 or more, raw space), width 0..1 (relative to the"
+                              " shorter side), hardness and density 0..1"
+                            : "path: points [[x, y], ...] (3 or more, raw space; closed), border 0..1 (relative"
+                              " to the shorter side)");
+      return FALSE;
+    }
+    form = dt_masks_create(brush ? DT_MASKS_BRUSH : DT_MASKS_PATH);
+    for(guint k = 0; k < n; k++)
+    {
+      JsonArray *p = json_array_get_array_element(pts, k);
+      const float px = json_array_get_double_element(p, 0), py = json_array_get_double_element(p, 1);
+      if(brush)
+      {
+        dt_masks_point_brush_t *pt = malloc(sizeof(dt_masks_point_brush_t));
+        pt->corner[0] = px;
+        pt->corner[1] = py;
+        pt->ctrl1[0] = pt->ctrl1[1] = pt->ctrl2[0] = pt->ctrl2[1] = -1.0f;
+        pt->border[0] = pt->border[1] = border;
+        pt->hardness = hardness;
+        pt->density = density;
+        pt->state = DT_MASKS_POINT_STATE_NORMAL;
+        form->points = g_list_append(form->points, pt);
+      }
+      else
+      {
+        dt_masks_point_path_t *pt = malloc(sizeof(dt_masks_point_path_t));
+        pt->corner[0] = px;
+        pt->corner[1] = py;
+        pt->ctrl1[0] = pt->ctrl1[1] = pt->ctrl2[0] = pt->ctrl2[1] = -1.0f;
+        pt->border[0] = pt->border[1] = MAX(0.0005f, border);
+        pt->state = DT_MASKS_POINT_STATE_NORMAL;
+        form->points = g_list_append(form->points, pt);
+      }
+    }
+    if(brush)
+      dt_masks_brush_init_ctrl_points(form);
+    else
+      dt_masks_path_init_ctrl_points(form);
+    return _mask_attach(m, form, op, inverted, b);
+  }
   const double x = sh ? _NUM(sh, "x", -1) : -1, y = sh ? _NUM(sh, "y", -1) : -1;
   if(!(x >= 0.0 && x <= 1.0 && y >= 0.0 && y <= 1.0))
   {
-    *err = g_strdup("shape needs type (circle, ellipse, gradient) and x, y in 0..1 (raw space, coords)");
+    *err = g_strdup("shape needs type (circle, ellipse, gradient, path, brush) and x, y in 0..1"
+                    " (raw space, coords)");
     return FALSE;
   }
   if(!g_strcmp0(type, "circle"))
@@ -3083,7 +3222,7 @@ static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   else
   {
-    *err = g_strdup("shape type: circle, ellipse or gradient");
+    *err = g_strdup("shape type: circle, ellipse, gradient, path or brush");
     return FALSE;
   }
 #undef _NUM
@@ -3127,6 +3266,21 @@ static gboolean _mask_list(JsonObject *params, JsonBuilder *b, gchar **err)
       json_builder_add_double_value(b, p[0]);
       json_builder_set_member_name(b, "y");
       json_builder_add_double_value(b, p[1]);
+    }
+    if(form->type & (DT_MASKS_PATH | DT_MASKS_BRUSH))
+    {
+      // corners first in both point types
+      json_builder_set_member_name(b, "points");
+      json_builder_begin_array(b);
+      for(GList *q = form->points; q; q = g_list_next(q))
+      {
+        const float *p = q->data;
+        json_builder_begin_array(b);
+        json_builder_add_double_value(b, p[0]);
+        json_builder_add_double_value(b, p[1]);
+        json_builder_end_array(b);
+      }
+      json_builder_end_array(b);
     }
     json_builder_end_object(b);
   }
@@ -3203,6 +3357,33 @@ static void _add_instance(JsonBuilder *b, const dt_iop_module_t *m)
 // a new instance of a module, after the given one in the pipe, as the
 // module's "new instance" (copy: false) or "duplicate" (copy: true) menu
 // entries do (imageop.c, dt_iop_gui_duplicate)
+// dt_masks_iop_use_same_as for a session (darktable's works on the
+// darkroom's image): the copy gets a group of its own holding the base's
+// shapes, shared as the darkroom shares them. the group is new, so it can't
+// contain itself (the check dt_masks_group_add_form makes)
+static gboolean _masks_use_same_as(dt_develop_t *dev, dt_iop_module_t *m, const dt_iop_module_t *base)
+{
+  const dt_masks_form_t *src = dt_masks_get_from_id(dev, base->blend_params->mask_id);
+  if(!src || src->type != DT_MASKS_GROUP) return FALSE;
+  dt_masks_form_t *grp = dt_masks_create(DT_MASKS_GROUP);
+  while(dt_masks_get_from_id(dev, grp->formid)) grp->formid++;
+  gchar *label = dt_history_item_get_name(m);
+  snprintf(grp->name, sizeof(grp->name), _("group `%s'"), label);
+  g_free(label);
+  for(const GList *l = src->points; l; l = g_list_next(l))
+  {
+    const dt_masks_point_group_t *pt = l->data;
+    if(!dt_masks_get_from_id(dev, pt->formid)) continue;
+    dt_masks_point_group_t *grpt = malloc(sizeof(dt_masks_point_group_t));
+    *grpt = *pt;
+    grpt->parentid = grp->formid;
+    grp->points = g_list_append(grp->points, grpt);
+  }
+  dev->forms = g_list_append(dev->forms, grp);
+  m->blend_params->mask_id = grp->formid;
+  return TRUE;
+}
+
 static gboolean _module_add(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
@@ -3220,7 +3401,7 @@ static gboolean _module_add(JsonObject *params, JsonBuilder *b, gchar **err)
   const gboolean copy = params ? json_object_get_boolean_member_with_default(params, "copy", FALSE) : FALSE;
   dt_develop_t *dev = _cur->dev;
   dt_iop_module_t *m = NULL;
-  gboolean shapes_copied = TRUE;
+  gboolean shapes_copied = TRUE, shapes = FALSE;
   if(_cur->gui)
   {
     _api_editing = TRUE;
@@ -3242,19 +3423,24 @@ static gboolean _module_add(JsonObject *params, JsonBuilder *b, gchar **err)
         if(m->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
         {
           dt_iop_commit_blend_params(m, base->blend_params, NULL);
-          // the darkroom gives the copy its own group with the base's
-          // shapes (dt_masks_iop_use_same_as), which works on the
-          // darkroom's image only: here the copy has no drawn shapes
+          // its own group with the base's shapes, as the darkroom's copy
           if(dt_is_valid_maskid(base->blend_params->mask_id))
           {
             m->blend_params->mask_id = NO_MASKID;
-            m->blend_params->mask_mode &= ~DEVELOP_MASK_MASK;
-            shapes_copied = FALSE;
+            shapes = _masks_use_same_as(dev, m, base);
+            if(!shapes)
+            {
+              m->blend_params->mask_mode &= ~DEVELOP_MASK_MASK;
+              shapes_copied = FALSE;
+            }
           }
         }
       }
       m->enabled = TRUE;
-      dt_dev_add_history_item_ext(dev, m, TRUE, TRUE);
+      if(shapes)
+        dt_dev_add_masks_history_item_ext(dev, m, TRUE, TRUE);
+      else
+        dt_dev_add_history_item_ext(dev, m, TRUE, TRUE);
       _pipe_rebuild(_cur);
       _cur->dirty = TRUE;
     }
@@ -4299,15 +4485,43 @@ static void _conf_restore(GList *list)
   g_list_free(list);
 }
 
-static gboolean _export(JsonObject *params, const dt_imgid_t current, gboolean *saved,
-                        JsonBuilder *b, gchar **err)
+// an export's settings and target, decided on the server's thread (the
+// format modules read darktablerc, which the request's quality overrides
+// for the moment); the writing can run on another (_export_write)
+typedef struct _export_t
+{
+  dt_imgid_t imgid;
+  dt_imageio_module_format_t *format;
+  dt_imageio_module_storage_t *storage;
+  dt_imageio_module_data_t *fdata, *sdata;
+  gboolean hq, upscale, skipped, saved, failed;
+  dt_export_metadata_t metadata;
+  dt_colorspaces_color_profile_type_t icc_type;
+  gchar *icc_filename;
+  dt_iop_color_intent_t icc_intent;
+  gchar *file;
+  gint64 t0;
+} _export_t;
+
+static void _export_free(_export_t *e)
+{
+  if(!e) return;
+  g_list_free_full(e->metadata.list, g_free);
+  g_free(e->icc_filename);
+  if(e->sdata) e->storage->free_params(e->storage, e->sdata);
+  if(e->fdata) e->format->free_params(e->format, e->fdata);
+  g_free(e->file);
+  g_free(e);
+}
+
+static _export_t *_export_prepare(JsonObject *params, const dt_imgid_t current, gchar **err)
 {
   const dt_imgid_t imgid = params && json_object_has_member(params, "imgid")
     ? json_object_get_int_member(params, "imgid") : current;
   if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
   {
     *err = g_strdup_printf("no image with id %d", imgid);
-    return FALSE;
+    return NULL;
   }
   const gchar *fmt_name = params ? json_object_get_string_member_with_default(params, "format", NULL) : NULL;
   const gchar *pattern = params ? json_object_get_string_member_with_default(params, "path", NULL) : NULL;
@@ -4333,12 +4547,12 @@ static gboolean _export(JsonObject *params, const dt_imgid_t current, gboolean *
   if(conflict && conflict_action < 0)
   {
     *err = g_strdup("on_conflict: unique, overwrite, overwrite_if_changed or skip");
-    return FALSE;
+    return NULL;
   }
   if(max_w < -1 || max_h < -1)
   {
     *err = g_strdup("max_width/max_height: pixels, 0 for no limit");
-    return FALSE;
+    return NULL;
   }
 
   // darktable knows these by other names (cli/main.c)
@@ -4351,18 +4565,18 @@ static gboolean _export(JsonObject *params, const dt_imgid_t current, gboolean *
   if(!format || !storage)
   {
     *err = g_strdup_printf(format ? "no disk storage module" : "unknown format '%s'", want);
-    return FALSE;
+    return NULL;
   }
   if(style && *style && !dt_styles_exists(style))
   {
     *err = g_strdup_printf("no style '%s'", style);
-    return FALSE;
+    return NULL;
   }
 
   // the export reads the saved history: unsaved changes are saved first on
   // request, else refused. the darkroom's edit is saved as its autosave does
   _session_t *s = _session_find(imgid);
-  *saved = FALSE;
+  gboolean saved = FALSE;
   if(s && s->gui)
     dt_dev_write_history(s->dev);
   else if(s && s->dirty)
@@ -4371,10 +4585,10 @@ static gboolean _export(JsonObject *params, const dt_imgid_t current, gboolean *
     {
       *err = g_strdup("the image has unsaved changes, and export uses the saved edit: save first,"
                       " or pass save: true");
-      return FALSE;
+      return NULL;
     }
     _save_session(s);
-    *saved = TRUE;
+    saved = TRUE;
   }
 
   const gint64 t0 = g_get_monotonic_time();
@@ -4397,7 +4611,7 @@ static gboolean _export(JsonObject *params, const dt_imgid_t current, gboolean *
     if(sdata) storage->free_params(storage, sdata);
     if(fdata) format->free_params(format, fdata);
     *err = g_strdup("the export modules returned no settings");
-    return FALSE;
+    return NULL;
   }
 
   // the size: the request's, else the export module's, within what the
@@ -4441,48 +4655,82 @@ static gboolean _export(JsonObject *params, const dt_imgid_t current, gboolean *
   const int on_conflict = conflict ? conflict_action : dt_conf_get_int("plugins/imageio/storage/disk/overwrite");
   gboolean skipped = FALSE;
   gchar *file = _export_target(imgid, pat, on_conflict, format, fdata, upscale, &skipped, err);
-  // as the disk storage's store() does
-  const gboolean failed = file && dt_imageio_export(imgid, file, format, fdata, hq, upscale, FALSE, 1.0,
-                                                    TRUE, FALSE, icc_type, icc_filename, icc_intent,
-                                                    storage, sdata, 1, 1, &metadata);
-  g_list_free_full(metadata.list, g_free);
-  g_free(icc_filename);
-  storage->free_params(storage, sdata);
-  format->free_params(format, fdata);
-  if(!file && !skipped) return FALSE;
-  if(failed)
+  _export_t *e = g_new0(_export_t, 1);
+  e->imgid = imgid;
+  e->format = format;
+  e->storage = storage;
+  e->fdata = fdata;
+  e->sdata = sdata;
+  e->hq = hq;
+  e->upscale = upscale;
+  e->skipped = skipped;
+  e->saved = saved;
+  e->metadata = metadata;
+  e->icc_type = icc_type;
+  e->icc_filename = icc_filename;
+  e->icc_intent = icc_intent;
+  e->file = file;
+  e->t0 = t0;
+  if(!file && !skipped)
   {
-    *err = g_strdup_printf("could not export to '%s'", file);
-    g_free(file);
+    _export_free(e);
+    return NULL;
+  }
+  return e;
+}
+
+// as the disk storage's store() does
+static void _export_write(_export_t *e)
+{
+  e->failed = e->file && dt_imageio_export(e->imgid, e->file, e->format, e->fdata, e->hq, e->upscale, FALSE, 1.0,
+                                           TRUE, FALSE, e->icc_type, e->icc_filename, e->icc_intent,
+                                           e->storage, e->sdata, 1, 1, &e->metadata);
+}
+
+static gboolean _export_finish(_export_t *e, JsonBuilder *b, gchar **err)
+{
+  if(e->failed)
+  {
+    *err = g_strdup_printf("could not export to '%s'", e->file);
     return FALSE;
   }
-  if(file)
+  if(e->file)
   {
     // as the export job: tagged exported, no longer changed
     guint tagid = 0, etagid = 0;
     dt_tag_new("darktable|changed", &tagid);
     dt_tag_new("darktable|exported", &etagid);
-    dt_tag_detach(tagid, imgid, FALSE, FALSE);
-    dt_tag_attach(etagid, imgid, FALSE, FALSE);
-    dt_image_cache_set_export_timestamp(imgid);
+    dt_tag_detach(tagid, e->imgid, FALSE, FALSE);
+    dt_tag_attach(etagid, e->imgid, FALSE, FALSE);
+    dt_image_cache_set_export_timestamp(e->imgid);
   }
-
   json_builder_set_member_name(b, "imgid");
-  json_builder_add_int_value(b, imgid);
+  json_builder_add_int_value(b, e->imgid);
   json_builder_set_member_name(b, "file");
-  if(file) json_builder_add_string_value(b, file);
+  if(e->file) json_builder_add_string_value(b, e->file);
   else json_builder_add_null_value(b);
   // the conflict setting can leave an existing file alone
   json_builder_set_member_name(b, "skipped");
-  json_builder_add_boolean_value(b, skipped);
+  json_builder_add_boolean_value(b, e->skipped);
   json_builder_set_member_name(b, "format");
-  json_builder_add_string_value(b, format->plugin_name);
+  json_builder_add_string_value(b, e->format->plugin_name);
   json_builder_set_member_name(b, "saved");
-  json_builder_add_boolean_value(b, *saved);
+  json_builder_add_boolean_value(b, e->saved);
   json_builder_set_member_name(b, "ms");
-  json_builder_add_int_value(b, (g_get_monotonic_time() - t0) / 1000);
-  g_free(file);
+  json_builder_add_int_value(b, (g_get_monotonic_time() - e->t0) / 1000);
   return TRUE;
+}
+
+static gboolean _export(JsonObject *params, const dt_imgid_t current, gboolean *saved,
+                        JsonBuilder *b, gchar **err)
+{
+  _export_t *e = _export_prepare(params, current, err);
+  if(!e) return FALSE;
+  *saved = e->saved;
+  _export_write(e);
+  const gboolean ok = _export_finish(e, b, err);
+  _export_free(e);
+  return ok;
 }
 
 // ---- releasing and taking back the library -------------------------------
@@ -5089,16 +5337,29 @@ static gboolean _thumbnail(JsonObject *params, JsonBuilder *b, gchar **err)
   dt_mipmap_buffer_t buf;
   dt_mipmap_cache_get(&buf, imgid, level, DT_MIPMAP_BLOCKING, 'r');
   gboolean ok = buf.buf && buf.width > 0 && buf.height > 0;
+  // the cached level is the one at or above size: down to size, as the
+  // mipmap cache makes its smaller levels (mipmap_cache.c)
+  uint32_t w = ok ? buf.width : 0, h = ok ? buf.height : 0;
+  uint8_t *scaled = NULL;
+  if(ok && (w > size || h > size))
+  {
+    scaled = dt_alloc_aligned((size_t)size * size * 4);
+    if(scaled)
+      dt_iop_flip_and_zoom_8(buf.buf, buf.width, buf.height, scaled, size, size, ORIENTATION_NONE, &w, &h);
+    else
+      w = buf.width, h = buf.height;
+  }
   // the mipmap cache keeps 8-bit levels in the byte order its own jpeg
   // writer takes (mipmap_cache.c, disk cache)
-  if(ok && dt_imageio_jpeg_write(path, buf.buf, buf.width, buf.height, quality, NULL, 0))
+  if(ok && dt_imageio_jpeg_write(path, scaled ? scaled : buf.buf, w, h, quality, NULL, 0))
     ok = FALSE;
+  dt_free_align(scaled);
   if(ok)
   {
     json_builder_set_member_name(b, "width");
-    json_builder_add_int_value(b, buf.width);
+    json_builder_add_int_value(b, w);
     json_builder_set_member_name(b, "height");
-    json_builder_add_int_value(b, buf.height);
+    json_builder_add_int_value(b, h);
     json_builder_set_member_name(b, "level");
     json_builder_add_int_value(b, level);
     json_builder_set_member_name(b, "ms");
@@ -5165,6 +5426,255 @@ static gboolean _set_label(JsonObject *params, JsonBuilder *b, gchar **err)
 static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err);
 
 // the darkroom's image renders through its mirror (_pipe_session)
+// ---- tags, metadata, location -----------------------------------------------
+// with darktable's own code, as its tagging, metadata editor and geotagging
+// modules: written to the library and the sidecar; the window's panels are
+// told (they listen for these signals)
+
+static GList *_imgids(JsonObject *params, const dt_imgid_t current, gchar **err)
+{
+  GList *imgs = NULL;
+  JsonArray *a = params && json_object_has_member(params, "imgids")
+                 && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "imgids"))
+                   ? json_object_get_array_member(params, "imgids") : NULL;
+  if(a)
+    for(guint i = 0; i < json_array_get_length(a); i++)
+      imgs = g_list_append(imgs, GINT_TO_POINTER(json_array_get_int_element(a, i)));
+  else if(dt_is_valid_imgid(current))
+    imgs = g_list_append(imgs, GINT_TO_POINTER(current));
+  if(!imgs) *err = g_strdup("no image: pass imgids, or open one first");
+  for(GList *l = imgs; l && !*err; l = g_list_next(l))
+    if(!_image_exists(GPOINTER_TO_INT(l->data)))
+      *err = g_strdup_printf("no image with id %d", GPOINTER_TO_INT(l->data));
+  if(*err)
+  {
+    g_list_free(imgs);
+    return NULL;
+  }
+  return imgs;
+}
+
+static void _imgs_changed(GList *imgs, JsonBuilder *b)
+{
+  for(GList *l = imgs; l; l = g_list_next(l)) dt_image_synch_xmp(GPOINTER_TO_INT(l->data));
+  json_builder_set_member_name(b, "imgids");
+  json_builder_begin_array(b);
+  for(GList *l = imgs; l; l = g_list_next(l)) json_builder_add_int_value(b, GPOINTER_TO_INT(l->data));
+  json_builder_end_array(b);
+}
+
+// a metadata field by its name in the metadata editor ("title") or its xmp
+// key ("Xmp.dc.title"); darktable's internal ones are left out
+static const dt_metadata_t *_metadata_field(const char *name)
+{
+  for(GList *l = dt_metadata_get_list(); l; l = g_list_next(l))
+  {
+    const dt_metadata_t *md = l->data;
+    if(!md->internal && (!g_strcmp0(md->name, name) || !g_strcmp0(md->tagname, name))) return md;
+  }
+  return NULL;
+}
+
+// an image's tags (not darktable's own "darktable|..."), metadata and
+// location
+static gboolean _image_metadata(JsonObject *params, const dt_imgid_t current, JsonBuilder *b, gchar **err)
+{
+  const dt_imgid_t imgid = params && json_object_has_member(params, "imgid")
+    ? json_object_get_int_member(params, "imgid") : current;
+  if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
+  {
+    *err = g_strdup_printf("no image with id %d", imgid);
+    return FALSE;
+  }
+  json_builder_set_member_name(b, "imgid");
+  json_builder_add_int_value(b, imgid);
+  GList *tags = NULL;
+  dt_tag_get_attached(imgid, &tags, TRUE);
+  json_builder_set_member_name(b, "tags");
+  json_builder_begin_array(b);
+  for(GList *l = tags; l; l = g_list_next(l))
+    json_builder_add_string_value(b, ((dt_tag_t *)l->data)->tag);
+  json_builder_end_array(b);
+  dt_tag_free_result(&tags);
+  json_builder_set_member_name(b, "metadata");
+  json_builder_begin_object(b);
+  for(GList *l = dt_metadata_get_list(); l; l = g_list_next(l))
+  {
+    const dt_metadata_t *md = l->data;
+    if(md->internal) continue;
+    uint32_t count = 0;
+    GList *v = dt_metadata_get(imgid, md->tagname, &count);
+    json_builder_set_member_name(b, md->name);
+    json_builder_add_string_value(b, v ? (const char *)v->data : "");
+    g_list_free_full(v, g_free);
+  }
+  json_builder_end_object(b);
+  const dt_image_t *img = dt_image_cache_get(imgid, 'r');
+  json_builder_set_member_name(b, "location");
+  if(img && !isnan(img->geoloc.latitude) && !isnan(img->geoloc.longitude))
+  {
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "latitude");
+    json_builder_add_double_value(b, img->geoloc.latitude);
+    json_builder_set_member_name(b, "longitude");
+    json_builder_add_double_value(b, img->geoloc.longitude);
+    json_builder_set_member_name(b, "elevation");
+    if(isnan(img->geoloc.elevation)) json_builder_add_null_value(b);
+    else json_builder_add_double_value(b, img->geoloc.elevation);
+    json_builder_end_object(b);
+  }
+  else
+    json_builder_add_null_value(b);
+  dt_image_cache_read_release(img);
+  return TRUE;
+}
+
+// attach and detach tags by name ("places|france|paris": the hierarchy
+// darktable's tagging module shows), creating new ones
+static gboolean _set_tags(JsonObject *params, const dt_imgid_t current, JsonBuilder *b, gchar **err)
+{
+  JsonArray *attach = params && json_object_has_member(params, "attach")
+                      && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "attach"))
+                        ? json_object_get_array_member(params, "attach") : NULL;
+  JsonArray *detach = params && json_object_has_member(params, "detach")
+                      && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "detach"))
+                        ? json_object_get_array_member(params, "detach") : NULL;
+  if(!attach && !detach)
+  {
+    *err = g_strdup("needs attach and/or detach: lists of tag names");
+    return FALSE;
+  }
+  for(int pass = 0; pass < 2; pass++)
+  {
+    JsonArray *a = pass ? detach : attach;
+    for(guint i = 0; a && i < json_array_get_length(a); i++)
+    {
+      JsonNode *n = json_array_get_element(a, i);
+      const char *name = JSON_NODE_HOLDS_VALUE(n) && json_node_get_value_type(n) == G_TYPE_STRING
+                         ? json_node_get_string(n) : NULL;
+      if(!name || !*name || g_str_has_prefix(name, "darktable|"))
+      {
+        *err = g_strdup("tag names are non-empty and not darktable's own (darktable|...)");
+        return FALSE;
+      }
+    }
+  }
+  GList *imgs = _imgids(params, current, err);
+  if(!imgs) return FALSE;
+  for(guint i = 0; attach && i < json_array_get_length(attach); i++)
+  {
+    guint tagid = 0;
+    dt_tag_new(json_array_get_string_element(attach, i), &tagid);
+    dt_tag_attach_images(tagid, imgs, FALSE);
+  }
+  for(guint i = 0; detach && i < json_array_get_length(detach); i++)
+  {
+    guint tagid = 0;
+    if(dt_tag_exists(json_array_get_string_element(detach, i), &tagid))
+      dt_tag_detach_images(tagid, imgs, FALSE);
+  }
+  if(_in_gui) DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_TAG_CHANGED);
+  _imgs_changed(imgs, b);
+  g_list_free(imgs);
+  return TRUE;
+}
+
+// metadata fields by name; "" clears one
+static gboolean _set_metadata(JsonObject *params, const dt_imgid_t current, JsonBuilder *b, gchar **err)
+{
+  JsonObject *values = params && json_object_has_member(params, "values")
+                       && JSON_NODE_HOLDS_OBJECT(json_object_get_member(params, "values"))
+                         ? json_object_get_object_member(params, "values") : NULL;
+  GList *names = values ? json_object_get_members(values) : NULL;
+  if(!names) *err = g_strdup("needs values: {field: text}");
+  for(GList *l = names; l && !*err; l = g_list_next(l))
+  {
+    JsonNode *v = json_object_get_member(values, l->data);
+    if(!_metadata_field(l->data))
+      *err = g_strdup_printf("no metadata field '%s' (image_metadata lists them)", (const char *)l->data);
+    else if(!JSON_NODE_HOLDS_VALUE(v) || json_node_get_value_type(v) != G_TYPE_STRING)
+      *err = g_strdup_printf("'%s' takes text", (const char *)l->data);
+  }
+  GList *imgs = *err ? NULL : _imgids(params, current, err);
+  if(!imgs)
+  {
+    g_list_free(names);
+    return FALSE;
+  }
+  for(GList *i = imgs; i; i = g_list_next(i))
+    for(GList *l = names; l; l = g_list_next(l))
+      dt_metadata_set(GPOINTER_TO_INT(i->data), _metadata_field(l->data)->tagname,
+                      json_object_get_string_member(values, l->data), FALSE);
+  g_list_free(names);
+  if(_in_gui) DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_METADATA_CHANGED, DT_METADATA_SIGNAL_NEW_VALUE);
+  _imgs_changed(imgs, b);
+  g_list_free(imgs);
+  return TRUE;
+}
+
+// the location, as the geotagging module sets it; clear removes it
+static gboolean _set_location(JsonObject *params, const dt_imgid_t current, JsonBuilder *b, gchar **err)
+{
+  const gboolean clear = params ? json_object_get_boolean_member_with_default(params, "clear", FALSE) : FALSE;
+  dt_image_geoloc_t loc = { NAN, NAN, NAN };
+  if(!clear)
+  {
+    if(!params || !json_object_has_member(params, "latitude") || !json_object_has_member(params, "longitude"))
+    {
+      *err = g_strdup("needs latitude and longitude (degrees; elevation in m optional), or clear: true");
+      return FALSE;
+    }
+    loc.latitude = json_object_get_double_member(params, "latitude");
+    loc.longitude = json_object_get_double_member(params, "longitude");
+    if(json_object_has_member(params, "elevation") && !json_object_get_null_member(params, "elevation"))
+      loc.elevation = json_object_get_double_member(params, "elevation");
+    if(fabs(loc.latitude) > 90.0 || fabs(loc.longitude) > 180.0)
+    {
+      *err = g_strdup("latitude is -90..90 and longitude -180..180");
+      return FALSE;
+    }
+  }
+  GList *imgs = _imgids(params, current, err);
+  if(!imgs) return FALSE;
+  dt_image_set_locations(imgs, &loc, FALSE);
+  if(_in_gui) DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_GEOTAG_CHANGED, g_list_copy(imgs), 0);
+  _imgs_changed(imgs, b);
+  g_list_free(imgs);
+  return TRUE;
+}
+
+// the library's tags with how many images carry each (not darktable's own)
+static gboolean _tag_list(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  const char *filter = params ? json_object_get_string_member_with_default(params, "filter", "") : "";
+  gchar *like = g_strdup_printf("%%%s%%", filter);
+  sqlite3_stmt *st;
+  sqlite3_prepare_v2(dt_database_get(darktable.db),
+                     "SELECT t.name, COUNT(ti.imgid)"
+                     " FROM data.tags AS t"
+                     " LEFT JOIN main.tagged_images AS ti ON ti.tagid = t.id"
+                     " WHERE t.name NOT LIKE 'darktable|%' AND t.name LIKE ?1"
+                     " GROUP BY t.id"
+                     " ORDER BY t.name",
+                     -1, &st, NULL);
+  sqlite3_bind_text(st, 1, like, -1, SQLITE_TRANSIENT);
+  json_builder_set_member_name(b, "tags");
+  json_builder_begin_array(b);
+  while(sqlite3_step(st) == SQLITE_ROW)
+  {
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "name");
+    json_builder_add_string_value(b, (const char *)sqlite3_column_text(st, 0));
+    json_builder_set_member_name(b, "images");
+    json_builder_add_int_value(b, sqlite3_column_int(st, 1));
+    json_builder_end_object(b);
+  }
+  json_builder_end_array(b);
+  sqlite3_finalize(st);
+  g_free(like);
+  return TRUE;
+}
+
 static gboolean _render(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur || !_cur->gui) return _render_session(params, b, err);
@@ -5539,6 +6049,7 @@ static dt_ai_environment_t *_seg_env = NULL;
 static dt_seg_context_t *_seg = NULL;
 static gchar *_seg_key = NULL;        // which photo and geometry _seg has encoded
 static int _seg_w = 0, _seg_h = 0;
+static int _seg_job = 0;              // the mask_ai_encode job encoding, 0 if none
 
 // keep only the part of the mask connected to (sx, sy): what the darkroom
 // does so stray blobs don't become shapes (object.c: _keep_seed_component)
@@ -5570,6 +6081,60 @@ static void _keep_component(float *mask, const int w, const int h, const float t
     if(!keep[i]) mask[i] = 0.0f;
   g_free(stack);
   g_free(keep);
+}
+#endif
+
+#ifdef HAVE_AI
+// the AI mask model, loaded once
+static gboolean _seg_model(gchar **err)
+{
+  if(!_seg)
+  {
+    if(!_seg_env) _seg_env = dt_ai_env_init(NULL);
+    gchar *model = dt_ai_models_get_active_for_task("mask");
+    _seg = model && _seg_env ? dt_seg_load(_seg_env, model) : NULL;
+    g_free(model);
+  }
+  if(!_seg) *err = g_strdup("no AI mask model could be loaded (darktable's preferences: AI models)");
+  return _seg != NULL;
+}
+
+// the photo as rendered at darktable's size for AI masks (1536 by
+// default), RGB, and the key its encoding is kept under (the photo and its
+// geometry); rgb stays NULL when that encoding is the current one. leaves
+// _cur at the session whose pipe rendered it
+static gboolean _seg_input(_session_t **sp, uint8_t **rgb, int *w, int *h, gchar **key, gchar **err)
+{
+  _session_t *s = _pipe_session(err);
+  if(!s) return FALSE;
+  _cur = s;
+  _pipe_sync(s);
+  const dt_hash_t dh = dt_dev_hash_distort_plus(s->dev, &s->pipe, 0, DT_DEV_TRANSFORM_DIR_ALL);
+  *key = g_strdup_printf("%d:%" PRIu64 ":%dx%d", s->dev->image_storage.id, (uint64_t)dh,
+                         s->pipe.processed_width, s->pipe.processed_height);
+  *sp = s;
+  *rgb = NULL;
+  if(_seg_key && !g_strcmp0(*key, _seg_key) && dt_seg_is_encoded(_seg)) return TRUE;
+  const int size = MAX(dt_conf_key_exists("plugins/darkroom/masks/object/render_size")
+                       ? dt_conf_get_int("plugins/darkroom/masks/object/render_size") : 1536, 1024);
+  _view_t v;
+  if(!_process_view(NULL, size, size, &v, err))
+  {
+    g_free(*key);
+    *key = NULL;
+    return FALSE;
+  }
+  *rgb = g_malloc((size_t)v.w * v.h * 3);
+  const uint8_t *src = s->pipe.backbuf;
+  for(size_t k = 0; k < (size_t)v.w * v.h; k++)
+  {
+    (*rgb)[3 * k + 0] = src[4 * k + 2];
+    (*rgb)[3 * k + 1] = src[4 * k + 1];
+    (*rgb)[3 * k + 2] = src[4 * k + 0];
+  }
+  *w = v.w;
+  *h = v.h;
+  return TRUE;
 }
 #endif
 
@@ -5634,61 +6199,39 @@ static gboolean _mask_ai(JsonObject *params, JsonBuilder *b, gchar **err)
   const gboolean inverted = params ? json_object_get_boolean_member_with_default(params, "inverted", FALSE) : FALSE;
   const gint64 t0 = g_get_monotonic_time();
 
-  // the model, loaded once
-  if(!_seg)
+  if(_seg_job)
   {
-    if(!_seg_env) _seg_env = dt_ai_env_init(NULL);
-    gchar *model = dt_ai_models_get_active_for_task("mask");
-    _seg = model && _seg_env ? dt_seg_load(_seg_env, model) : NULL;
-    g_free(model);
-    if(!_seg)
-    {
-      g_free(p);
-      *err = g_strdup("no AI mask model could be loaded (darktable's preferences: AI models)");
-      return FALSE;
-    }
+    g_free(p);
+    *err = g_strdup_printf("the photo is being encoded for AI masks (job %d): wait for it", _seg_job);
+    return FALSE;
+  }
+  if(!_seg_model(err))
+  {
+    g_free(p);
+    return FALSE;
   }
 
   // the photo as rendered, encoded at darktable's size (1536 by default);
   // kept while the photo and its geometry stay the same
   _session_t *gui = _cur;
-  _session_t *s = _pipe_session(err);
-  if(!s)
+  _session_t *s = NULL;
+  uint8_t *rgb = NULL;
+  int rw = 0, rh = 0;
+  gchar *key = NULL;
+  if(!_seg_input(&s, &rgb, &rw, &rh, &key, err))
   {
+    _cur = gui;
     g_free(p);
     return FALSE;
   }
-  _cur = s;
-  _pipe_sync(s);
-  const dt_hash_t dh = dt_dev_hash_distort_plus(s->dev, &s->pipe, 0, DT_DEV_TRANSFORM_DIR_ALL);
-  gchar *key = g_strdup_printf("%d:%" PRIu64 ":%dx%d", s->dev->image_storage.id, (uint64_t)dh,
-                               s->pipe.processed_width, s->pipe.processed_height);
-  gboolean encoded = _seg_key && !g_strcmp0(key, _seg_key) && dt_seg_is_encoded(_seg);
-  if(!encoded)
+  gboolean encoded = rgb == NULL;
+  if(rgb)
   {
-    const int size = MAX(dt_conf_key_exists("plugins/darkroom/masks/object/render_size")
-                         ? dt_conf_get_int("plugins/darkroom/masks/object/render_size") : 1536, 1024);
-    _view_t v;
-    if(!_process_view(NULL, size, size, &v, err))
-    {
-      _cur = gui;
-      g_free(key);
-      g_free(p);
-      return FALSE;
-    }
-    uint8_t *rgb = g_malloc((size_t)v.w * v.h * 3);
-    const uint8_t *src = s->pipe.backbuf;
-    for(size_t k = 0; k < (size_t)v.w * v.h; k++)
-    {
-      rgb[3 * k + 0] = src[4 * k + 2];
-      rgb[3 * k + 1] = src[4 * k + 1];
-      rgb[3 * k + 2] = src[4 * k + 0];
-    }
     dt_seg_reset_encoding(_seg);
-    encoded = dt_seg_encode_image(_seg, rgb, v.w, v.h);
+    encoded = dt_seg_encode_image(_seg, rgb, rw, rh);
     g_free(rgb);
-    _seg_w = v.w;
-    _seg_h = v.h;
+    _seg_w = rw;
+    _seg_h = rh;
     g_free(_seg_key);
     _seg_key = encoded ? g_strdup(key) : NULL;
   }
@@ -5852,11 +6395,19 @@ typedef struct _job_t
   int prio;
   gchar *control;
   gboolean picker;
-  int phase, presses, phase_presses;
+  int phase, presses, phase_presses, arms;
+  float area[4];                     // a picker's box, or point in area[0..1]
+  gboolean point;
   guint64 preview_mark, full_mark;   // pipe runs counted at the last step
   void *before;                      // the module's settings when it started
   guint watch;
   JsonNode *result;
+  // an export, or the photo to encode for AI masks
+  struct _export_t *export;
+  uint8_t *rgb;
+  int rw, rh;
+  gchar *seg_key;
+  gboolean ok;
 } _job_t;
 
 static GList *_jobs = NULL;
@@ -5946,6 +6497,11 @@ static gboolean _job_cancel(JsonObject *params, JsonBuilder *b, gchar **err)
   if(j->state != _JOB_RUNNING)
   {
     *err = g_strdup_printf("job %d has already ended (%s)", j->id, _job_states[j->state]);
+    return FALSE;
+  }
+  if(j->export)
+  {
+    *err = g_strdup_printf("job %d is an export, which runs to its end", j->id);
     return FALSE;
   }
   g_atomic_int_set(&j->cancel, 1);
@@ -6265,6 +6821,159 @@ static gboolean _ai_denoise(JsonObject *params, const dt_imgid_t current, JsonBu
 #endif
 }
 
+// ---- exports and AI mask encoding in the background ---------------------
+// as AI denoise: the slow part on a thread of its own, the rest on the
+// server's thread
+
+static gboolean _export_job_finish(gpointer data)
+{
+  _job_t *j = data;
+  g_thread_join(j->thread);
+  j->thread = NULL;
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  gchar *err = NULL;
+  const gboolean ok = _export_finish(j->export, b, &err);
+  json_builder_end_object(b);
+  if(ok) j->result = json_builder_get_root(b);
+  g_object_unref(b);
+  j->error = err;
+  j->state = ok ? _JOB_DONE : _JOB_FAILED;
+  j->finished = g_get_monotonic_time();
+  _export_free(j->export);
+  j->export = NULL;
+  _notify_job(j);
+  return G_SOURCE_REMOVE;
+}
+
+static gpointer _export_job_run(gpointer data)
+{
+  _job_t *j = data;
+  _export_write(j->export);
+  g_idle_add(_export_job_finish, j);
+  return NULL;
+}
+
+// export {background: true}: replies the job at once; its result is what
+// export replies
+static gboolean _export_job(JsonObject *params, const dt_imgid_t current, gboolean *saved, JsonBuilder *b,
+                            gchar **err)
+{
+  _export_t *e = _export_prepare(params, current, err);
+  if(!e) return FALSE;
+  *saved = e->saved;
+  _job_t *j = g_new0(_job_t, 1);
+  j->id = _next_job++;
+  j->type = "export";
+  j->imgid = e->imgid;
+  j->started = g_get_monotonic_time();
+  j->export = e;
+  _jobs = g_list_append(_jobs, j);
+  j->thread = g_thread_new("api-export", _export_job_run, j);
+  _add_job(b, j);
+  return TRUE;
+}
+
+#ifdef HAVE_AI
+static gboolean _seg_job_finish(gpointer data)
+{
+  _job_t *j = data;
+  g_thread_join(j->thread);
+  j->thread = NULL;
+  _seg_job = 0;
+  g_free(j->rgb);
+  j->rgb = NULL;
+  if(g_atomic_int_get(&j->cancel) || !j->ok)
+  {
+    dt_seg_reset_encoding(_seg);
+    g_free(_seg_key);
+    _seg_key = NULL;
+    j->state = g_atomic_int_get(&j->cancel) ? _JOB_CANCELLED : _JOB_FAILED;
+    if(!j->ok) j->error = g_strdup("the AI mask model could not encode the photo");
+  }
+  else
+  {
+    _seg_w = j->rw;
+    _seg_h = j->rh;
+    g_free(_seg_key);
+    _seg_key = j->seg_key;
+    j->seg_key = NULL;
+    j->state = _JOB_DONE;
+  }
+  g_free(j->seg_key);
+  j->seg_key = NULL;
+  j->finished = g_get_monotonic_time();
+  _notify_job(j);
+  return G_SOURCE_REMOVE;
+}
+
+static gpointer _seg_job_run(gpointer data)
+{
+  _job_t *j = data;
+  dt_seg_reset_encoding(_seg);
+  j->ok = dt_seg_encode_image(_seg, j->rgb, j->rw, j->rh);
+  g_idle_add(_seg_job_finish, j);
+  return NULL;
+}
+#endif
+
+// encodes the photo for AI masks in the background (the slow part of the
+// first mask_ai on a photo: seconds), so mask_ai is quick after. done at
+// once when it is encoded already
+static gboolean _mask_ai_encode(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+#ifndef HAVE_AI
+  *err = g_strdup("this darktable was built without AI (USE_AI)");
+  return FALSE;
+#else
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  if(!dt_ai_registry_is_enabled())
+  {
+    *err = g_strdup("AI features are off in darktable's preferences (plugins/ai/enabled)");
+    return FALSE;
+  }
+  if(_seg_job)
+  {
+    *err = g_strdup_printf("a photo is being encoded already (job %d)", _seg_job);
+    return FALSE;
+  }
+  if(!_seg_model(err)) return FALSE;
+  _session_t *gui = _cur, *s = NULL;
+  _job_t *j = g_new0(_job_t, 1);
+  const gboolean ok = _seg_input(&s, &j->rgb, &j->rw, &j->rh, &j->seg_key, err);
+  _cur = gui;
+  if(!ok)
+  {
+    g_free(j);
+    return FALSE;
+  }
+  j->id = _next_job++;
+  j->type = "mask_ai_encode";
+  j->imgid = gui->dev->image_storage.id;
+  j->started = g_get_monotonic_time();
+  _jobs = g_list_append(_jobs, j);
+  if(!j->rgb)
+  {
+    // encoded already
+    g_free(j->seg_key);
+    j->seg_key = NULL;
+    j->state = _JOB_DONE;
+    j->finished = j->started;
+  }
+  else
+  {
+    _seg_job = j->id;
+    j->thread = g_thread_new("api-ai-encode", _seg_job_run, j);
+  }
+  _add_job(b, j);
+  return TRUE;
+#endif
+}
+
 // ---- clients ------------------------------------------------------------
 // stdin/stdout is one client; with a socket, every connection is one. the
 // sockets are GLib sources of the default main context: the engine's own
@@ -6555,6 +7264,37 @@ static void _run_pipes(dt_develop_t *dev)
   dt_control_queue_redraw_center();
 }
 
+// switches a picker on (unless it is) and sets its area: in darktable's
+// picker space (the pipe's input, so it stays on the same spot when the
+// crop changes), as dragging it does (darkroom.c, mouse_moved). an error,
+// or NULL
+static const char *_pick_arm(_job_t *j, dt_iop_module_t *m, const _control_t *c)
+{
+  dt_develop_t *dev = darktable.develop;
+  if(!dt_iop_color_picker_is_active(c->widget) && !_press(m, c))
+    return "darktable didn't accept the press";
+  const dt_iop_color_picker_t *proxy = darktable.lib->proxy.colorpicker.picker_proxy;
+  if(!proxy || proxy->module != m || !dt_iop_color_picker_is_active(c->widget))
+    return "darktable didn't switch the picker on";
+  if(j->point)
+  {
+    dt_pickerpoint_t pos;
+    dt_color_picker_backtransform_box(dev, 1, j->area, pos);
+    dt_lib_colorpicker_set_point(darktable.lib, pos);
+  }
+  else
+  {
+    dt_pickerbox_t box;
+    dt_color_picker_backtransform_box(dev, 2, j->area, box);
+    dt_lib_colorpicker_set_box_area(darktable.lib, box);
+  }
+  // a run already under way samples the old area: then the first sample
+  // is not this one (_gui_pickerdata_cb)
+  j->phase = dt_pipe_processing(dev->preview_pipe) ? 0 : 1;
+  _run_preview(dev);
+  return NULL;
+}
+
 // the preview pipe sampled a picker's area and darktable applied it
 // (color_picker_proxy.c connected first, so it has run)
 static void _gui_pickerdata_cb(gpointer instance, dt_iop_module_t *module, dt_dev_pixelpipe_t *pipe,
@@ -6607,10 +7347,17 @@ static gboolean _pick_watch(gpointer data)
   const dt_iop_color_picker_t *proxy = darktable.lib->proxy.colorpicker.picker_proxy;
   if(j->picker && (!proxy || proxy->module != m))
   {
-    // another picker, a click in the window, or the darkroom reloading
-    // (a style applied) switched it off
+    // the modules' controls refreshed after the darkroom reloaded (a style
+    // applied) switch pickers off (dt_iop_color_picker_reset): switch it on
+    // again, twice at most. not when another picker took over (another
+    // job, a click in the window)
+    GList *list = NULL;
+    const _control_t *c = !proxy && ++j->arms <= 2 ? _control_find(m, j->control, &list) : NULL;
+    const char *e = c ? _pick_arm(j, m, c) : "the picker was switched off before darktable applied it";
+    g_list_free_full(list, _control_free);
+    if(!e) return G_SOURCE_CONTINUE;
     j->watch = 0;
-    _pick_end(j, _JOB_FAILED, "the picker was switched off before darktable applied it");
+    _pick_end(j, _JOB_FAILED, e);
     return G_SOURCE_REMOVE;
   }
   if(j->picker)
@@ -6713,7 +7460,7 @@ static gboolean _picker_apply(JsonObject *params, JsonBuilder *b, gchar **err)
     *err = g_strdup_printf("module '%s' has no picker or button '%s' (picker_list)", m->op, name ? name : "");
     return FALSE;
   }
-  float area[4];
+  float area[4] = { 0.f };
   gboolean point = FALSE;
   if(c->picker && !_parse_area(params, area, &point, err))
   {
@@ -6735,6 +7482,8 @@ static gboolean _picker_apply(JsonObject *params, JsonBuilder *b, gchar **err)
   j->prio = m->multi_priority;
   j->control = g_strdup(c->name);
   j->picker = c->picker;
+  memcpy(j->area, area, sizeof(area));
+  j->point = point;
   j->before = g_malloc(m->params_size);
   memcpy(j->before, m->params, m->params_size);
   _jobs = g_list_append(_jobs, j);
@@ -6742,40 +7491,14 @@ static gboolean _picker_apply(JsonObject *params, JsonBuilder *b, gchar **err)
   dt_develop_t *dev = darktable.develop;
   if(c->picker)
   {
-    if(!dt_iop_color_picker_is_active(c->widget) && !_press(m, c))
+    const char *e = _pick_arm(j, m, c);
+    if(e)
     {
-      _pick_end(j, _JOB_FAILED, "darktable didn't accept the press");
+      _pick_end(j, _JOB_FAILED, e);
       g_list_free_full(list, _control_free);
       _add_job(b, j);
       return TRUE;
     }
-    const dt_iop_color_picker_t *proxy = darktable.lib->proxy.colorpicker.picker_proxy;
-    if(!proxy || proxy->module != m || !dt_iop_color_picker_is_active(c->widget))
-    {
-      _pick_end(j, _JOB_FAILED, "darktable didn't switch the picker on");
-      g_list_free_full(list, _control_free);
-      _add_job(b, j);
-      return TRUE;
-    }
-    // the area in darktable's picker space (the pipe's input, so it stays
-    // on the same spot when the crop changes), as dragging it does
-    // (darkroom.c, mouse_moved)
-    if(point)
-    {
-      dt_pickerpoint_t pos;
-      dt_color_picker_backtransform_box(dev, 1, area, pos);
-      dt_lib_colorpicker_set_point(darktable.lib, pos);
-    }
-    else
-    {
-      dt_pickerbox_t box;
-      dt_color_picker_backtransform_box(dev, 2, area, box);
-      dt_lib_colorpicker_set_box_area(darktable.lib, box);
-    }
-    // a run already under way samples the old area: then the first sample
-    // is not this one (_gui_pickerdata_cb)
-    j->phase = dt_pipe_processing(dev->preview_pipe) ? 0 : 1;
-    _run_preview(dev);
   }
   else
   {
@@ -6950,8 +7673,9 @@ static const char *_methods[] = {
   "module_enable", "preset_list", "preset_apply", "history_list", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
   "retouch_remove", "blend_get", "blend_set", "mask_add", "mask_list",
-  "mask_remove", "mask_ai", "sample", "ai_denoise", "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "style_list", "style_create", "style_delete", "style_apply",
-  "history_paste", "picker_list", "picker_apply", "module_remove", "module_rename", "history_compress",
+  "mask_remove", "mask_add.path", "mask_ai", "mask_ai_encode", "export.background", "sample", "ai_denoise", "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "style_list", "style_create", "style_delete", "style_apply",
+  "history_paste", "image_metadata", "tag_list", "set_tags",
+  "set_metadata", "set_location", "picker_list", "picker_apply", "module_remove", "module_rename", "history_compress",
   "render.history_end", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
   "library_status", "library_release", "library_acquire", "handover", "shutdown", NULL };
 
@@ -6962,7 +7686,7 @@ static const struct { const char *method; const char *event; } _session_methods[
   { "coords", NULL }, { "retouch_list", NULL }, { "retouch_heal", "edit" },
   { "retouch_add", "edit" }, { "retouch_set", "edit" }, { "retouch_remove", "edit" },
   { "blend_get", NULL }, { "blend_set", "edit" }, { "mask_add", "edit" }, { "mask_list", NULL },
-  { "mask_remove", "edit" }, { "mask_ai", "edit" }, { "sample", NULL },
+  { "mask_remove", "edit" }, { "mask_ai", "edit" }, { "mask_ai_encode", NULL }, { "sample", NULL },
   { "module_move", "edit" }, { "picker_list", NULL }, { "picker_apply", NULL }, { "curve_get", NULL }, { "curve_set", "edit" },
   { "module_add", "edit" }, { "module_remove", "edit" }, { "module_rename", "edit" }, { "history_compress", "saved" },
   { "module_set", "edit" }, { "module_enable", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" },
@@ -7049,7 +7773,9 @@ static gboolean _handle(_client_t *c, const gchar *line)
   else if(!g_strcmp0(method, "export"))
   {
     gboolean saved = FALSE;
-    if(_export(params, c->current, &saved, b, &err) && saved)
+    const gboolean bg = params && json_object_get_boolean_member_with_default(params, "background", FALSE);
+    if((bg ? _export_job(params, c->current, &saved, b, &err) : _export(params, c->current, &saved, b, &err))
+       && saved)
     {
       event = "saved";
       event_img = params && json_object_has_member(params, "imgid")
@@ -7123,6 +7849,23 @@ static gboolean _handle(_client_t *c, const gchar *line)
         ? json_object_get_int_member(params, "imgid") : c->current;
     }
   }
+  else if(!g_strcmp0(method, "image_metadata"))
+    _image_metadata(params, c->current, b, &err);
+  else if(!g_strcmp0(method, "tag_list"))
+    _tag_list(params, b, &err);
+  else if(!g_strcmp0(method, "set_tags") || !g_strcmp0(method, "set_metadata")
+          || !g_strcmp0(method, "set_location"))
+  {
+    const gboolean ok = !g_strcmp0(method, "set_tags") ? _set_tags(params, c->current, b, &err)
+                      : !g_strcmp0(method, "set_metadata") ? _set_metadata(params, c->current, b, &err)
+                      : _set_location(params, c->current, b, &err);
+    if(ok)
+    {
+      GList *imgs = _imgids(params, c->current, &err);
+      for(GList *l = imgs; l; l = g_list_next(l)) _notify(c, "image", GPOINTER_TO_INT(l->data));
+      g_list_free(imgs);
+    }
+  }
   else if(!g_strcmp0(method, "style_list"))
     _style_list(params, b, &err);
   else if(!g_strcmp0(method, "style_create"))
@@ -7164,6 +7907,8 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _mask_add(params, b, &err);
   else if(!g_strcmp0(method, "mask_ai"))
     _mask_ai(params, b, &err);
+  else if(!g_strcmp0(method, "mask_ai_encode"))
+    _mask_ai_encode(params, b, &err);
   else if(!g_strcmp0(method, "mask_list"))
     _mask_list(params, b, &err);
   else if(!g_strcmp0(method, "mask_remove"))

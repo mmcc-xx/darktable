@@ -2658,7 +2658,11 @@ static gboolean _set_rating(JsonObject *params, JsonBuilder *b, gchar **err)
      && !g_strcmp0(json_node_get_string(v), "reject"))
     rating = DT_VIEW_REJECT;
   else if(v && JSON_NODE_HOLDS_VALUE(v) && json_node_get_value_type(v) == G_TYPE_INT64)
-    rating = json_node_get_int(v);
+  {
+    // 6 is DT_VIEW_REJECT: a number must be a star rating
+    const gint64 n = json_node_get_int(v);
+    rating = n >= 0 && n <= 5 ? (int)n : -2;
+  }
   if(rating != DT_VIEW_REJECT && (rating < 0 || rating > 5))
   {
     *err = g_strdup("rating must be 0..5 or \"reject\"");

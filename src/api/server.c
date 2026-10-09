@@ -388,6 +388,12 @@ static _session_t *_session_load_ext(const dt_imgid_t imgid, const gboolean list
   // defaults; replaying it is what the darkroom does when it shows an image
   dt_dev_pop_history_items_ext(s->dev, s->dev->history_end);
   dt_ioppr_resync_modules_order(s->dev);
+  // as if a module had been focused, which the darkroom always does before
+  // an edit (imageop.c, dt_iop_request_focus): history items read from the
+  // library carry focus_hash FALSE, so the first edit of a module starts a
+  // new item instead of merging into a saved one (develop.c,
+  // _dev_add_history_item_ext), which undo couldn't go back from
+  s->dev->focus_hash = TRUE;
 
   dt_mipmap_cache_get(&s->buf, imgid, DT_MIPMAP_FULL, DT_MIPMAP_BLOCKING, 'r');
   if(!s->buf.buf || !s->buf.width || !s->buf.height)
@@ -896,10 +902,19 @@ static gboolean _parse_list(const dt_introspection_field_t *f, const char *name,
 // a module change becomes a history item, as in the darkroom. in darktable's
 // window, the darkroom's own path for its image, so its widgets, history
 // panel and pipes follow
+// in darktable's window, an API edit counts as working in the module: a
+// darkroom just opened (or reloaded, dt_dev_reload_history_items) has no
+// focus yet, and its first edit would merge into the top saved item
+static void _gui_focus(void)
+{
+  if(_cur->gui && !_cur->dev->focus_hash) _cur->dev->focus_hash = TRUE;
+}
+
 static void _record(dt_iop_module_t *m, const gboolean enable)
 {
   if(_cur->gui)
   {
+    _gui_focus();
     _api_editing = TRUE;
     dt_iop_gui_update(m);
     dt_dev_add_history_item(_cur->dev, m, enable);
@@ -1298,6 +1313,7 @@ static gboolean _preset_apply(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   if(_cur->gui)
   {
+    _gui_focus();
     _api_editing = TRUE;
     dt_gui_presets_apply_preset(name, m);
     _api_editing = FALSE;
@@ -2582,6 +2598,7 @@ static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
   dt_develop_t *dev = _cur->dev;
   if(_cur->gui)
   {
+    _gui_focus();
     _api_editing = TRUE;
     dt_dev_undo_start_record(dev);
   }

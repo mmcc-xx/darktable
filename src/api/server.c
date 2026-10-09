@@ -96,6 +96,15 @@
      module_add {operation, instance, copy}
                                  -> a new instance after the given one ("new
                                     instance", or "duplicate" with copy)
+     module_move {operation, instance, before | after: {operation, instance}}
+                                 -> moves a module in the pipe, as dragging it
+                                    in the darkroom (darktable's rules apply)
+     curve_get / curve_set {operation, instance, channel, points, type}
+                                 -> curves of rgbcurve, tonecurve, colorzones,
+                                    basecurve: points [[x, y], ...] per channel
+     image_duplicate {imgid, virgin, save}
+                                 -> a duplicate (virtual copy) with the saved
+                                    edit, or none (virgin)
      module_remove {operation, instance}
                                  -> deletes an instance (not a module's last)
      module_rename {operation, instance, name}
@@ -2907,6 +2916,9 @@ static gboolean _module_remove(JsonObject *params, JsonBuilder *b, gchar **err)
       l = n;
     }
     dt_dev_module_remove(dev, m);
+    // the pipe order list names instances by operation and number: drop
+    // the removed one's entry, or a later instance with its number gets two
+    dt_ioppr_resync_iop_list(dev);
     if(is_zero)
     {
       dt_iop_module_t *first = NULL;
@@ -2916,6 +2928,9 @@ static gboolean _module_remove(JsonObject *params, JsonBuilder *b, gchar **err)
         if(hist->module->instance == m->instance) first = hist->module;
       }
       if(!first) first = next;
+      // its entry in the order list follows the new number
+      GList *e = dt_ioppr_get_iop_order_link(dev->iop_order_list, first->op, first->multi_priority);
+      if(e) ((dt_iop_order_entry_t *)e->data)->instance = 0;
       dt_iop_update_multi_priority(first, 0);
       for(GList *h = dev->history; h; h = g_list_next(h))
       {
@@ -3040,6 +3055,324 @@ static gboolean _history_compress(JsonObject *params, JsonBuilder *b, gchar **er
   json_builder_add_boolean_value(b, TRUE);
   _session_info(b, _cur);
   return TRUE;
+}
+
+// ---- module order, curves, duplicates ---------------------------------------
+
+// move a module (instance) before or after another in the pipe, as dragging
+// it in the darkroom does (imageop.c, _on_drag_drop): darktable's rules for
+// what may move where apply (iop_order.c)
+static gboolean _module_move(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  dt_iop_module_t *m = _find_module(params, err);
+  if(!m) return FALSE;
+  JsonObject *ref = NULL;
+  gboolean after = FALSE;
+  if(params && json_object_has_member(params, "before")
+     && JSON_NODE_HOLDS_OBJECT(json_object_get_member(params, "before")))
+    ref = json_object_get_object_member(params, "before");
+  else if(params && json_object_has_member(params, "after")
+          && JSON_NODE_HOLDS_OBJECT(json_object_get_member(params, "after")))
+  {
+    ref = json_object_get_object_member(params, "after");
+    after = TRUE;
+  }
+  if(!ref)
+  {
+    *err = g_strdup("module_move needs before or after: {operation, instance}");
+    return FALSE;
+  }
+  dt_iop_module_t *target = _find_module(ref, err);
+  if(!target) return FALSE;
+  if(target == m)
+  {
+    *err = g_strdup("a module can't move relative to itself");
+    return FALSE;
+  }
+  dt_develop_t *dev = _cur->dev;
+  const gboolean ok = after ? dt_ioppr_check_can_move_after_iop(dev->iop, m, target)
+                            : dt_ioppr_check_can_move_before_iop(dev->iop, m, target);
+  if(!ok || !(after ? dt_ioppr_move_iop_after(dev, m, target) : dt_ioppr_move_iop_before(dev, m, target)))
+  {
+    *err = g_strdup_printf("darktable doesn't allow moving '%s' %s '%s' (fixed modules, or modules in between"
+                           " that must stay in order)", m->op, after ? "after" : "before", target->op);
+    return FALSE;
+  }
+  if(_cur->gui)
+  {
+    _gui_focus();
+    _api_editing = TRUE;
+    dt_dev_reorder_gui_module_list(dev);
+    dt_dev_add_history_item(dev, m, TRUE);
+    dt_dev_pixelpipe_rebuild(dev);
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_DEVELOP_MODULE_MOVED);
+    _api_editing = FALSE;
+    _gui_changed_by_api();
+  }
+  else
+  {
+    dt_dev_add_history_item_ext(dev, m, TRUE, TRUE);
+    _pipe_rebuild(_cur);
+    _cur->dirty = TRUE;
+  }
+  _add_instance(b, m);
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, dev->history_end);
+  return TRUE;
+}
+
+// the curve modules: nodes per channel, node count and curve type per channel,
+// all lists in the params (introspection gives their layout)
+typedef struct _curve_mod_t
+{
+  const char *op, *nodes, *count, *type;
+  const char *channels[4];
+} _curve_mod_t;
+static const _curve_mod_t _curve_mods[] = {
+  { "rgbcurve", "curve_nodes", "curve_num_nodes", "curve_type", { "R", "G", "B", NULL } },
+  { "tonecurve", "tonecurve", "tonecurve_nodes", "tonecurve_type", { "L", "a", "b", NULL } },
+  { "colorzones", "curve", "curve_num_nodes", "curve_type", { "lightness", "chroma", "hue", NULL } },
+  { "basecurve", "basecurve", "basecurve_nodes", "basecurve_type", { "curve", NULL } },
+  { NULL } };
+// curve_tools.h
+static const char *_curve_types[] = { "cubic spline", "centripetal spline", "monotonic spline", NULL };
+
+static dt_introspection_field_t *_any_field(const dt_iop_module_t *m, const char *name)
+{
+  for(dt_introspection_field_t *f = m->so->get_introspection_linear();
+      f && f->header.type != DT_INTROSPECTION_TYPE_NONE; f++)
+    if(!g_strcmp0(f->header.name, name)) return f;
+  return NULL;
+}
+
+// pointers into the params for channel ch: its node array (and node
+// layout), its count and type
+typedef struct _curve_ptr_t
+{
+  uint8_t *nodes;
+  size_t node_size, x_off, y_off;
+  int max_nodes;
+  int *count, *type;
+} _curve_ptr_t;
+
+static gboolean _curve_ptr(dt_iop_module_t *m, const _curve_mod_t *c, const int ch, _curve_ptr_t *p)
+{
+  dt_introspection_field_t *nf = _any_field(m, c->nodes), *cf = _any_field(m, c->count), *tf = _any_field(m, c->type);
+  if(!nf || !cf || !tf || nf->header.type != DT_INTROSPECTION_TYPE_ARRAY) return FALSE;
+  dt_introspection_field_t *row = NULL, *node = NULL;
+  void *rp = dt_introspection_access_array(nf, (uint8_t *)m->params + nf->header.offset, ch, &row);
+  if(!rp || !row || row->header.type != DT_INTROSPECTION_TYPE_ARRAY) return FALSE;
+  void *np = dt_introspection_access_array(row, rp, 0, &node);
+  dt_introspection_field_t *xf = NULL, *yf = NULL;
+  void *xp = np ? dt_introspection_get_child(node, np, "x", &xf) : NULL;
+  void *yp = np ? dt_introspection_get_child(node, np, "y", &yf) : NULL;
+  if(!xp || !yp) return FALSE;
+  p->nodes = np;
+  p->node_size = node->header.size;
+  p->x_off = (uint8_t *)xp - (uint8_t *)np;
+  p->y_off = (uint8_t *)yp - (uint8_t *)np;
+  p->max_nodes = row->Array.count;
+  p->count = dt_introspection_access_array(cf, (uint8_t *)m->params + cf->header.offset, ch, NULL);
+  p->type = dt_introspection_access_array(tf, (uint8_t *)m->params + tf->header.offset, ch, NULL);
+  return p->count && p->type;
+}
+
+static const _curve_mod_t *_curve_mod(const dt_iop_module_t *m, gchar **err)
+{
+  for(const _curve_mod_t *c = _curve_mods; c->op; c++)
+    if(!g_strcmp0(c->op, m->op)) return c;
+  *err = g_strdup_printf("'%s' has no curves (rgbcurve, tonecurve, colorzones, basecurve)", m->op);
+  return NULL;
+}
+
+static void _add_curves(JsonBuilder *b, dt_iop_module_t *m, const _curve_mod_t *c)
+{
+  json_builder_set_member_name(b, "curves");
+  json_builder_begin_array(b);
+  for(int ch = 0; c->channels[ch]; ch++)
+  {
+    _curve_ptr_t p;
+    if(!_curve_ptr(m, c, ch, &p)) continue;
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "channel");
+    json_builder_add_string_value(b, c->channels[ch]);
+    json_builder_set_member_name(b, "type");
+    json_builder_add_string_value(b, *p.type >= 0 && *p.type <= 2 ? _curve_types[*p.type] : "other");
+    json_builder_set_member_name(b, "points");
+    json_builder_begin_array(b);
+    for(int k = 0; k < MIN(*p.count, p.max_nodes); k++)
+    {
+      const uint8_t *n = p.nodes + k * p.node_size;
+      json_builder_begin_array(b);
+      json_builder_add_double_value(b, round(*(const float *)(n + p.x_off) * 1e5) / 1e5);
+      json_builder_add_double_value(b, round(*(const float *)(n + p.y_off) * 1e5) / 1e5);
+      json_builder_end_array(b);
+    }
+    json_builder_end_array(b);
+    json_builder_set_member_name(b, "max_points");
+    json_builder_add_int_value(b, p.max_nodes);
+    json_builder_end_object(b);
+  }
+  json_builder_end_array(b);
+}
+
+static gboolean _curve_get(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  dt_iop_module_t *m = _find_module(params, err);
+  if(!m) return FALSE;
+  const _curve_mod_t *c = _curve_mod(m, err);
+  if(!c) return FALSE;
+  _add_instance(b, m);
+  _add_curves(b, m, c);
+  return TRUE;
+}
+
+// one channel's curve: its points [[x, y], ...] (x increasing, 0..1) and
+// optionally its type, as dragging nodes in the module does; one history item
+static gboolean _curve_set(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  dt_iop_module_t *m = _find_module(params, err);
+  if(!m) return FALSE;
+  const _curve_mod_t *c = _curve_mod(m, err);
+  if(!c) return FALSE;
+  const char *chname = params ? json_object_get_string_member_with_default(params, "channel", c->channels[0])
+                              : c->channels[0];
+  int ch = -1;
+  for(int k = 0; c->channels[k]; k++)
+    if(!g_ascii_strcasecmp(chname, c->channels[k])) ch = k;
+  if(ch < 0)
+  {
+    GString *list = g_string_new(NULL);
+    for(int k = 0; c->channels[k]; k++) g_string_append_printf(list, "%s%s", k ? ", " : "", c->channels[k]);
+    *err = g_strdup_printf("'%s' has no channel '%s' (%s)", m->op, chname, list->str);
+    g_string_free(list, TRUE);
+    return FALSE;
+  }
+  _curve_ptr_t p;
+  if(!_curve_ptr(m, c, ch, &p))
+  {
+    *err = g_strdup_printf("'%s': this darktable's curve layout isn't the expected one", m->op);
+    return FALSE;
+  }
+  int type = *p.type;
+  const char *tname = params ? json_object_get_string_member_with_default(params, "type", NULL) : NULL;
+  if(tname)
+  {
+    type = -1;
+    for(int k = 0; _curve_types[k]; k++)
+      if(!g_ascii_strcasecmp(tname, _curve_types[k])) type = k;
+    if(type < 0)
+    {
+      *err = g_strdup("type: cubic spline, centripetal spline or monotonic spline");
+      return FALSE;
+    }
+  }
+  JsonArray *pts = params && json_object_has_member(params, "points")
+                   && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "points"))
+                     ? json_object_get_array_member(params, "points") : NULL;
+  const guint n = pts ? json_array_get_length(pts) : 0;
+  if(n < 2 || n > (guint)p.max_nodes)
+  {
+    *err = g_strdup_printf("points: 2..%d points [[x, y], ...]", p.max_nodes);
+    return FALSE;
+  }
+  float (*xy)[2] = g_malloc0_n(n, sizeof(*xy));
+  for(guint k = 0; k < n; k++)
+  {
+    JsonArray *q = JSON_NODE_HOLDS_ARRAY(json_array_get_element(pts, k)) ? json_array_get_array_element(pts, k) : NULL;
+    const gboolean ok = q && json_array_get_length(q) == 2;
+    xy[k][0] = ok ? json_array_get_double_element(q, 0) : -1;
+    xy[k][1] = ok ? json_array_get_double_element(q, 1) : -1;
+    if(!ok || xy[k][0] < 0 || xy[k][0] > 1 || xy[k][1] < 0 || xy[k][1] > 1 || (k && xy[k][0] <= xy[k - 1][0]))
+    {
+      g_free(xy);
+      *err = g_strdup_printf("point %u: [x, y] in 0..1, x increasing", k);
+      return FALSE;
+    }
+  }
+  for(guint k = 0; k < n; k++)
+  {
+    uint8_t *node = p.nodes + k * p.node_size;
+    *(float *)(node + p.x_off) = xy[k][0];
+    *(float *)(node + p.y_off) = xy[k][1];
+  }
+  g_free(xy);
+  *p.count = n;
+  *p.type = type;
+  _record(m, TRUE);
+  _add_instance(b, m);
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, _cur->dev->history_end);
+  _add_curves(b, m, c);
+  return TRUE;
+}
+
+static gboolean _image_info(JsonObject *params, JsonBuilder *b, gchar **err);
+
+// a duplicate (virtual copy) of a photo, as the lighttable's duplicate does
+// (control_jobs.c): with the saved edit, or none (virgin); in the photo's
+// group. unsaved changes of an open photo are refused unless saved first
+static gboolean _image_duplicate(JsonObject *params, const dt_imgid_t current, gboolean *saved,
+                                 JsonBuilder *b, gchar **err)
+{
+  const dt_imgid_t imgid = params && json_object_has_member(params, "imgid")
+    ? json_object_get_int_member(params, "imgid") : current;
+  if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
+  {
+    *err = g_strdup_printf("no image with id %d", imgid);
+    return FALSE;
+  }
+  const gboolean virgin = params ? json_object_get_boolean_member_with_default(params, "virgin", FALSE) : FALSE;
+  const gboolean save = params ? json_object_get_boolean_member_with_default(params, "save", FALSE) : FALSE;
+  _session_t *s = _session_find(imgid);
+  *saved = FALSE;
+  if(s && s->gui)
+    dt_dev_write_history(s->dev);
+  else if(s && s->dirty && !virgin)
+  {
+    if(!save)
+    {
+      *err = g_strdup("the photo has unsaved changes, and the duplicate gets the saved edit: save first,"
+                      " or pass save: true");
+      return FALSE;
+    }
+    _save_session(s);
+    *saved = TRUE;
+  }
+  const dt_imgid_t newid = dt_image_duplicate(imgid);
+  if(!dt_is_valid_imgid(newid))
+  {
+    *err = g_strdup("darktable couldn't duplicate the photo");
+    return FALSE;
+  }
+  if(virgin)
+    dt_history_delete_on_image(newid);
+  else
+    dt_history_copy_and_paste_on_image(imgid, newid, FALSE, NULL, TRUE, TRUE, TRUE);
+  dt_image_cache_set_change_timestamp_from_image(newid, imgid);
+  if(_in_gui) DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_FILMROLLS_CHANGED);
+  JsonObject *q = json_object_new();
+  json_object_set_int_member(q, "imgid", newid);
+  const gboolean ok = _image_info(q, b, err);
+  json_object_unref(q);
+  json_builder_set_member_name(b, "saved");
+  json_builder_add_boolean_value(b, *saved);
+  return ok;
 }
 
 // ---- export ----------------------------------------------------------------
@@ -4842,7 +5175,7 @@ static const char *_methods[] = {
   "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
   "module_enable", "preset_list", "preset_apply", "history_list", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "blend_get", "blend_set", "mask_add", "mask_list",
-  "mask_remove", "mask_ai", "sample", "module_add", "module_remove", "module_rename", "history_compress",
+  "mask_remove", "mask_ai", "sample", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "module_remove", "module_rename", "history_compress",
   "render.history_end", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
   "library_status", "library_release", "library_acquire", "handover", "shutdown", NULL };
 
@@ -4853,6 +5186,7 @@ static const struct { const char *method; const char *event; } _session_methods[
   { "coords", NULL }, { "retouch_list", NULL }, { "retouch_heal", "edit" },
   { "blend_get", NULL }, { "blend_set", "edit" }, { "mask_add", "edit" }, { "mask_list", NULL },
   { "mask_remove", "edit" }, { "mask_ai", "edit" }, { "sample", NULL },
+  { "module_move", "edit" }, { "curve_get", NULL }, { "curve_set", "edit" },
   { "module_add", "edit" }, { "module_remove", "edit" }, { "module_rename", "edit" }, { "history_compress", "saved" },
   { "module_set", "edit" }, { "module_enable", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" },
   { "save", "saved" }, { "reset", "reset" }, { "session_close", "closed" }, { NULL, NULL } };
@@ -4985,6 +5319,22 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _preset_list(params, b, &err);
   else if(!g_strcmp0(method, "preset_apply"))
     _preset_apply(params, b, &err);
+  else if(!g_strcmp0(method, "module_move"))
+    _module_move(params, b, &err);
+  else if(!g_strcmp0(method, "curve_get"))
+    _curve_get(params, b, &err);
+  else if(!g_strcmp0(method, "curve_set"))
+    _curve_set(params, b, &err);
+  else if(!g_strcmp0(method, "image_duplicate"))
+  {
+    gboolean saved = FALSE;
+    if(_image_duplicate(params, c->current, &saved, b, &err))
+    {
+      event = saved ? "saved" : "image";
+      event_img = params && json_object_has_member(params, "imgid")
+        ? json_object_get_int_member(params, "imgid") : c->current;
+    }
+  }
   else if(!g_strcmp0(method, "module_add"))
     _module_add(params, b, &err);
   else if(!g_strcmp0(method, "module_remove"))

@@ -25,6 +25,18 @@
 
    methods:
      ping                        -> {"version"}
+     film_rolls                  -> film rolls with their image counts
+     images_list {film_id, rating, label, offset, limit}
+                                 -> images in folder/filename order; rating
+                                    "visible" (default), "all", "rejected"
+                                    or "1".."5" (at least); label 0..4
+     image_info {imgid}          -> one image's row as in images_list
+     thumbnail {imgid, size, path, quality}
+                                 -> a JPEG from darktable's mipmap cache,
+                                    rendered with the current history
+     set_rating {imgid, rating}  -> 0..5 or "reject", as the lighttable
+     set_label {imgid, label, on}
+                                 -> color label 0..4 on or off
      session_open {imgid}        -> loads the image and replays its history
                                     up to history_end, as the darkroom does
      session_close               -> releases the open image
@@ -71,6 +83,7 @@
 */
 
 #include "common/darktable.h"
+#include "common/colorlabels.h"
 #include "common/database.h"
 #include "common/file_location.h"
 #include "common/history.h"
@@ -78,10 +91,12 @@
 #include "common/image_cache.h"
 #include "common/iop_order.h"
 #include "common/mipmap_cache.h"
+#include "common/ratings.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
 #include "develop/pixelpipe_hb.h"
 #include "imageio/imageio_jpeg.h"
+#include "views/view.h"
 
 #include <errno.h>
 #include <glib.h>
@@ -903,6 +918,283 @@ static gboolean _library_acquire(JsonBuilder *b, gchar **err)
   return TRUE;
 }
 
+// ---- browsing the library -------------------------------------------------
+
+static gboolean _film_rolls(JsonBuilder *b, gchar **err)
+{
+  sqlite3_stmt *st = NULL;
+  // clang-format off
+  if(sqlite3_prepare_v2(dt_database_get(darktable.db),
+                        "SELECT f.id, f.folder, COUNT(i.id)"
+                        " FROM main.film_rolls AS f"
+                        " LEFT JOIN main.images AS i ON i.film_id = f.id"
+                        " GROUP BY f.id"
+                        " ORDER BY f.folder",
+                        -1, &st, NULL) != SQLITE_OK)
+  // clang-format on
+  {
+    *err = g_strdup("cannot read film rolls");
+    return FALSE;
+  }
+  json_builder_set_member_name(b, "film_rolls");
+  json_builder_begin_array(b);
+  while(sqlite3_step(st) == SQLITE_ROW)
+  {
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "id");
+    json_builder_add_int_value(b, sqlite3_column_int(st, 0));
+    json_builder_set_member_name(b, "folder");
+    json_builder_add_string_value(b, (const char *)sqlite3_column_text(st, 1));
+    json_builder_set_member_name(b, "count");
+    json_builder_add_int_value(b, sqlite3_column_int(st, 2));
+    json_builder_end_object(b);
+  }
+  json_builder_end_array(b);
+  sqlite3_finalize(st);
+  return TRUE;
+}
+
+// rating filters: the clause is chosen from fixed strings, never built from input
+static const char *_rating_clause(const char *rating)
+{
+  // rejected: the reject flag, or the old reject rating (DT_VIEW_REJECT)
+  static const char *rejected = "((i.flags & 8) = 8 OR (i.flags & 7) = 6)";
+  if(!g_strcmp0(rating, "all")) return "1";
+  if(!g_strcmp0(rating, "rejected")) return rejected;
+  if(rating && rating[0] >= '1' && rating[0] <= '5' && !rating[1])
+  {
+    static const char *atleast[] = {
+      "(NOT ((i.flags & 8) = 8 OR (i.flags & 7) = 6) AND (i.flags & 7) >= 1)",
+      "(NOT ((i.flags & 8) = 8 OR (i.flags & 7) = 6) AND (i.flags & 7) >= 2)",
+      "(NOT ((i.flags & 8) = 8 OR (i.flags & 7) = 6) AND (i.flags & 7) >= 3)",
+      "(NOT ((i.flags & 8) = 8 OR (i.flags & 7) = 6) AND (i.flags & 7) >= 4)",
+      "(NOT ((i.flags & 8) = 8 OR (i.flags & 7) = 6) AND (i.flags & 7) >= 5)" };
+    return atleast[rating[0] - '1'];
+  }
+  return "NOT ((i.flags & 8) = 8 OR (i.flags & 7) = 6)"; // "visible", the default
+}
+
+static void _add_image_row(JsonBuilder *b, sqlite3_stmt *st)
+{
+  const int flags = sqlite3_column_int(st, 4);
+  const gboolean rejected = (flags & DT_IMAGE_REJECTED) || (flags & DT_VIEW_RATINGS_MASK) == DT_VIEW_REJECT;
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "id");
+  json_builder_add_int_value(b, sqlite3_column_int(st, 0));
+  json_builder_set_member_name(b, "filename");
+  json_builder_add_string_value(b, (const char *)sqlite3_column_text(st, 1));
+  json_builder_set_member_name(b, "folder");
+  json_builder_add_string_value(b, (const char *)sqlite3_column_text(st, 2));
+  json_builder_set_member_name(b, "version");
+  json_builder_add_int_value(b, sqlite3_column_int(st, 3));
+  json_builder_set_member_name(b, "rating");
+  json_builder_add_int_value(b, rejected ? 0 : (flags & DT_VIEW_RATINGS_MASK));
+  json_builder_set_member_name(b, "rejected");
+  json_builder_add_boolean_value(b, rejected);
+  json_builder_set_member_name(b, "width");
+  json_builder_add_int_value(b, sqlite3_column_int(st, 5));
+  json_builder_set_member_name(b, "height");
+  json_builder_add_int_value(b, sqlite3_column_int(st, 6));
+  json_builder_set_member_name(b, "changed");
+  json_builder_add_int_value(b, sqlite3_column_int64(st, 7));
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, sqlite3_column_int(st, 9));
+  json_builder_set_member_name(b, "labels");
+  json_builder_begin_array(b);
+  const char *labels = (const char *)sqlite3_column_text(st, 8);
+  if(labels)
+  {
+    gchar **parts = g_strsplit(labels, ",", -1);
+    for(gchar **p = parts; *p; p++) json_builder_add_int_value(b, atoi(*p));
+    g_strfreev(parts);
+  }
+  json_builder_end_array(b);
+  json_builder_end_object(b);
+}
+
+static gboolean _images_list(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  const int film_id = params ? json_object_get_int_member_with_default(params, "film_id", -1) : -1;
+  const int label = params ? json_object_get_int_member_with_default(params, "label", -1) : -1;
+  const int offset = MAX(0, params ? json_object_get_int_member_with_default(params, "offset", 0) : 0);
+  const int limit = CLAMP(params ? json_object_get_int_member_with_default(params, "limit", 100) : 100, 1, 1000);
+  const char *rating = params ? json_object_get_string_member_with_default(params, "rating", "visible") : "visible";
+
+  // clang-format off
+  gchar *where = g_strdup_printf(" WHERE (?1 < 0 OR i.film_id = ?1)"
+                                 "   AND %s"
+                                 "   AND (?2 < 0 OR EXISTS (SELECT 1 FROM main.color_labels AS c"
+                                 "                          WHERE c.imgid = i.id AND c.color = ?2))",
+                                 _rating_clause(rating));
+  gchar *q_count = g_strconcat("SELECT COUNT(*) FROM main.images AS i", where, NULL);
+  gchar *q_rows = g_strconcat("SELECT i.id, i.filename, f.folder, i.version, i.flags, i.width, i.height,"
+                              "       i.change_timestamp,"
+                              "       (SELECT GROUP_CONCAT(color) FROM main.color_labels WHERE imgid = i.id),"
+                              "       i.history_end"
+                              " FROM main.images AS i"
+                              " JOIN main.film_rolls AS f ON f.id = i.film_id",
+                              where,
+                              " ORDER BY f.folder, i.filename, i.version"
+                              " LIMIT ?3 OFFSET ?4", NULL);
+  // clang-format on
+  sqlite3 *db = dt_database_get(darktable.db);
+  sqlite3_stmt *st = NULL;
+  gboolean ok = sqlite3_prepare_v2(db, q_count, -1, &st, NULL) == SQLITE_OK;
+  if(ok)
+  {
+    sqlite3_bind_int(st, 1, film_id);
+    sqlite3_bind_int(st, 2, label);
+    json_builder_set_member_name(b, "total");
+    json_builder_add_int_value(b, sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : 0);
+    sqlite3_finalize(st);
+    ok = sqlite3_prepare_v2(db, q_rows, -1, &st, NULL) == SQLITE_OK;
+  }
+  if(ok)
+  {
+    sqlite3_bind_int(st, 1, film_id);
+    sqlite3_bind_int(st, 2, label);
+    sqlite3_bind_int(st, 3, limit);
+    sqlite3_bind_int(st, 4, offset);
+    json_builder_set_member_name(b, "images");
+    json_builder_begin_array(b);
+    while(sqlite3_step(st) == SQLITE_ROW) _add_image_row(b, st);
+    json_builder_end_array(b);
+    sqlite3_finalize(st);
+  }
+  else
+    *err = g_strdup("cannot read the image list");
+  g_free(where);
+  g_free(q_count);
+  g_free(q_rows);
+  return ok;
+}
+
+static gboolean _image_info(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  const dt_imgid_t imgid = params ? json_object_get_int_member_with_default(params, "imgid", -1) : -1;
+  if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
+  {
+    *err = g_strdup_printf("no image with id %d", imgid);
+    return FALSE;
+  }
+  sqlite3_stmt *st = NULL;
+  // clang-format off
+  if(sqlite3_prepare_v2(dt_database_get(darktable.db),
+                        "SELECT i.id, i.filename, f.folder, i.version, i.flags, i.width, i.height,"
+                        "       i.change_timestamp,"
+                        "       (SELECT GROUP_CONCAT(color) FROM main.color_labels WHERE imgid = i.id),"
+                        "       i.history_end"
+                        " FROM main.images AS i"
+                        " JOIN main.film_rolls AS f ON f.id = i.film_id"
+                        " WHERE i.id = ?1",
+                        -1, &st, NULL) != SQLITE_OK)
+  // clang-format on
+  {
+    *err = g_strdup("cannot read the image");
+    return FALSE;
+  }
+  sqlite3_bind_int(st, 1, imgid);
+  if(sqlite3_step(st) == SQLITE_ROW)
+  {
+    json_builder_set_member_name(b, "image");
+    _add_image_row(b, st);
+  }
+  sqlite3_finalize(st);
+  return TRUE;
+}
+
+// a thumbnail from darktable's mipmap cache (rendered with the image's
+// current history if the cache has none), as darktable's lighttable shows it
+static gboolean _thumbnail(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  const dt_imgid_t imgid = params ? json_object_get_int_member_with_default(params, "imgid", -1) : -1;
+  const int size = params ? json_object_get_int_member_with_default(params, "size", 400) : 400;
+  const int quality = params ? json_object_get_int_member_with_default(params, "quality", 80) : 80;
+  const gchar *path = params ? json_object_get_string_member_with_default(params, "path", NULL) : NULL;
+  if(!path || size <= 0)
+  {
+    *err = g_strdup("thumbnail needs path and size > 0");
+    return FALSE;
+  }
+  if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
+  {
+    *err = g_strdup_printf("no image with id %d", imgid);
+    return FALSE;
+  }
+  const gint64 t0 = g_get_monotonic_time();
+  const dt_mipmap_size_t level = dt_mipmap_cache_get_matching_size(size, size);
+  dt_mipmap_buffer_t buf;
+  dt_mipmap_cache_get(&buf, imgid, level, DT_MIPMAP_BLOCKING, 'r');
+  gboolean ok = buf.buf && buf.width > 0 && buf.height > 0;
+  // the mipmap cache keeps 8-bit levels in the byte order its own jpeg
+  // writer takes (mipmap_cache.c, disk cache)
+  if(ok && dt_imageio_jpeg_write(path, buf.buf, buf.width, buf.height, quality, NULL, 0))
+    ok = FALSE;
+  if(ok)
+  {
+    json_builder_set_member_name(b, "width");
+    json_builder_add_int_value(b, buf.width);
+    json_builder_set_member_name(b, "height");
+    json_builder_add_int_value(b, buf.height);
+    json_builder_set_member_name(b, "level");
+    json_builder_add_int_value(b, level);
+    json_builder_set_member_name(b, "ms");
+    json_builder_add_int_value(b, (g_get_monotonic_time() - t0) / 1000);
+  }
+  else
+    *err = g_strdup_printf("no thumbnail for image %d", imgid);
+  dt_mipmap_cache_release(&buf);
+  return ok;
+}
+
+static gboolean _set_rating(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  const dt_imgid_t imgid = params ? json_object_get_int_member_with_default(params, "imgid", -1) : -1;
+  if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
+  {
+    *err = g_strdup_printf("no image with id %d", imgid);
+    return FALSE;
+  }
+  JsonNode *v = params ? json_object_get_member(params, "rating") : NULL;
+  int rating = -2;
+  if(v && JSON_NODE_HOLDS_VALUE(v) && json_node_get_value_type(v) == G_TYPE_STRING
+     && !g_strcmp0(json_node_get_string(v), "reject"))
+    rating = DT_VIEW_REJECT;
+  else if(v && JSON_NODE_HOLDS_VALUE(v) && json_node_get_value_type(v) == G_TYPE_INT64)
+    rating = json_node_get_int(v);
+  if(rating != DT_VIEW_REJECT && (rating < 0 || rating > 5))
+  {
+    *err = g_strdup("rating must be 0..5 or \"reject\"");
+    return FALSE;
+  }
+  // as the lighttable: rejecting keeps the stars, a rating clears the reject
+  dt_ratings_apply_on_image(imgid, rating, FALSE, FALSE, FALSE);
+  return _image_info(params, b, err);
+}
+
+static gboolean _set_label(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  const dt_imgid_t imgid = params ? json_object_get_int_member_with_default(params, "imgid", -1) : -1;
+  const int label = params ? json_object_get_int_member_with_default(params, "label", -1) : -1;
+  const gboolean on = params ? json_object_get_boolean_member_with_default(params, "on", TRUE) : TRUE;
+  if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
+  {
+    *err = g_strdup_printf("no image with id %d", imgid);
+    return FALSE;
+  }
+  if(label < 0 || label > 4)
+  {
+    *err = g_strdup("label must be 0..4 (red, yellow, green, blue, purple)");
+    return FALSE;
+  }
+  if(on)
+    dt_colorlabels_set_label(imgid, label);
+  else
+    dt_colorlabels_remove_label(imgid, label);
+  dt_image_write_sidecar_file(imgid);
+  return _image_info(params, b, err);
+}
+
 static gboolean _render(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_dev)
@@ -1056,6 +1348,18 @@ static gboolean _handle(const gchar *line, FILE *out)
     json_builder_set_member_name(b, "version");
     json_builder_add_string_value(b, darktable_package_version);
   }
+  else if(!g_strcmp0(method, "film_rolls"))
+    _film_rolls(b, &err);
+  else if(!g_strcmp0(method, "images_list"))
+    _images_list(params, b, &err);
+  else if(!g_strcmp0(method, "image_info"))
+    _image_info(params, b, &err);
+  else if(!g_strcmp0(method, "thumbnail"))
+    _thumbnail(params, b, &err);
+  else if(!g_strcmp0(method, "set_rating"))
+    _set_rating(params, b, &err);
+  else if(!g_strcmp0(method, "set_label"))
+    _set_label(params, b, &err);
   else if(!g_strcmp0(method, "session_open"))
   {
     const dt_imgid_t imgid = params ? json_object_get_int_member_with_default(params, "imgid", -1) : -1;

@@ -1323,6 +1323,11 @@ void dt_bauhaus_widget_set_quad_paint(GtkWidget *widget,
   gtk_widget_queue_draw(widget);
 }
 
+dt_bauhaus_quad_paint_f dt_bauhaus_widget_get_quad_paint(GtkWidget *widget)
+{
+  return DT_BAUHAUS_WIDGET(widget)->quad_paint;
+}
+
 void dt_bauhaus_widget_set_quad_tooltip(GtkWidget *widget,
                                         const gchar *text)
 {

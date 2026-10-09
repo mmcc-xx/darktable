@@ -51,7 +51,7 @@
    in <socket>.drafts.json when a server stops and restored by the next one.
 
    methods:
-     ping                        -> {"version"}
+     ping                        -> {"version", "server", "methods"}
      film_rolls                  -> film rolls with their image counts
      images_list {film_id, rating, label, offset, limit}
                                  -> images in folder/filename order; rating
@@ -80,7 +80,15 @@
      module_set {operation, instance, values: {field: value}}
                                  -> changes settings by name (all or none),
                                     switches the module on, adds a history
-                                    item; enums by name, label or number
+                                    item; enums by name, label or number;
+                                    lists whole (nested arrays) or by
+                                    element ("grey[1]", "x[0][3]")
+     preset_list {operation, instance}
+                                 -> the module's presets for its version:
+                                    name, label, builtin, autoapply
+     preset_apply {operation, instance, name}
+                                 -> applies a preset (by name or label) as
+                                    the presets menu does, one history item
      module_enable {operation, instance, enabled}
                                  -> switches a module on or off (in memory)
      history_list                -> the open image's history items, and
@@ -127,10 +135,14 @@
                                     save: true saves unsaved changes first;
                                     without it they are refused. replies
                                     the file written, or skipped
-     render {width, height, path, quality, uncropped}
+     render {width, height, path, quality, uncropped, zoom, center_x,
+             center_y}
                                  -> writes an sRGB JPEG fitted inside
                                     width x height to path; uncropped
-                                    leaves crop's box out
+                                    leaves crop's box out; zoom (1 = 100%)
+                                    renders the width x height region
+                                    around center_x/center_y (fractions)
+                                    at that scale and replies its region
      handover                    -> (engine) releases the library to
                                     darktable's window, replies the unsaved
                                     edits as drafts, and exits
@@ -154,9 +166,11 @@
 #include "common/ratings.h"
 #include "common/styles.h"
 #include "common/tags.h"
+#include "develop/blend.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
 #include "develop/pixelpipe_hb.h"
+#include "gui/presets.h"
 #include "imageio/imageio_jpeg.h"
 #include "imageio/imageio_module.h"
 #include "common/datetime.h"
@@ -582,6 +596,82 @@ static void _add_field_value(JsonBuilder *b, const dt_introspection_field_t *f, 
     json_builder_add_int_value(b, (gint64)_get_num(f, p));
 }
 
+// a list setting a client can address: an array (of arrays) of floats,
+// bools or enums at the top of the params struct. not arrays of structs
+// (curve nodes) or chars (strings), nor of integers: those are counts and
+// indexes into other lists (rgbcurve's curve_num_nodes), whose declared
+// range doesn't keep them inside the lists they count
+static gboolean _settable_list(const dt_introspection_field_t *f)
+{
+  if(f->header.type != DT_INTROSPECTION_TYPE_ARRAY || strchr(f->header.name, '[') || strchr(f->header.name, '.'))
+    return FALSE;
+  const dt_introspection_field_t *e = f;
+  while(e->header.type == DT_INTROSPECTION_TYPE_ARRAY) e = e->Array.field;
+  const dt_introspection_type_t t = e->header.type;
+  return t == DT_INTROSPECTION_TYPE_FLOAT || t == DT_INTROSPECTION_TYPE_DOUBLE
+         || t == DT_INTROSPECTION_TYPE_BOOL || t == DT_INTROSPECTION_TYPE_ENUM;
+}
+
+static dt_introspection_field_t *_list_field(const dt_iop_module_t *m, const char *name)
+{
+  for(dt_introspection_field_t *f = m->so->get_introspection_linear();
+      f && f->header.type != DT_INTROSPECTION_TYPE_NONE; f++)
+    if(_settable_list(f) && !g_strcmp0(f->header.name, name)) return f;
+  return NULL;
+}
+
+// the element a name like "grey[1]" or "x[0][3]" addresses: its scalar
+// descriptor and offset in the params. a list's element descriptor carries
+// the first element's offset (dev-doc/introspection.md), so step from the
+// list's own
+static dt_introspection_field_t *_element(const dt_iop_module_t *m, const char *name, size_t *offset)
+{
+  const char *br = strchr(name, '[');
+  if(!br) return NULL;
+  gchar *base = g_strndup(name, br - name);
+  dt_introspection_field_t *f = _list_field(m, base);
+  g_free(base);
+  if(!f) return NULL;
+  size_t off = f->header.offset;
+  const char *p = br;
+  while(f->header.type == DT_INTROSPECTION_TYPE_ARRAY)
+  {
+    char *end = NULL;
+    if(*p != '[') return NULL;
+    const long k = strtol(p + 1, &end, 10);
+    if(end == p + 1 || *end != ']' || k < 0 || (size_t)k >= f->Array.count) return NULL;
+    off += k * f->Array.field->header.size;
+    f = f->Array.field;
+    p = end + 1;
+  }
+  if(*p) return NULL;
+  *offset = off;
+  return f;
+}
+
+// a list's values as nested JSON arrays
+static void _add_list_value(JsonBuilder *b, const dt_introspection_field_t *f, const void *p)
+{
+  json_builder_begin_array(b);
+  for(size_t k = 0; k < f->Array.count; k++)
+  {
+    const void *e = (const uint8_t *)p + k * f->Array.field->header.size;
+    if(f->Array.field->header.type == DT_INTROSPECTION_TYPE_ARRAY)
+      _add_list_value(b, f->Array.field, e);
+    else
+      _add_field_value(b, f->Array.field, (const uint8_t *)e - f->Array.field->header.offset);
+  }
+  json_builder_end_array(b);
+}
+
+static void _add_list_shape(JsonBuilder *b, const dt_introspection_field_t *f)
+{
+  json_builder_begin_array(b);
+  for(; f->header.type == DT_INTROSPECTION_TYPE_ARRAY; f = f->Array.field)
+    json_builder_add_int_value(b, f->Array.count);
+  json_builder_end_array(b);
+}
+
 static dt_introspection_field_t *_field(const dt_iop_module_t *m, const char *name)
 {
   for(dt_introspection_field_t *f = m->so->get_introspection_linear();
@@ -652,14 +742,43 @@ static gboolean _module_get(JsonObject *params, JsonBuilder *b, gchar **err)
     }
     json_builder_end_object(b);
   }
+  // lists: their values nested by dimension, the element's range; set
+  // whole, or one element by "name[i]" or "name[i][j]"
+  for(dt_introspection_field_t *f = m->so->get_introspection_linear();
+      f && f->header.type != DT_INTROSPECTION_TYPE_NONE; f++)
+  {
+    if(!_settable_list(f)) continue;
+    const dt_introspection_field_t *e = f;
+    while(e->header.type == DT_INTROSPECTION_TYPE_ARRAY) e = e->Array.field;
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "name");
+    json_builder_add_string_value(b, f->header.name);
+    json_builder_set_member_name(b, "description");
+    json_builder_add_string_value(b, f->header.description ? f->header.description : "");
+    json_builder_set_member_name(b, "shape");
+    _add_list_shape(b, f);
+    json_builder_set_member_name(b, "value");
+    _add_list_value(b, f, (const uint8_t *)m->params + f->header.offset);
+    json_builder_set_member_name(b, "default");
+    _add_list_value(b, f, (const uint8_t *)m->default_params + f->header.offset);
+    double lo, hi, def;
+    if(_range(e, &lo, &hi, &def))
+    {
+      json_builder_set_member_name(b, "min");
+      json_builder_add_double_value(b, lo);
+      json_builder_set_member_name(b, "max");
+      json_builder_add_double_value(b, hi);
+    }
+    json_builder_end_object(b);
+  }
   json_builder_end_array(b);
   return TRUE;
 }
 
 // parse one requested value into the field's number, or explain why not
-static gboolean _parse_value(const dt_introspection_field_t *f, JsonNode *v, double *out, gchar **err)
+static gboolean _parse_value_named(const dt_introspection_field_t *f, const char *name, JsonNode *v,
+                                   double *out, gchar **err)
 {
-  const char *name = f->header.name;
   if(f->header.type == DT_INTROSPECTION_TYPE_ENUM)
   {
     if(JSON_NODE_HOLDS_VALUE(v) && json_node_get_value_type(v) == G_TYPE_STRING)
@@ -704,6 +823,40 @@ static gboolean _parse_value(const dt_introspection_field_t *f, JsonNode *v, dou
   {
     *err = g_strdup_printf("'%s': %g is outside %g..%g", name, *out, lo, hi);
     return FALSE;
+  }
+  return TRUE;
+}
+
+static gboolean _parse_value(const dt_introspection_field_t *f, JsonNode *v, double *out, gchar **err)
+{
+  return _parse_value_named(f, f->header.name, v, out, err);
+}
+
+// a whole list from nested JSON arrays of exactly its shape, into p
+static gboolean _parse_list(const dt_introspection_field_t *f, const char *name, JsonNode *v,
+                            uint8_t *p, gchar **err)
+{
+  JsonArray *a = JSON_NODE_HOLDS_ARRAY(v) ? json_node_get_array(v) : NULL;
+  if(!a || json_array_get_length(a) != f->Array.count)
+  {
+    *err = g_strdup_printf("'%s': needs a list of %zu", name, f->Array.count);
+    return FALSE;
+  }
+  for(size_t k = 0; k < f->Array.count; k++)
+  {
+    gchar *ename = g_strdup_printf("%s[%zu]", name, k);
+    uint8_t *e = p + k * f->Array.field->header.size;
+    gboolean ok;
+    if(f->Array.field->header.type == DT_INTROSPECTION_TYPE_ARRAY)
+      ok = _parse_list(f->Array.field, ename, json_array_get_element(a, k), e, err);
+    else
+    {
+      double x;
+      ok = _parse_value_named(f->Array.field, ename, json_array_get_element(a, k), &x, err);
+      if(ok) _set_num(f->Array.field, e, x);
+    }
+    g_free(ename);
+    if(!ok) return FALSE;
   }
   return TRUE;
 }
@@ -760,15 +913,30 @@ static gboolean _module_set(JsonObject *params, JsonBuilder *b, gchar **err)
   gboolean ok = TRUE;
   for(GList *n = names; n && ok; n = g_list_next(n))
   {
-    const dt_introspection_field_t *f = _field(m, n->data);
+    const char *name = n->data;
+    JsonNode *node = json_object_get_member(values, name);
+    const dt_introspection_field_t *f = _field(m, name);
+    const dt_introspection_field_t *list = f ? NULL : _list_field(m, name);
+    size_t off = 0;
+    const dt_introspection_field_t *e = f || list ? NULL : _element(m, name, &off);
     double v;
-    if(!f)
+    if(f)
     {
-      *err = g_strdup_printf("module '%s' has no field '%s'", m->op, (char *)n->data);
+      if((ok = _parse_value(f, node, &v, err)))
+        _set_num(f, (uint8_t *)p + f->header.offset, v);
+    }
+    else if(list)
+      ok = _parse_list(list, name, node, (uint8_t *)p + list->header.offset, err);
+    else if(e)
+    {
+      if((ok = _parse_value_named(e, name, node, &v, err)))
+        _set_num(e, (uint8_t *)p + off, v);
+    }
+    else
+    {
+      *err = g_strdup_printf("module '%s' has no field '%s'", m->op, name);
       ok = FALSE;
     }
-    else if((ok = _parse_value(f, json_object_get_member(values, n->data), &v, err)))
-      _set_num(f, (uint8_t *)p + f->header.offset, v);
   }
   if(ok)
   {
@@ -783,8 +951,14 @@ static gboolean _module_set(JsonObject *params, JsonBuilder *b, gchar **err)
     json_builder_begin_object(b);
     for(GList *n = names; n; n = g_list_next(n))
     {
-      json_builder_set_member_name(b, n->data);
-      _add_field_value(b, _field(m, n->data), m->params);
+      const char *name = n->data;
+      const dt_introspection_field_t *f = _field(m, name), *list = f ? NULL : _list_field(m, name);
+      size_t off = 0;
+      const dt_introspection_field_t *e = f || list ? NULL : _element(m, name, &off);
+      json_builder_set_member_name(b, name);
+      if(f) _add_field_value(b, f, m->params);
+      else if(list) _add_list_value(b, list, (const uint8_t *)m->params + list->header.offset);
+      else _add_field_value(b, e, (const uint8_t *)m->params + off - e->header.offset);
     }
     json_builder_end_object(b);
   }
@@ -964,6 +1138,148 @@ static gboolean _reset(JsonBuilder *b, gchar **err)
   dt_history_hash_set_mipmap(imgid);
   if(s->gui) _gui_changed_by_api();
   _session_info(b, s);
+  return TRUE;
+}
+
+// ---- presets ---------------------------------------------------------------
+// a module's presets as its presets menu offers them: those stored for its
+// current version (gui/presets.c, dt_gui_presets_apply_preset). built-in
+// ones are stored as "_builtin_group | name"; label is what the menu shows
+
+static gboolean _preset_list(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  dt_iop_module_t *m = _find_module(params, err);
+  if(!m) return FALSE;
+  sqlite3_stmt *st = NULL;
+  // clang-format off
+  sqlite3_prepare_v2(dt_database_get(darktable.db),
+                     "SELECT name, description, writeprotect, autoapply"
+                     " FROM data.presets"
+                     " WHERE operation = ?1 AND op_version = ?2"
+                     " ORDER BY writeprotect DESC, LOWER(name)",
+                     -1, &st, NULL);
+  // clang-format on
+  sqlite3_bind_text(st, 1, m->op, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int(st, 2, m->version());
+  json_builder_set_member_name(b, "operation");
+  json_builder_add_string_value(b, m->op);
+  json_builder_set_member_name(b, "presets");
+  json_builder_begin_array(b);
+  while(sqlite3_step(st) == SQLITE_ROW)
+  {
+    const char *name = (const char *)sqlite3_column_text(st, 0);
+    const char *desc = (const char *)sqlite3_column_text(st, 1);
+    gchar *label = dt_util_localize_segmented_name(name, TRUE);
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "name");
+    json_builder_add_string_value(b, name);
+    json_builder_set_member_name(b, "label");
+    json_builder_add_string_value(b, label);
+    json_builder_set_member_name(b, "description");
+    json_builder_add_string_value(b, desc ? desc : "");
+    json_builder_set_member_name(b, "builtin");
+    json_builder_add_boolean_value(b, sqlite3_column_int(st, 2));
+    json_builder_set_member_name(b, "autoapply");
+    json_builder_add_boolean_value(b, sqlite3_column_int(st, 3));
+    json_builder_end_object(b);
+    g_free(label);
+  }
+  json_builder_end_array(b);
+  sqlite3_finalize(st);
+  return TRUE;
+}
+
+// apply a preset by its name or its label, as the presets menu does: the
+// preset's settings, on/off state and blending, and its name as the
+// module's label unless that was typed by hand
+static gboolean _preset_apply(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  dt_iop_module_t *m = _find_module(params, err);
+  if(!m) return FALSE;
+  const char *want = params ? json_object_get_string_member_with_default(params, "name", NULL) : NULL;
+  if(!want || !*want)
+  {
+    *err = g_strdup("preset_apply needs name (from preset_list)");
+    return FALSE;
+  }
+  sqlite3_stmt *st = NULL;
+  // clang-format off
+  sqlite3_prepare_v2(dt_database_get(darktable.db),
+                     "SELECT name, op_params, enabled, blendop_params, blendop_version,"
+                     "       multi_name, multi_name_hand_edited"
+                     " FROM data.presets"
+                     " WHERE operation = ?1 AND op_version = ?2",
+                     -1, &st, NULL);
+  // clang-format on
+  sqlite3_bind_text(st, 1, m->op, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int(st, 2, m->version());
+  gboolean found = FALSE;
+  gchar *name = NULL;
+  while(!found && sqlite3_step(st) == SQLITE_ROW)
+  {
+    const char *n = (const char *)sqlite3_column_text(st, 0);
+    gchar *label = dt_util_localize_segmented_name(n, TRUE);
+    found = !g_strcmp0(n, want) || !g_ascii_strcasecmp(label, want);
+    g_free(label);
+    if(!found) continue;
+    name = g_strdup(n);
+    if(_cur->gui)
+      break;                         // the darkroom applies it itself, below
+
+    const void *op = sqlite3_column_blob(st, 1);
+    const int op_len = sqlite3_column_bytes(st, 1);
+    const void *bl = sqlite3_column_blob(st, 3);
+    const int bl_len = sqlite3_column_bytes(st, 3);
+    const int bl_version = sqlite3_column_int(st, 4);
+    const char *multi_name = (const char *)sqlite3_column_text(st, 5);
+    memcpy(m->params, op && op_len == m->params_size ? op : m->default_params, m->params_size);
+    m->enabled = sqlite3_column_int(st, 2);
+    if(bl && bl_version == dt_develop_blend_version() && bl_len == sizeof(dt_develop_blend_params_t))
+      dt_iop_commit_blend_params(m, bl, NULL);
+    else if(!bl || dt_develop_blend_legacy_params(m, bl, bl_version, m->blend_params,
+                                                  dt_develop_blend_version(), bl_len))
+      dt_iop_commit_blend_params(m, m->default_blendop_params, NULL);
+    // dt_iop_update_multi_name, without its history item and header update
+    if(dt_conf_get_bool("darkroom/ui/auto_module_name_update") && !m->multi_name_hand_edited)
+    {
+      gchar *mname = g_strdup(multi_name && *multi_name ? multi_name : n);
+      g_strlcpy(m->multi_name, g_strstrip(mname), sizeof(m->multi_name));
+      m->multi_name_hand_edited = sqlite3_column_int(st, 6);
+      g_free(mname);
+    }
+  }
+  sqlite3_finalize(st);
+  if(!found)
+  {
+    *err = g_strdup_printf("module '%s' has no preset '%s'", m->op, want);
+    return FALSE;
+  }
+  if(_cur->gui)
+  {
+    _api_editing = TRUE;
+    dt_gui_presets_apply_preset(name, m);
+    _api_editing = FALSE;
+    _gui_changed_by_api();
+  }
+  else
+    _record(m, FALSE);
+  json_builder_set_member_name(b, "name");
+  json_builder_add_string_value(b, name);
+  json_builder_set_member_name(b, "enabled");
+  json_builder_add_boolean_value(b, m->enabled);
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, _cur->dev->history_end);
+  g_free(name);
   return TRUE;
 }
 
@@ -2421,10 +2737,29 @@ static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
     dt_dev_pixelpipe_get_dimensions(&_cur->pipe, _cur->dev, _cur->pipe.iwidth, _cur->pipe.iheight,
                                     &_cur->pipe.processed_width, &_cur->pipe.processed_height);
   }
-  const double scale = fmin(1.0, fmin((double)max_w / _cur->pipe.processed_width,
-                                      (double)max_h / _cur->pipe.processed_height));
-  const int w = floor(scale * _cur->pipe.processed_width);
-  const int h = floor(scale * _cur->pipe.processed_height);
+  // zoom: a region at that scale of the full-size image (1 = 100%), as the
+  // darkroom shows it zoomed in, centered on center_x/center_y (fractions);
+  // else the whole image fitted inside max_w x max_h
+  const double zoom = params ? json_object_get_double_member_with_default(params, "zoom", 0.0) : 0.0;
+  const double pw = _cur->pipe.processed_width, ph = _cur->pipe.processed_height;
+  double scale;
+  int x = 0, y = 0, w, h;
+  if(zoom > 0.0)
+  {
+    scale = CLAMP(zoom, 0.01, 2.0);
+    const double cx = params ? json_object_get_double_member_with_default(params, "center_x", 0.5) : 0.5;
+    const double cy = params ? json_object_get_double_member_with_default(params, "center_y", 0.5) : 0.5;
+    w = MIN(max_w, (int)floor(scale * pw));
+    h = MIN(max_h, (int)floor(scale * ph));
+    x = CLAMP((int)round(cx * scale * pw - w / 2.0), 0, (int)floor(scale * pw) - w);
+    y = CLAMP((int)round(cy * scale * ph - h / 2.0), 0, (int)floor(scale * ph) - h);
+  }
+  else
+  {
+    scale = fmin(1.0, fmin(max_w / pw, max_h / ph));
+    w = floor(scale * pw);
+    h = floor(scale * ph);
+  }
 
   // as a non-hq export does: downscale right after demosaic, not in finalscale
   dt_dev_pixelpipe_iop_t *finalscale = NULL;
@@ -2434,7 +2769,7 @@ static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
     if(dt_iop_module_is_finalscale(piece->module)) { finalscale = piece; break; }
   }
   if(finalscale) finalscale->enabled = FALSE;
-  dt_dev_pixelpipe_process(&_cur->pipe, _cur->dev, 0, 0, w, h, scale, DT_DEVICE_NONE);
+  dt_dev_pixelpipe_process(&_cur->pipe, _cur->dev, x, y, w, h, scale, DT_DEVICE_NONE);
   if(finalscale) finalscale->enabled = TRUE;
   if(crop)
   {
@@ -2475,6 +2810,14 @@ static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
   json_builder_add_int_value(b, h);
   json_builder_set_member_name(b, "uncropped");
   json_builder_add_boolean_value(b, crop != NULL);
+  if(zoom > 0.0)
+  {
+    // the region shown, in fractions of the whole image
+    json_builder_set_member_name(b, "zoom");
+    json_builder_add_double_value(b, scale);
+    json_builder_set_member_name(b, "region");
+    _add_box(b, (float[4]){ x / (scale * pw), y / (scale * ph), (x + w) / (scale * pw), (y + h) / (scale * ph) });
+  }
   json_builder_set_member_name(b, "process_ms");
   json_builder_add_int_value(b, (t1 - t0) / 1000);
   json_builder_set_member_name(b, "jpeg_ms");
@@ -2635,10 +2978,17 @@ static void _notify(const struct _client_t *from, const char *type, const dt_img
   g_object_unref(b);
 }
 
+static const char *_methods[] = {
+  "ping", "film_rolls", "images_list", "image_info", "thumbnail", "set_rating", "set_label",
+  "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
+  "module_enable", "preset_list", "preset_apply", "history_list", "history_end", "geometry_get",
+  "geometry_set", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
+  "library_status", "library_release", "library_acquire", "handover", "shutdown", NULL };
+
 // methods that work on an edit session, and the event each one sends
 static const struct { const char *method; const char *event; } _session_methods[] = {
   { "module_list", NULL }, { "module_get", NULL }, { "history_list", NULL }, { "render", NULL },
-  { "geometry_get", NULL },
+  { "geometry_get", NULL }, { "preset_list", NULL }, { "preset_apply", "edit" },
   { "module_set", "edit" }, { "module_enable", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" },
   { "save", "saved" }, { "reset", "reset" }, { "session_close", "closed" }, { NULL, NULL } };
 
@@ -2702,6 +3052,12 @@ static gboolean _handle(_client_t *c, const gchar *line)
     json_builder_add_int_value(b, c->id);
     json_builder_set_member_name(b, "server");
     json_builder_add_string_value(b, _opt.in_gui ? "gui" : "engine");
+    // what this server can do, so a client can check before calling: names
+    // of methods, and of options a method gained later ("render.zoom")
+    json_builder_set_member_name(b, "methods");
+    json_builder_begin_array(b);
+    for(int k = 0; _methods[k]; k++) json_builder_add_string_value(b, _methods[k]);
+    json_builder_end_array(b);
   }
   else if(!g_strcmp0(method, "film_rolls"))
     _film_rolls(b, &err);
@@ -2760,6 +3116,10 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _module_enable(params, b, &err);
   else if(!g_strcmp0(method, "history_list"))
     _history_list(b, &err);
+  else if(!g_strcmp0(method, "preset_list"))
+    _preset_list(params, b, &err);
+  else if(!g_strcmp0(method, "preset_apply"))
+    _preset_apply(params, b, &err);
   else if(!g_strcmp0(method, "geometry_get"))
     _geometry_get(b, &err);
   else if(!g_strcmp0(method, "geometry_set"))

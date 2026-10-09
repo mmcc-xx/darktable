@@ -93,6 +93,16 @@
      retouch_heal {spots: [{x, y, r, sx, sy}]}
                                  -> adds heal circles (raw space; r relative
                                     to the shorter side) as one history item
+     module_add {operation, instance, copy}
+                                 -> a new instance after the given one ("new
+                                    instance", or "duplicate" with copy)
+     module_remove {operation, instance}
+                                 -> deletes an instance (not a module's last)
+     module_rename {operation, instance, name}
+                                 -> the instance's label ("" for darktable's)
+     history_compress {truncate} -> compresses the history stack as the
+                                    history panel does (truncate: only drops
+                                    the items above history_end); saves first
      blend_get / blend_set {operation, instance, values}
                                  -> a module's blending in the darkroom's
                                     names and units: masks, blend_mode,
@@ -167,13 +177,15 @@
                                     without it they are refused. replies
                                     the file written, or skipped
      render {width, height, path, quality, uncropped, zoom, center_x,
-             center_y}
+             center_y, history_end}
                                  -> writes an sRGB JPEG fitted inside
                                     width x height to path; uncropped
                                     leaves crop's box out; zoom (1 = 100%)
                                     renders the width x height region
                                     around center_x/center_y (fractions)
-                                    at that scale and replies its region
+                                    at that scale and replies its region;
+                                    history_end renders an earlier step
+                                    (before/after) without undoing
      handover                    -> (engine) releases the library to
                                     darktable's window, replies the unsaved
                                     edits as drafts, and exits
@@ -2722,6 +2734,295 @@ static gboolean _mask_remove(JsonObject *params, JsonBuilder *b, gchar **err)
   return TRUE;
 }
 
+// ---- module instances and history compression ------------------------------
+
+// a session's pipe after modules were added or removed: new nodes for the
+// new module list (the darkroom rebuilds its pipes the same way,
+// dt_dev_pixelpipe_rebuild)
+static void _pipe_rebuild(_session_t *s)
+{
+  dt_dev_pixelpipe_cleanup_nodes(&s->pipe);
+  dt_dev_pixelpipe_create_nodes(&s->pipe, s->dev);
+  // cache lines of the old nodes can match the new ones' hashes (an
+  // instance removed, its neighbours renumbered): renders came out banded
+  dt_dev_pixelpipe_cache_flush(&s->pipe);
+  s->pipe_changed = TRUE;
+}
+
+static void _add_instance(JsonBuilder *b, const dt_iop_module_t *m)
+{
+  json_builder_set_member_name(b, "operation");
+  json_builder_add_string_value(b, m->op);
+  json_builder_set_member_name(b, "instance");
+  json_builder_add_int_value(b, m->multi_priority);
+  json_builder_set_member_name(b, "name");
+  json_builder_add_string_value(b, m->multi_name);
+  json_builder_set_member_name(b, "iop_order");
+  json_builder_add_int_value(b, m->iop_order);
+}
+
+// a new instance of a module, after the given one in the pipe, as the
+// module's "new instance" (copy: false) or "duplicate" (copy: true) menu
+// entries do (imageop.c, dt_iop_gui_duplicate)
+static gboolean _module_add(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  dt_iop_module_t *base = _find_module(params, err);
+  if(!base) return FALSE;
+  if(base->flags() & IOP_FLAGS_ONE_INSTANCE)
+  {
+    *err = g_strdup_printf("module '%s' can only have one instance", base->op);
+    return FALSE;
+  }
+  const gboolean copy = params ? json_object_get_boolean_member_with_default(params, "copy", FALSE) : FALSE;
+  dt_develop_t *dev = _cur->dev;
+  dt_iop_module_t *m = NULL;
+  gboolean shapes_copied = TRUE;
+  if(_cur->gui)
+  {
+    _api_editing = TRUE;
+    m = dt_iop_gui_duplicate(base, copy);
+    _api_editing = FALSE;
+    _gui_changed_by_api();
+  }
+  else
+  {
+    // the base in the history first, so the instances' order is recorded
+    dt_dev_add_history_item_ext(dev, base, FALSE, TRUE);
+    m = dt_dev_module_duplicate(dev, base);
+    if(m)
+    {
+      dt_iop_reload_defaults(m);
+      if(copy)
+      {
+        memcpy(m->params, base->params, m->params_size);
+        if(m->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
+        {
+          dt_iop_commit_blend_params(m, base->blend_params, NULL);
+          // the darkroom gives the copy its own group with the base's
+          // shapes (dt_masks_iop_use_same_as), which works on the
+          // darkroom's image only: here the copy has no drawn shapes
+          if(dt_is_valid_maskid(base->blend_params->mask_id))
+          {
+            m->blend_params->mask_id = NO_MASKID;
+            m->blend_params->mask_mode &= ~DEVELOP_MASK_MASK;
+            shapes_copied = FALSE;
+          }
+        }
+      }
+      m->enabled = TRUE;
+      dt_dev_add_history_item_ext(dev, m, TRUE, TRUE);
+      _pipe_rebuild(_cur);
+      _cur->dirty = TRUE;
+    }
+  }
+  if(!m)
+  {
+    *err = g_strdup_printf("could not add an instance of '%s'", base->op);
+    return FALSE;
+  }
+  _add_instance(b, m);
+  if(!shapes_copied)
+  {
+    json_builder_set_member_name(b, "note");
+    json_builder_add_string_value(b, "the base's drawn shapes were not copied");
+  }
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, dev->history_end);
+  return TRUE;
+}
+
+// delete an instance, as the module's delete menu entry does (imageop.c,
+// _gui_delete_callback): its history items go, another instance of the
+// module takes its place if it was the first one. not the last instance
+static gboolean _module_remove(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  dt_iop_module_t *m = _find_module(params, err);
+  if(!m) return FALSE;
+  dt_develop_t *dev = _cur->dev;
+  dt_iop_module_t *next = NULL;
+  for(GList *l = dev->iop; l; l = g_list_next(l))
+  {
+    dt_iop_module_t *o = l->data;
+    if(o != m && o->instance == m->instance && !next) next = o;
+  }
+  if(!next)
+  {
+    *err = g_strdup_printf("'%s' instance %d is the module's only instance: switch it off instead",
+                           m->op, m->multi_priority);
+    return FALSE;
+  }
+  if(_cur->gui)
+  {
+    _api_editing = TRUE;
+    dt_iop_gui_delete(m);
+    _api_editing = FALSE;
+    _gui_changed_by_api();
+  }
+  else
+  {
+    const gboolean is_zero = m->multi_priority == 0;
+    // what dt_dev_module_remove does for the darkroom (gui_attached)
+    int k = 0;
+    for(GList *l = dev->history; l;)
+    {
+      GList *n = g_list_next(l);
+      dt_dev_history_item_t *hist = l->data;
+      if(hist->module == m)
+      {
+        if(k < dev->history_end) dev->history_end--;
+        dt_dev_free_history_item(hist);
+        dev->history = g_list_delete_link(dev->history, l);
+      }
+      else
+        k++;
+      l = n;
+    }
+    dt_dev_module_remove(dev, m);
+    if(is_zero)
+    {
+      dt_iop_module_t *first = NULL;
+      for(GList *h = dev->history; h && !first; h = g_list_next(h))
+      {
+        dt_dev_history_item_t *hist = h->data;
+        if(hist->module->instance == m->instance) first = hist->module;
+      }
+      if(!first) first = next;
+      dt_iop_update_multi_priority(first, 0);
+      for(GList *h = dev->history; h; h = g_list_next(h))
+      {
+        dt_dev_history_item_t *hist = h->data;
+        if(hist->module == first) hist->multi_priority = 0;
+      }
+    }
+    // kept, as the darkroom keeps it: the pipe's nodes still point at it
+    dev->alliop = g_list_append(dev->alliop, m);
+    _pipe_rebuild(_cur);
+    _cur->dirty = TRUE;
+  }
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, dev->history_end);
+  json_builder_set_member_name(b, "instances");
+  json_builder_begin_array(b);
+  for(GList *l = dev->iop; l; l = g_list_next(l))
+  {
+    dt_iop_module_t *o = l->data;
+    if(o->instance != next->instance) continue;
+    json_builder_begin_object(b);
+    _add_instance(b, o);
+    json_builder_end_object(b);
+  }
+  json_builder_end_array(b);
+  return TRUE;
+}
+
+// the instance's label, as renaming it in its header does (an empty name
+// gives the label back to darktable)
+static gboolean _module_rename(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  dt_iop_module_t *m = _find_module(params, err);
+  if(!m) return FALSE;
+  const char *name = params ? json_object_get_string_member_with_default(params, "name", NULL) : NULL;
+  if(!name || strlen(name) >= sizeof(m->multi_name))
+  {
+    *err = g_strdup_printf("module_rename needs name (at most %zu bytes; \"\" for darktable's label)",
+                           sizeof(m->multi_name) - 1);
+    return FALSE;
+  }
+  if(_cur->gui)
+  {
+    _gui_focus();
+    _api_editing = TRUE;
+    dt_iop_update_multi_name(m, name, *name != '\0', TRUE, TRUE);
+    _api_editing = FALSE;
+    _gui_changed_by_api();
+  }
+  else
+  {
+    gchar *n = g_strstrip(g_strdup(name));
+    g_strlcpy(m->multi_name, n, sizeof(m->multi_name));
+    m->multi_name_hand_edited = *n != '\0';
+    g_free(n);
+    _record(m, TRUE);
+  }
+  _add_instance(b, m);
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, _cur->dev->history_end);
+  return TRUE;
+}
+
+// compress the history stack as the history panel's button does
+// (libs/history.c: _lib_history_truncate): one item per module instance,
+// disabled modules dropped; truncate: only drop the items above
+// history_end. it works on the library, so the edit is saved first
+static gboolean _history_compress(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  const gboolean truncate = params ? json_object_get_boolean_member_with_default(params, "truncate", FALSE) : FALSE;
+  const dt_imgid_t imgid = _cur->dev->image_storage.id;
+  const int before = g_list_length(_cur->dev->history);
+  if(_cur->gui)
+  {
+    dt_develop_t *dev = _cur->dev;
+    _api_editing = TRUE;
+    dt_dev_undo_start_record(dev);
+    dt_dev_write_history(dev);
+    if(truncate) dt_history_truncate_on_image(imgid, dev->history_end);
+    else dt_history_compress_on_image(imgid);
+    dt_dev_reload_history_items(dev);
+    dt_dev_write_history(dev);
+    dt_image_synch_xmp(imgid);
+    dev->history_end = g_list_length(dev->history);
+    dt_image_set_history_end(imgid, dev->history_end);
+    dt_dev_reload_history_items(dev);
+    dt_dev_undo_end_record(dev);
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_DEVELOP_HISTORY_INVALIDATED);
+    _api_editing = FALSE;
+    _gui_changed_by_api();
+  }
+  else
+  {
+    _session_t *s = _cur;
+    _save_session(s);
+    if(truncate) dt_history_truncate_on_image(imgid, s->dev->history_end);
+    else dt_history_compress_on_image(imgid);
+    // reload, and write back once so the items are numbered without gaps
+    _session_close(s);
+    if(!(s = _session_load(imgid, err))) return FALSE;
+    _cur = s;
+    s->dev->history_end = g_list_length(s->dev->history);
+    dt_dev_pop_history_items_ext(s->dev, s->dev->history_end);
+    dt_dev_write_history(s->dev);
+    dt_image_set_history_end(imgid, s->dev->history_end);
+    dt_image_synch_xmp(imgid);
+    s->pipe_changed = TRUE;
+  }
+  json_builder_set_member_name(b, "items_before");
+  json_builder_add_int_value(b, before);
+  json_builder_set_member_name(b, "saved");
+  json_builder_add_boolean_value(b, TRUE);
+  _session_info(b, _cur);
+  return TRUE;
+}
+
 // ---- export ----------------------------------------------------------------
 // darktable's export: the disk storage and a format module, with the export
 // module's settings (libs/export.c) unless the request overrides them, as
@@ -3739,6 +4040,21 @@ typedef struct _view_t
 static gboolean _process_view(JsonObject *params, const int max_w, const int max_h, _view_t *v, gchar **err)
 {
   const gint64 t0 = g_get_monotonic_time();
+  // history_end: the image as it was at that step (0 = original), for
+  // before/after, without moving the edit's own history_end (popping keeps
+  // the later items, as undo does until the next edit)
+  const int end_now = _cur->dev->history_end;
+  const int end_view = params ? json_object_get_int_member_with_default(params, "history_end", end_now) : end_now;
+  if(end_view < 0 || end_view > (int)g_list_length(_cur->dev->history))
+  {
+    *err = g_strdup_printf("history_end must be 0..%d", g_list_length(_cur->dev->history));
+    return FALSE;
+  }
+  if(end_view != end_now)
+  {
+    dt_dev_pop_history_items_ext(_cur->dev, end_view);
+    _cur->pipe_changed = TRUE;
+  }
   _pipe_sync(_cur);
   // uncropped: without crop's box, as the darkroom shows the image while
   // crop has the focus, for drawing a box on
@@ -3792,6 +4108,11 @@ static gboolean _process_view(JsonObject *params, const int max_w, const int max
     crop->enabled = TRUE;
     dt_dev_pixelpipe_get_dimensions(&_cur->pipe, _cur->dev, _cur->pipe.iwidth, _cur->pipe.iheight,
                                     &_cur->pipe.processed_width, &_cur->pipe.processed_height);
+  }
+  if(end_view != end_now)
+  {
+    dt_dev_pop_history_items_ext(_cur->dev, end_now);
+    _cur->pipe_changed = TRUE;
   }
   v->ms = (g_get_monotonic_time() - t0) / 1000;
   if(!_cur->pipe.backbuf || _cur->pipe.backbuf_width != v->w || _cur->pipe.backbuf_height != v->h)
@@ -4213,7 +4534,8 @@ static const char *_methods[] = {
   "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
   "module_enable", "preset_list", "preset_apply", "history_list", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "blend_get", "blend_set", "mask_add", "mask_list",
-  "mask_remove", "sample", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
+  "mask_remove", "sample", "module_add", "module_remove", "module_rename", "history_compress",
+  "render.history_end", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
   "library_status", "library_release", "library_acquire", "handover", "shutdown", NULL };
 
 // methods that work on an edit session, and the event each one sends
@@ -4223,6 +4545,7 @@ static const struct { const char *method; const char *event; } _session_methods[
   { "coords", NULL }, { "retouch_list", NULL }, { "retouch_heal", "edit" },
   { "blend_get", NULL }, { "blend_set", "edit" }, { "mask_add", "edit" }, { "mask_list", NULL },
   { "mask_remove", "edit" }, { "sample", NULL },
+  { "module_add", "edit" }, { "module_remove", "edit" }, { "module_rename", "edit" }, { "history_compress", "saved" },
   { "module_set", "edit" }, { "module_enable", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" },
   { "save", "saved" }, { "reset", "reset" }, { "session_close", "closed" }, { NULL, NULL } };
 
@@ -4354,6 +4677,14 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _preset_list(params, b, &err);
   else if(!g_strcmp0(method, "preset_apply"))
     _preset_apply(params, b, &err);
+  else if(!g_strcmp0(method, "module_add"))
+    _module_add(params, b, &err);
+  else if(!g_strcmp0(method, "module_remove"))
+    _module_remove(params, b, &err);
+  else if(!g_strcmp0(method, "module_rename"))
+    _module_rename(params, b, &err);
+  else if(!g_strcmp0(method, "history_compress"))
+    _history_compress(params, b, &err);
   else if(!g_strcmp0(method, "blend_get"))
     _blend_get(params, b, &err);
   else if(!g_strcmp0(method, "blend_set"))

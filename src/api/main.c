@@ -18,10 +18,27 @@
 
 /* darktable-api: a long-running edit engine (proof of concept).
 
-   Line-delimited JSON-RPC 2.0 over stdin/stdout: one request per line, one
-   response per line. All arguments after --core go to dt_init, so it opens
-   whichever library --configdir/--library name and holds its lock until it
-   exits.
+   Line-delimited JSON-RPC 2.0: one request per line, one response per line.
+   All arguments after --core go to dt_init, so it opens whichever library
+   --configdir/--library name and holds its lock while it runs.
+
+     darktable-api [--listen <socket>] [--max-sessions <n>] [--idle-exit <s>]
+                   --core --configdir <dir> [darktable options]
+
+   without --listen it serves one client on stdin/stdout and exits when stdin
+   closes. with --listen it serves every client that connects to the unix
+   socket (mode 0700), so several front ends share one library: requests are
+   handled one at a time, edit sessions belong to the engine (one per open
+   image, at most --max-sessions, default 3), and each change is announced to
+   the other clients as a notification {"method": "event", "params": {"type",
+   "imgid", "history_end", "unsaved", "client"}} with type edit, saved,
+   reset, reopened, closed, image (rating/label), library_released or
+   library_acquired. --idle-exit stops the engine that many seconds after the
+   last client left, unless an image has unsaved changes.
+
+   the session methods (module_*, history_*, save, reset, render,
+   session_close) work on params.imgid if given, else on the image the
+   client last opened.
 
    methods:
      ping                        -> {"version"}
@@ -37,9 +54,13 @@
      set_rating {imgid, rating}  -> 0..5 or "reject", as the lighttable
      set_label {imgid, label, on}
                                  -> color label 0..4 on or off
-     session_open {imgid}        -> loads the image and replays its history
-                                    up to history_end, as the darkroom does
-     session_close               -> releases the open image
+     session_open {imgid, fresh} -> opens the image for editing: loads it and
+                                    replays its history up to history_end, as
+                                    the darkroom does, or joins the session
+                                    another client has open (unsaved changes
+                                    included); fresh reloads it as saved.
+                                    replies joined and unsaved
+     session_close               -> closes the image's session for everyone
      module_list                 -> the open image's modules: enabled ones and
                                     those in its history, in pipe order
      module_get {operation, instance}
@@ -62,22 +83,23 @@
                                     history (saved and unsaved) and reloads
                                     it, so darktable applies the workflow
                                     defaults and auto-apply presets again
-     library_status              -> owned or released, the lock holder's pid
-     library_release             -> closes the session (unsaved changes kept
-                                    as a draft), the caches and the library,
+     library_status              -> owned or released, the lock holder's pid,
+                                    the open sessions
+     library_release             -> closes the sessions (unsaved changes kept
+                                    as drafts), the caches and the library,
                                     removing the lock files: darktable's GUI
                                     can open the library now
      library_acquire             -> takes the library back (refused while
                                     another live process holds it), reopens
                                     database and caches, reloads darktablerc
-                                    and restores the draft if the image was
+                                    and restores each draft whose image was
                                     not changed meanwhile
      render {width, height, path, quality}
                                  -> writes an sRGB JPEG fitted inside
                                     width x height to path
      shutdown                    -> closes the session and exits
 
-   edits stay in memory until save. the session keeps one pixelpipe with
+   edits stay in memory until save. each session keeps one pixelpipe with
    darktable's full-size cache, so a render after a change re-runs only the
    modules after the changed one. see src/api/README.md
 */
@@ -101,28 +123,42 @@
 #include <errno.h>
 #include <glib.h>
 #include <glib/gi18n.h>
+#include <glib/gstdio.h>
 #include <json-glib/json-glib.h>
 #include <limits.h>
 #include <signal.h>
 #include <math.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
-// the open session, one at a time
-static dt_develop_t *_dev = NULL;
-static dt_dev_pixelpipe_t _pipe;
-static dt_mipmap_buffer_t _buf;
-static gboolean _pipe_changed = FALSE;
-static gboolean _dirty = FALSE;       // edits since the last open or save
+// edit sessions: one per open image, shared by all clients. _cur is the
+// session of the request being handled (_handle picks it)
+typedef struct _session_t
+{
+  dt_develop_t *dev;
+  dt_dev_pixelpipe_t pipe;
+  dt_mipmap_buffer_t buf;
+  gboolean pipe_changed;
+  gboolean dirty;                    // edits since the last open or save
+  gint64 last_use;
+} _session_t;
+
+static GList *_sessions = NULL;
+static _session_t *_cur = NULL;
+static int _max_sessions = 3;        // each holds a full-size raw and a pipe cache
 static volatile sig_atomic_t _stop = 0;
 
 static gboolean _in_history(const dt_iop_module_t *m)
 {
-  for(GList *h = _dev->history; h; h = g_list_next(h))
+  for(GList *h = _cur->dev->history; h; h = g_list_next(h))
   {
     const dt_dev_history_item_t *hi = h->data;
-    if(hi->module == m && hi->num < _dev->history_end) return TRUE;
+    if(hi->module == m && hi->num < _cur->dev->history_end) return TRUE;
   }
   return FALSE;
 }
@@ -144,66 +180,138 @@ static gboolean _image_exists(const dt_imgid_t imgid)
   return found;
 }
 
-static void _session_close(void)
+static void _session_free(_session_t *s)
 {
-  if(!_dev) return;
-  dt_dev_pixelpipe_cleanup(&_pipe);
-  dt_mipmap_cache_release(&_buf);
-  dt_dev_cleanup(_dev);
-  g_free(_dev);
-  _dev = NULL;
+  dt_dev_pixelpipe_cleanup(&s->pipe);
+  dt_mipmap_cache_release(&s->buf);
+  dt_dev_cleanup(s->dev);
+  g_free(s->dev);
+  g_free(s);
 }
 
-static gboolean _session_open(const dt_imgid_t imgid, JsonBuilder *b, gchar **err)
+static _session_t *_session_find(const dt_imgid_t imgid)
+{
+  for(GList *l = _sessions; l; l = g_list_next(l))
+  {
+    _session_t *s = l->data;
+    if(s->dev->image_storage.id == imgid) return s;
+  }
+  return NULL;
+}
+
+static void _session_close(_session_t *s)
+{
+  if(!s) return;
+  _sessions = g_list_remove(_sessions, s);
+  if(_cur == s) _cur = NULL;
+  _session_free(s);
+}
+
+static void _session_close_all(void)
+{
+  while(_sessions) _session_close(_sessions->data);
+}
+
+// load an image into a new session: its history replayed up to history_end,
+// as the darkroom does, and a pipe on its full-size buffer
+static _session_t *_session_load(const dt_imgid_t imgid, gchar **err)
+{
+  _session_t *s = g_new0(_session_t, 1);
+  s->dev = g_new0(dt_develop_t, 1);
+  dt_dev_init(s->dev, FALSE);
+  dt_dev_load_image(s->dev, imgid);
+  // dt_dev_load_image reads the history but leaves module params at their
+  // defaults; replaying it is what the darkroom does when it shows an image
+  dt_dev_pop_history_items_ext(s->dev, s->dev->history_end);
+  dt_ioppr_resync_modules_order(s->dev);
+
+  dt_mipmap_cache_get(&s->buf, imgid, DT_MIPMAP_FULL, DT_MIPMAP_BLOCKING, 'r');
+  if(!s->buf.buf || !s->buf.width || !s->buf.height)
+  {
+    *err = g_strdup_printf("cannot load the image file of %d", imgid);
+    dt_mipmap_cache_release(&s->buf);
+    dt_dev_cleanup(s->dev);
+    g_free(s->dev);
+    g_free(s);
+    return NULL;
+  }
+  // a full (darkroom) pipe: an export pipe keeps only DT_PIPECACHE_MIN cache
+  // lines, so every render would start again from the raw file
+  dt_dev_pixelpipe_init(&s->pipe);
+  dt_dev_pixelpipe_set_icc(&s->pipe, DT_COLORSPACE_SRGB, NULL, DT_INTENT_PERCEPTUAL);
+  dt_dev_pixelpipe_set_input(&s->pipe, s->dev, (float *)s->buf.buf,
+                             s->buf.width, s->buf.height, s->buf.iscale);
+  dt_dev_pixelpipe_create_nodes(&s->pipe, s->dev);
+  s->pipe_changed = TRUE;
+  s->last_use = g_get_monotonic_time();
+  _sessions = g_list_append(_sessions, s);
+  return s;
+}
+
+static void _session_info(JsonBuilder *b, const _session_t *s)
+{
+  json_builder_set_member_name(b, "imgid");
+  json_builder_add_int_value(b, s->dev->image_storage.id);
+  json_builder_set_member_name(b, "filename");
+  json_builder_add_string_value(b, s->dev->image_storage.filename);
+  json_builder_set_member_name(b, "width");
+  json_builder_add_int_value(b, s->dev->image_storage.width);
+  json_builder_set_member_name(b, "height");
+  json_builder_add_int_value(b, s->dev->image_storage.height);
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, s->dev->history_end);
+  json_builder_set_member_name(b, "history_items");
+  json_builder_add_int_value(b, g_list_length(s->dev->history));
+  json_builder_set_member_name(b, "unsaved");
+  json_builder_add_boolean_value(b, s->dirty);
+}
+
+// open an image for editing. a session another client has open is joined,
+// unsaved changes included, unless fresh asks to reload it as saved (which
+// drops those changes for everyone)
+static gboolean _session_open(const dt_imgid_t imgid, const gboolean fresh,
+                              JsonBuilder *b, gchar **err)
 {
   if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
   {
     *err = g_strdup_printf("no image with id %d", imgid);
     return FALSE;
   }
-
-  _session_close();
   const gint64 t0 = g_get_monotonic_time();
-  _dev = g_new0(dt_develop_t, 1);
-  dt_dev_init(_dev, FALSE);
-  dt_dev_load_image(_dev, imgid);
-  // dt_dev_load_image reads the history but leaves module params at their
-  // defaults; replaying it is what the darkroom does when it shows an image
-  dt_dev_pop_history_items_ext(_dev, _dev->history_end);
-  dt_ioppr_resync_modules_order(_dev);
-
-  dt_mipmap_cache_get(&_buf, imgid, DT_MIPMAP_FULL, DT_MIPMAP_BLOCKING, 'r');
-  if(!_buf.buf || !_buf.width || !_buf.height)
+  _session_t *s = _session_find(imgid);
+  if(s && fresh)
   {
-    *err = g_strdup_printf("cannot load the image file of %d", imgid);
-    dt_mipmap_cache_release(&_buf);
-    dt_dev_cleanup(_dev);
-    g_free(_dev);
-    _dev = NULL;
-    return FALSE;
+    _session_close(s);
+    s = NULL;
   }
-  // a full (darkroom) pipe: an export pipe keeps only DT_PIPECACHE_MIN cache
-  // lines, so every render would start again from the raw file
-  dt_dev_pixelpipe_init(&_pipe);
-  dt_dev_pixelpipe_set_icc(&_pipe, DT_COLORSPACE_SRGB, NULL, DT_INTENT_PERCEPTUAL);
-  dt_dev_pixelpipe_set_input(&_pipe, _dev, (float *)_buf.buf,
-                             _buf.width, _buf.height, _buf.iscale);
-  dt_dev_pixelpipe_create_nodes(&_pipe, _dev);
-  _pipe_changed = TRUE;
-  _dirty = FALSE;
-
-  json_builder_set_member_name(b, "imgid");
-  json_builder_add_int_value(b, imgid);
-  json_builder_set_member_name(b, "filename");
-  json_builder_add_string_value(b, _dev->image_storage.filename);
-  json_builder_set_member_name(b, "width");
-  json_builder_add_int_value(b, _dev->image_storage.width);
-  json_builder_set_member_name(b, "height");
-  json_builder_add_int_value(b, _dev->image_storage.height);
-  json_builder_set_member_name(b, "history_end");
-  json_builder_add_int_value(b, _dev->history_end);
-  json_builder_set_member_name(b, "history_items");
-  json_builder_add_int_value(b, g_list_length(_dev->history));
+  const gboolean joined = s != NULL;
+  if(!s)
+  {
+    if(g_list_length(_sessions) >= (guint)_max_sessions)
+    {
+      // make room: close the least recently used session without unsaved
+      // changes; never drop someone's unsaved edit
+      _session_t *victim = NULL;
+      for(GList *l = _sessions; l; l = g_list_next(l))
+      {
+        _session_t *o = l->data;
+        if(!o->dirty && (!victim || o->last_use < victim->last_use)) victim = o;
+      }
+      if(!victim)
+      {
+        *err = g_strdup_printf("%d images are open with unsaved changes: save one, or reopen it"
+                               " with fresh to discard them, first", _max_sessions);
+        return FALSE;
+      }
+      _session_close(victim);
+    }
+    if(!(s = _session_load(imgid, err))) return FALSE;
+  }
+  s->last_use = g_get_monotonic_time();
+  _cur = s;
+  _session_info(b, s);
+  json_builder_set_member_name(b, "joined");
+  json_builder_add_boolean_value(b, joined);
   json_builder_set_member_name(b, "ms");
   json_builder_add_int_value(b, (g_get_monotonic_time() - t0) / 1000);
   return TRUE;
@@ -211,14 +319,14 @@ static gboolean _session_open(const dt_imgid_t imgid, JsonBuilder *b, gchar **er
 
 static gboolean _module_list(JsonBuilder *b, gchar **err)
 {
-  if(!_dev)
+  if(!_cur)
   {
     *err = g_strdup("no open session");
     return FALSE;
   }
   json_builder_set_member_name(b, "modules");
   json_builder_begin_array(b);
-  for(GList *l = _dev->iop; l; l = g_list_next(l))
+  for(GList *l = _cur->dev->iop; l; l = g_list_next(l))
   {
     dt_iop_module_t *m = l->data;
     const gboolean in_hist = _in_history(m);
@@ -246,7 +354,7 @@ static dt_iop_module_t *_find_module(JsonObject *params, gchar **err)
 {
   const gchar *op = params ? json_object_get_string_member_with_default(params, "operation", NULL) : NULL;
   const int instance = params ? json_object_get_int_member_with_default(params, "instance", 0) : 0;
-  dt_iop_module_t *m = op ? dt_iop_get_module_by_op_priority(_dev->iop, op, instance) : NULL;
+  dt_iop_module_t *m = op ? dt_iop_get_module_by_op_priority(_cur->dev->iop, op, instance) : NULL;
   if(!m) *err = g_strdup_printf("no module '%s' instance %d", op ? op : "", instance);
   return m;
 }
@@ -361,7 +469,7 @@ static dt_introspection_field_t *_field(const dt_iop_module_t *m, const char *na
 
 static gboolean _module_get(JsonObject *params, JsonBuilder *b, gchar **err)
 {
-  if(!_dev)
+  if(!_cur)
   {
     *err = g_strdup("no open session");
     return FALSE;
@@ -479,7 +587,7 @@ static gboolean _parse_value(const dt_introspection_field_t *f, JsonNode *v, dou
 
 static gboolean _module_set(JsonObject *params, JsonBuilder *b, gchar **err)
 {
-  if(!_dev)
+  if(!_cur)
   {
     *err = g_strdup("no open session");
     return FALSE;
@@ -521,13 +629,13 @@ static gboolean _module_set(JsonObject *params, JsonBuilder *b, gchar **err)
   {
     memcpy(m->params, p, m->params_size);
     // as in the darkroom: changing a module's setting switches it on
-    dt_dev_add_history_item_ext(_dev, m, TRUE, TRUE);
-    _pipe_changed = TRUE;
-    _dirty = TRUE;
+    dt_dev_add_history_item_ext(_cur->dev, m, TRUE, TRUE);
+    _cur->pipe_changed = TRUE;
+    _cur->dirty = TRUE;
     json_builder_set_member_name(b, "enabled");
     json_builder_add_boolean_value(b, m->enabled);
     json_builder_set_member_name(b, "history_end");
-    json_builder_add_int_value(b, _dev->history_end);
+    json_builder_add_int_value(b, _cur->dev->history_end);
     json_builder_set_member_name(b, "values");
     json_builder_begin_object(b);
     for(GList *n = names; n; n = g_list_next(n))
@@ -544,7 +652,7 @@ static gboolean _module_set(JsonObject *params, JsonBuilder *b, gchar **err)
 
 static gboolean _module_enable(JsonObject *params, JsonBuilder *b, gchar **err)
 {
-  if(!_dev)
+  if(!_cur)
   {
     *err = g_strdup("no open session");
     return FALSE;
@@ -552,29 +660,29 @@ static gboolean _module_enable(JsonObject *params, JsonBuilder *b, gchar **err)
   dt_iop_module_t *m = _find_module(params, err);
   if(!m) return FALSE;
   m->enabled = json_object_get_boolean_member_with_default(params, "enabled", TRUE);
-  dt_dev_add_history_item_ext(_dev, m, FALSE, TRUE);
-  _pipe_changed = TRUE;
-  _dirty = TRUE;
+  dt_dev_add_history_item_ext(_cur->dev, m, FALSE, TRUE);
+  _cur->pipe_changed = TRUE;
+  _cur->dirty = TRUE;
   json_builder_set_member_name(b, "enabled");
   json_builder_add_boolean_value(b, m->enabled);
   json_builder_set_member_name(b, "history_end");
-  json_builder_add_int_value(b, _dev->history_end);
+  json_builder_add_int_value(b, _cur->dev->history_end);
   return TRUE;
 }
 
 static gboolean _history_list(JsonBuilder *b, gchar **err)
 {
-  if(!_dev)
+  if(!_cur)
   {
     *err = g_strdup("no open session");
     return FALSE;
   }
   json_builder_set_member_name(b, "history_end");
-  json_builder_add_int_value(b, _dev->history_end);
+  json_builder_add_int_value(b, _cur->dev->history_end);
   json_builder_set_member_name(b, "items");
   json_builder_begin_array(b);
   int i = 0;
-  for(GList *h = _dev->history; h; h = g_list_next(h), i++)
+  for(GList *h = _cur->dev->history; h; h = g_list_next(h), i++)
   {
     const dt_dev_history_item_t *hi = h->data;
     json_builder_begin_object(b);
@@ -589,7 +697,7 @@ static gboolean _history_list(JsonBuilder *b, gchar **err)
     json_builder_set_member_name(b, "enabled");
     json_builder_add_boolean_value(b, hi->enabled);
     json_builder_set_member_name(b, "applied");
-    json_builder_add_boolean_value(b, i < _dev->history_end);
+    json_builder_add_boolean_value(b, i < _cur->dev->history_end);
     json_builder_end_object(b);
   }
   json_builder_end_array(b);
@@ -600,23 +708,23 @@ static gboolean _history_list(JsonBuilder *b, gchar **err)
 // until the next edit, which drops them
 static gboolean _history_end(JsonObject *params, JsonBuilder *b, gchar **err)
 {
-  if(!_dev)
+  if(!_cur)
   {
     *err = g_strdup("no open session");
     return FALSE;
   }
   const int n = params ? json_object_get_int_member_with_default(params, "end", -1) : -1;
-  const int count = g_list_length(_dev->history);
+  const int count = g_list_length(_cur->dev->history);
   if(n < 0 || n > count)
   {
     *err = g_strdup_printf("end must be 0..%d", count);
     return FALSE;
   }
-  dt_dev_pop_history_items_ext(_dev, n);
-  _pipe_changed = TRUE;
-  _dirty = TRUE;
+  dt_dev_pop_history_items_ext(_cur->dev, n);
+  _cur->pipe_changed = TRUE;
+  _cur->dirty = TRUE;
   json_builder_set_member_name(b, "history_end");
-  json_builder_add_int_value(b, _dev->history_end);
+  json_builder_add_int_value(b, _cur->dev->history_end);
   return TRUE;
 }
 
@@ -626,16 +734,19 @@ static gboolean _history_end(JsonObject *params, JsonBuilder *b, gchar **err)
 // configured with "never" gets none
 static gboolean _save(JsonBuilder *b, gchar **err)
 {
-  if(!_dev)
+  if(!_cur)
   {
     *err = g_strdup("no open session");
     return FALSE;
   }
-  const dt_imgid_t imgid = _dev->image_storage.id;
+  const dt_imgid_t imgid = _cur->dev->image_storage.id;
   const gint64 t0 = g_get_monotonic_time();
-  dt_dev_write_history(_dev);
-  _dirty = FALSE;
-  const gboolean changed = !dt_history_hash_is_mipmap_synced(imgid);
+  // the history hash alone can miss a change: a draft restored after a
+  // release can match the hash of an older thumbnail
+  const gboolean was_dirty = _cur->dirty;
+  dt_dev_write_history(_cur->dev);
+  _cur->dirty = FALSE;
+  const gboolean changed = was_dirty || !dt_history_hash_is_mipmap_synced(imgid);
   if(changed)
   {
     dt_image_cache_set_change_timestamp(imgid);
@@ -647,9 +758,9 @@ static gboolean _save(JsonBuilder *b, gchar **err)
   json_builder_set_member_name(b, "changed");
   json_builder_add_boolean_value(b, changed);
   json_builder_set_member_name(b, "history_end");
-  json_builder_add_int_value(b, _dev->history_end);
+  json_builder_add_int_value(b, _cur->dev->history_end);
   json_builder_set_member_name(b, "history_items");
-  json_builder_add_int_value(b, g_list_length(_dev->history));
+  json_builder_add_int_value(b, g_list_length(_cur->dev->history));
   json_builder_set_member_name(b, "ms");
   json_builder_add_int_value(b, (g_get_monotonic_time() - t0) / 1000);
   return TRUE;
@@ -660,22 +771,25 @@ static gboolean _save(JsonBuilder *b, gchar **err)
 // and the user's auto-apply presets to an image with no history
 static gboolean _reset(JsonBuilder *b, gchar **err)
 {
-  if(!_dev)
+  if(!_cur)
   {
     *err = g_strdup("no open session");
     return FALSE;
   }
-  const dt_imgid_t imgid = _dev->image_storage.id;
-  _session_close();
+  const dt_imgid_t imgid = _cur->dev->image_storage.id;
+  _session_close(_cur);
   dt_history_delete_on_image_ext(imgid, FALSE, TRUE);
-  if(!_session_open(imgid, b, err)) return FALSE;
+  _session_t *s = _session_load(imgid, err);
+  if(!s) return FALSE;
+  _cur = s;
   // the defaults exist only in memory until saved, as when darktable first
   // opens an image; write them so the library and thumbnails agree
-  dt_dev_write_history(_dev);
+  dt_dev_write_history(s->dev);
   dt_image_cache_set_change_timestamp(imgid);
   dt_mipmap_cache_remove(imgid);
   dt_image_write_sidecar_file(imgid);
   dt_history_hash_set_mipmap(imgid);
+  _session_info(b, s);
   return TRUE;
 }
 
@@ -694,25 +808,35 @@ typedef struct _draft_module_t
   void *params;
 } _draft_module_t;
 
+// the unsaved state of one image at release
+typedef struct _draft_t
+{
+  dt_imgid_t imgid;
+  gchar *fingerprint;
+  GList *modules;
+} _draft_t;
+
 static gboolean _released = FALSE;
 static gchar *_library_path = NULL;   // the library file to reopen
-static GList *_draft = NULL;          // unsaved module state at release
-static dt_imgid_t _draft_imgid = NO_IMGID;
-static gchar *_draft_fingerprint = NULL;
+static GList *_drafts = NULL;
 
-static void _draft_free(void)
+static void _draft_free(_draft_t *d)
 {
-  for(GList *l = _draft; l; l = g_list_next(l))
+  for(GList *l = d->modules; l; l = g_list_next(l))
   {
-    _draft_module_t *d = l->data;
-    g_free(d->params);
-    g_free(d);
+    _draft_module_t *m = l->data;
+    g_free(m->params);
+    g_free(m);
   }
-  g_list_free(_draft);
-  _draft = NULL;
-  _draft_imgid = NO_IMGID;
-  g_free(_draft_fingerprint);
-  _draft_fingerprint = NULL;
+  g_list_free(d->modules);
+  g_free(d->fingerprint);
+  g_free(d);
+}
+
+static void _drafts_free(void)
+{
+  g_list_free_full(_drafts, (GDestroyNotify)_draft_free);
+  _drafts = NULL;
 }
 
 // what tells us whether someone else edited the image: its saved history
@@ -761,7 +885,7 @@ static gchar *_data_path(void)
   return p;
 }
 
-static gboolean _library_status(JsonBuilder *b, gchar **err)
+static gboolean _library_status(JsonBuilder *b, const dt_imgid_t current, gchar **err)
 {
   json_builder_set_member_name(b, "state");
   json_builder_add_string_value(b, _released ? "released" : "owned");
@@ -774,15 +898,33 @@ static gboolean _library_status(JsonBuilder *b, gchar **err)
     g_free(data);
     json_builder_set_member_name(b, "holder_pid");
     json_builder_add_int_value(b, pid);
-    json_builder_set_member_name(b, "draft_imgid");
-    json_builder_add_int_value(b, _draft_imgid);
+    json_builder_set_member_name(b, "drafts");
+    json_builder_begin_array(b);
+    for(GList *l = _drafts; l; l = g_list_next(l))
+      json_builder_add_int_value(b, ((_draft_t *)l->data)->imgid);
+    json_builder_end_array(b);
   }
   else
   {
+    // this client's image, and every open session
+    const _session_t *mine = _session_find(current);
     json_builder_set_member_name(b, "open_imgid");
-    json_builder_add_int_value(b, _dev ? _dev->image_storage.id : NO_IMGID);
+    json_builder_add_int_value(b, mine ? current : NO_IMGID);
     json_builder_set_member_name(b, "unsaved");
-    json_builder_add_boolean_value(b, _dev && _dirty);
+    json_builder_add_boolean_value(b, mine && mine->dirty);
+    json_builder_set_member_name(b, "sessions");
+    json_builder_begin_array(b);
+    for(GList *l = _sessions; l; l = g_list_next(l))
+    {
+      const _session_t *s = l->data;
+      json_builder_begin_object(b);
+      json_builder_set_member_name(b, "imgid");
+      json_builder_add_int_value(b, s->dev->image_storage.id);
+      json_builder_set_member_name(b, "unsaved");
+      json_builder_add_boolean_value(b, s->dirty);
+      json_builder_end_object(b);
+    }
+    json_builder_end_array(b);
   }
   return TRUE;
 }
@@ -795,28 +937,36 @@ static gboolean _library_release(JsonBuilder *b, gchar **err)
     return FALSE;
   }
   const gint64 t0 = g_get_monotonic_time();
-  _draft_free();
-  if(_dev && _dirty)
+  _drafts_free();
+  json_builder_set_member_name(b, "closed");
+  json_builder_begin_array(b);
+  for(GList *l = _sessions; l; l = g_list_next(l))
   {
+    const _session_t *s = l->data;
+    const dt_imgid_t imgid = s->dev->image_storage.id;
+    json_builder_add_int_value(b, imgid);
+    if(!s->dirty) continue;
     // keep the unsaved state of every module, to restore it on acquire if
     // nobody changed the image meanwhile
-    _draft_imgid = _dev->image_storage.id;
-    _draft_fingerprint = _fingerprint(_draft_imgid);
-    for(GList *l = _dev->iop; l; l = g_list_next(l))
+    _draft_t *d = g_new0(_draft_t, 1);
+    d->imgid = imgid;
+    d->fingerprint = _fingerprint(imgid);
+    for(GList *m = s->dev->iop; m; m = g_list_next(m))
     {
-      const dt_iop_module_t *m = l->data;
-      _draft_module_t *d = g_new0(_draft_module_t, 1);
-      g_strlcpy(d->op, m->op, sizeof(d->op));
-      d->multi_priority = m->multi_priority;
-      d->enabled = m->enabled;
-      d->params_size = m->params_size;
-      d->params = g_malloc(m->params_size);
-      memcpy(d->params, m->params, m->params_size);
-      _draft = g_list_prepend(_draft, d);
+      const dt_iop_module_t *mod = m->data;
+      _draft_module_t *dm = g_new0(_draft_module_t, 1);
+      g_strlcpy(dm->op, mod->op, sizeof(dm->op));
+      dm->multi_priority = mod->multi_priority;
+      dm->enabled = mod->enabled;
+      dm->params_size = mod->params_size;
+      dm->params = g_malloc(mod->params_size);
+      memcpy(dm->params, mod->params, mod->params_size);
+      d->modules = g_list_prepend(d->modules, dm);
     }
+    _drafts = g_list_append(_drafts, d);
   }
-  const dt_imgid_t was_open = _dev ? _dev->image_storage.id : NO_IMGID;
-  _session_close();
+  json_builder_end_array(b);
+  _session_close_all();
 
   // as dt_cleanup does: the caches first (the mipmap cache writes its
   // thumbnails to disk), then the database, which removes the lock files
@@ -831,10 +981,8 @@ static gboolean _library_release(JsonBuilder *b, gchar **err)
 
   json_builder_set_member_name(b, "state");
   json_builder_add_string_value(b, "released");
-  json_builder_set_member_name(b, "closed_imgid");
-  json_builder_add_int_value(b, was_open);
-  json_builder_set_member_name(b, "draft_kept");
-  json_builder_add_boolean_value(b, _draft != NULL);
+  json_builder_set_member_name(b, "drafts_kept");
+  json_builder_add_int_value(b, g_list_length(_drafts));
   json_builder_set_member_name(b, "ms");
   json_builder_add_int_value(b, (g_get_monotonic_time() - t0) / 1000);
   return TRUE;
@@ -874,45 +1022,56 @@ static gboolean _library_acquire(JsonBuilder *b, gchar **err)
 
   json_builder_set_member_name(b, "state");
   json_builder_add_string_value(b, "owned");
-  if(dt_is_valid_imgid(_draft_imgid) && _image_exists(_draft_imgid))
+  json_builder_set_member_name(b, "drafts");
+  json_builder_begin_array(b);
+  for(GList *l = _drafts; l; l = g_list_next(l))
   {
-    gchar *fp = _fingerprint(_draft_imgid);
-    const gboolean unchanged = !g_strcmp0(fp, _draft_fingerprint);
-    g_free(fp);
-    gchar *open_err = NULL;
-    JsonBuilder *ob = json_builder_new();
-    json_builder_begin_object(ob);
-    const gboolean opened = _session_open(_draft_imgid, ob, &open_err);
-    json_builder_end_object(ob);
-    g_object_unref(ob);
+    const _draft_t *d = l->data;
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "imgid");
+    json_builder_add_int_value(b, d->imgid);
+    const char *what;
     int restored = 0;
-    if(opened && unchanged)
+    if(!_image_exists(d->imgid))
+      what = "dropped: the image was removed while released";
+    else
     {
-      for(GList *l = _draft; l; l = g_list_next(l))
+      gchar *fp = _fingerprint(d->imgid);
+      const gboolean unchanged = !g_strcmp0(fp, d->fingerprint);
+      g_free(fp);
+      gchar *open_err = NULL;
+      _session_t *s = unchanged ? _session_load(d->imgid, &open_err) : NULL;
+      if(!unchanged)
+        what = "dropped: the image was changed while released";
+      else if(!s)
+        what = "dropped: the image could not be opened";
+      else
       {
-        const _draft_module_t *d = l->data;
-        dt_iop_module_t *m = dt_iop_get_module_by_op_priority(_dev->iop, d->op, d->multi_priority);
-        if(!m || m->params_size != d->params_size) continue;
-        if(m->enabled == d->enabled && !memcmp(m->params, d->params, d->params_size)) continue;
-        memcpy(m->params, d->params, d->params_size);
-        m->enabled = d->enabled;
-        dt_dev_add_history_item_ext(_dev, m, FALSE, TRUE);
-        restored++;
+        for(GList *m = d->modules; m; m = g_list_next(m))
+        {
+          const _draft_module_t *dm = m->data;
+          dt_iop_module_t *mod = dt_iop_get_module_by_op_priority(s->dev->iop, dm->op, dm->multi_priority);
+          if(!mod || mod->params_size != dm->params_size) continue;
+          if(mod->enabled == dm->enabled && !memcmp(mod->params, dm->params, dm->params_size)) continue;
+          memcpy(mod->params, dm->params, dm->params_size);
+          mod->enabled = dm->enabled;
+          dt_dev_add_history_item_ext(s->dev, mod, FALSE, TRUE);
+          restored++;
+        }
+        s->dirty = restored > 0;
+        s->pipe_changed = TRUE;
+        what = "restored";
       }
-      _dirty = restored > 0;
-      _pipe_changed = TRUE;
+      g_free(open_err);
     }
-    json_builder_set_member_name(b, "draft_imgid");
-    json_builder_add_int_value(b, _draft_imgid);
     json_builder_set_member_name(b, "draft");
-    json_builder_add_string_value(b, !opened ? "image could not be opened"
-                                     : unchanged ? "restored"
-                                     : "dropped: the image was changed while released");
+    json_builder_add_string_value(b, what);
     json_builder_set_member_name(b, "modules_restored");
     json_builder_add_int_value(b, restored);
-    g_free(open_err);
+    json_builder_end_object(b);
   }
-  _draft_free();
+  json_builder_end_array(b);
+  _drafts_free();
   json_builder_set_member_name(b, "ms");
   json_builder_add_int_value(b, (g_get_monotonic_time() - t0) / 1000);
   return TRUE;
@@ -1197,7 +1356,7 @@ static gboolean _set_label(JsonObject *params, JsonBuilder *b, gchar **err)
 
 static gboolean _render(JsonObject *params, JsonBuilder *b, gchar **err)
 {
-  if(!_dev)
+  if(!_cur)
   {
     *err = g_strdup("no open session");
     return FALSE;
@@ -1213,33 +1372,33 @@ static gboolean _render(JsonObject *params, JsonBuilder *b, gchar **err)
   }
 
   const gint64 t0 = g_get_monotonic_time();
-  if(_pipe_changed)
+  if(_cur->pipe_changed)
   {
     // parameters changed or modules switched: syncing the nodes is enough,
     // and the cache keeps every line whose inputs are unchanged
-    dt_dev_pixelpipe_synch_all(&_pipe, _dev);
-    dt_dev_pixelpipe_get_dimensions(&_pipe, _dev, _pipe.iwidth, _pipe.iheight,
-                                    &_pipe.processed_width, &_pipe.processed_height);
-    _pipe_changed = FALSE;
+    dt_dev_pixelpipe_synch_all(&_cur->pipe, _cur->dev);
+    dt_dev_pixelpipe_get_dimensions(&_cur->pipe, _cur->dev, _cur->pipe.iwidth, _cur->pipe.iheight,
+                                    &_cur->pipe.processed_width, &_cur->pipe.processed_height);
+    _cur->pipe_changed = FALSE;
   }
-  const double scale = fmin(1.0, fmin((double)max_w / _pipe.processed_width,
-                                      (double)max_h / _pipe.processed_height));
-  const int w = floor(scale * _pipe.processed_width);
-  const int h = floor(scale * _pipe.processed_height);
+  const double scale = fmin(1.0, fmin((double)max_w / _cur->pipe.processed_width,
+                                      (double)max_h / _cur->pipe.processed_height));
+  const int w = floor(scale * _cur->pipe.processed_width);
+  const int h = floor(scale * _cur->pipe.processed_height);
 
   // as a non-hq export does: downscale right after demosaic, not in finalscale
   dt_dev_pixelpipe_iop_t *finalscale = NULL;
-  for(GList *n = g_list_last(_pipe.nodes); n; n = g_list_previous(n))
+  for(GList *n = g_list_last(_cur->pipe.nodes); n; n = g_list_previous(n))
   {
     dt_dev_pixelpipe_iop_t *piece = n->data;
     if(dt_iop_module_is_finalscale(piece->module)) { finalscale = piece; break; }
   }
   if(finalscale) finalscale->enabled = FALSE;
-  dt_dev_pixelpipe_process(&_pipe, _dev, 0, 0, w, h, scale, DT_DEVICE_NONE);
+  dt_dev_pixelpipe_process(&_cur->pipe, _cur->dev, 0, 0, w, h, scale, DT_DEVICE_NONE);
   if(finalscale) finalscale->enabled = TRUE;
   const gint64 t1 = g_get_monotonic_time();
 
-  if(!_pipe.backbuf || _pipe.backbuf_width != w || _pipe.backbuf_height != h)
+  if(!_cur->pipe.backbuf || _cur->pipe.backbuf_width != w || _cur->pipe.backbuf_height != h)
   {
     *err = g_strdup("the pipe produced no output");
     return FALSE;
@@ -1247,7 +1406,7 @@ static gboolean _render(JsonObject *params, JsonBuilder *b, gchar **err)
   // backbuf is a cache line in display byte order (BGRA): convert a copy
   const size_t npix = (size_t)w * h;
   uint8_t *rgba = g_malloc(npix * 4);
-  const uint8_t *src = _pipe.backbuf;
+  const uint8_t *src = _cur->pipe.backbuf;
   for(size_t k = 0; k < npix; k++)
   {
     rgba[4 * k + 0] = src[4 * k + 2];
@@ -1280,7 +1439,74 @@ static void _on_signal(int sig)
   _stop = 1;
 }
 
-static void _reply(FILE *out, JsonNode *id, JsonNode *result, const gchar *err)
+// ---- clients ------------------------------------------------------------
+// stdin/stdout is one client; with --listen, every connection to the unix
+// socket is one. requests are handled one at a time, in arrival order
+
+typedef struct _client_t
+{
+  int id;
+  int in_fd, out_fd;
+  GString *inbuf;
+  dt_imgid_t current;               // the image this client last opened
+  gboolean dead;
+} _client_t;
+
+static GList *_clients = NULL;
+static int _next_client_id = 1;
+
+static _client_t *_client_new(const int in_fd, const int out_fd)
+{
+  _client_t *c = g_new0(_client_t, 1);
+  c->id = _next_client_id++;
+  c->in_fd = in_fd;
+  c->out_fd = out_fd;
+  c->inbuf = g_string_new(NULL);
+  c->current = NO_IMGID;
+  _clients = g_list_append(_clients, c);
+  return c;
+}
+
+static void _client_free(_client_t *c)
+{
+  _clients = g_list_remove(_clients, c);
+  if(c->in_fd > STDERR_FILENO) close(c->in_fd);
+  if(c->out_fd != c->in_fd && c->out_fd > STDERR_FILENO) close(c->out_fd);
+  g_string_free(c->inbuf, TRUE);
+  g_free(c);
+}
+
+static void _send_line(_client_t *c, const gchar *s)
+{
+  if(c->dead) return;
+  const size_t n = strlen(s);
+  gchar *line = g_strconcat(s, "\n", NULL);
+  size_t done = 0;
+  while(done < n + 1)
+  {
+    const ssize_t w = write(c->out_fd, line + done, n + 1 - done);
+    if(w < 0 && errno == EINTR) continue;
+    if(w <= 0)
+    {
+      c->dead = TRUE;  // gone (EPIPE); dropped by the main loop
+      break;
+    }
+    done += w;
+  }
+  g_free(line);
+}
+
+static void _send_node(_client_t *c, JsonNode *root)
+{
+  JsonGenerator *g = json_generator_new();
+  json_generator_set_root(g, root);
+  gchar *s = json_generator_to_data(g, NULL);
+  _send_line(c, s);
+  g_free(s);
+  g_object_unref(g);
+}
+
+static void _reply(_client_t *c, JsonNode *id, JsonNode *result, const gchar *err)
 {
   JsonBuilder *b = json_builder_new();
   json_builder_begin_object(b);
@@ -1305,26 +1531,62 @@ static void _reply(FILE *out, JsonNode *id, JsonNode *result, const gchar *err)
     json_builder_add_value(b, result);
   }
   json_builder_end_object(b);
-  JsonGenerator *g = json_generator_new();
   JsonNode *root = json_builder_get_root(b);
-  json_generator_set_root(g, root);
-  gchar *s = json_generator_to_data(g, NULL);
-  fprintf(out, "%s\n", s);
-  fflush(out);
-  g_free(s);
+  _send_node(c, root);
   json_node_unref(root);
-  g_object_unref(g);
   g_object_unref(b);
 }
 
-// returns FALSE when the loop should stop
-static gboolean _handle(const gchar *line, FILE *out)
+// tell the other clients what changed: a JSON-RPC notification
+// {"method": "event", "params": {"type", "imgid", "history_end", "client"}}
+static void _notify(const _client_t *from, const char *type, const dt_imgid_t imgid)
+{
+  if(!_clients || !_clients->next) return;
+  const _session_t *s = dt_is_valid_imgid(imgid) && !_released ? _session_find(imgid) : NULL;
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "jsonrpc");
+  json_builder_add_string_value(b, "2.0");
+  json_builder_set_member_name(b, "method");
+  json_builder_add_string_value(b, "event");
+  json_builder_set_member_name(b, "params");
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "type");
+  json_builder_add_string_value(b, type);
+  json_builder_set_member_name(b, "imgid");
+  json_builder_add_int_value(b, imgid);
+  if(s)
+  {
+    json_builder_set_member_name(b, "history_end");
+    json_builder_add_int_value(b, s->dev->history_end);
+    json_builder_set_member_name(b, "unsaved");
+    json_builder_add_boolean_value(b, s->dirty);
+  }
+  json_builder_set_member_name(b, "client");
+  json_builder_add_int_value(b, from->id);
+  json_builder_end_object(b);
+  json_builder_end_object(b);
+  JsonNode *root = json_builder_get_root(b);
+  for(GList *l = _clients; l; l = g_list_next(l))
+    if(l->data != from) _send_node(l->data, root);
+  json_node_unref(root);
+  g_object_unref(b);
+}
+
+// methods that work on an edit session, and the event each one sends
+static const struct { const char *method; const char *event; } _session_methods[] = {
+  { "module_list", NULL }, { "module_get", NULL }, { "history_list", NULL }, { "render", NULL },
+  { "module_set", "edit" }, { "module_enable", "edit" }, { "history_end", "edit" },
+  { "save", "saved" }, { "reset", "reset" }, { "session_close", "closed" }, { NULL, NULL } };
+
+// returns FALSE when the engine should stop
+static gboolean _handle(_client_t *c, const gchar *line)
 {
   JsonParser *p = json_parser_new();
   if(!json_parser_load_from_data(p, line, -1, NULL)
      || !JSON_NODE_HOLDS_OBJECT(json_parser_get_root(p)))
   {
-    _reply(out, NULL, NULL, "parse error");
+    _reply(c, NULL, NULL, "parse error");
     g_object_unref(p);
     return TRUE;
   }
@@ -1339,14 +1601,41 @@ static gboolean _handle(const gchar *line, FILE *out)
   json_builder_begin_object(b);
   gchar *err = NULL;
   gboolean go_on = TRUE;
+  const char *event = NULL;
+  dt_imgid_t event_img = NO_IMGID;
 
-  if(_released && g_strcmp0(method, "ping") && g_strcmp0(method, "library_status")
+  // a session method works on params.imgid, else on the client's image
+  gboolean session_method = FALSE;
+  for(int i = 0; _session_methods[i].method; i++)
+    if(!g_strcmp0(method, _session_methods[i].method))
+    {
+      session_method = TRUE;
+      event = _session_methods[i].event;
+    }
+  _cur = NULL;
+  if(session_method && !_released)
+  {
+    const dt_imgid_t imgid = params && json_object_has_member(params, "imgid")
+      ? json_object_get_int_member(params, "imgid") : c->current;
+    _cur = _session_find(imgid);
+    if(_cur)
+      _cur->last_use = g_get_monotonic_time();
+    else if(dt_is_valid_imgid(imgid))
+      err = g_strdup_printf("image %d is not open: call session_open first", imgid);
+    event_img = imgid;
+  }
+
+  if(err)
+    ;
+  else if(_released && g_strcmp0(method, "ping") && g_strcmp0(method, "library_status")
      && g_strcmp0(method, "library_acquire") && g_strcmp0(method, "shutdown"))
     err = g_strdup("the library is released: call library_acquire first");
   else if(!g_strcmp0(method, "ping"))
   {
     json_builder_set_member_name(b, "version");
     json_builder_add_string_value(b, darktable_package_version);
+    json_builder_set_member_name(b, "client");
+    json_builder_add_int_value(b, c->id);
   }
   else if(!g_strcmp0(method, "film_rolls"))
     _film_rolls(b, &err);
@@ -1356,20 +1645,34 @@ static gboolean _handle(const gchar *line, FILE *out)
     _image_info(params, b, &err);
   else if(!g_strcmp0(method, "thumbnail"))
     _thumbnail(params, b, &err);
-  else if(!g_strcmp0(method, "set_rating"))
-    _set_rating(params, b, &err);
-  else if(!g_strcmp0(method, "set_label"))
-    _set_label(params, b, &err);
+  else if(!g_strcmp0(method, "set_rating") || !g_strcmp0(method, "set_label"))
+  {
+    if(!g_strcmp0(method, "set_rating") ? _set_rating(params, b, &err) : _set_label(params, b, &err))
+    {
+      event = "image";
+      event_img = json_object_get_int_member_with_default(params, "imgid", NO_IMGID);
+    }
+  }
   else if(!g_strcmp0(method, "session_open"))
   {
     const dt_imgid_t imgid = params ? json_object_get_int_member_with_default(params, "imgid", -1) : -1;
-    _session_open(imgid, b, &err);
+    const gboolean fresh = params ? json_object_get_boolean_member_with_default(params, "fresh", FALSE) : FALSE;
+    const gboolean had = _session_find(imgid) != NULL;
+    if(_session_open(imgid, fresh, b, &err))
+    {
+      c->current = imgid;
+      if(fresh && had)
+      {
+        event = "reopened";  // unsaved changes dropped for everyone
+        event_img = imgid;
+      }
+    }
   }
   else if(!g_strcmp0(method, "session_close"))
   {
     json_builder_set_member_name(b, "closed");
-    json_builder_add_boolean_value(b, _dev != NULL);
-    _session_close();
+    json_builder_add_boolean_value(b, _cur != NULL);
+    _session_close(_cur);
   }
   else if(!g_strcmp0(method, "module_list"))
     _module_list(b, &err);
@@ -1386,30 +1689,97 @@ static gboolean _handle(const gchar *line, FILE *out)
   else if(!g_strcmp0(method, "save"))
     _save(b, &err);
   else if(!g_strcmp0(method, "library_status"))
-    _library_status(b, &err);
-  else if(!g_strcmp0(method, "library_release"))
-    _library_release(b, &err);
-  else if(!g_strcmp0(method, "library_acquire"))
-    _library_acquire(b, &err);
+    _library_status(b, c->current, &err);
+  else if(!g_strcmp0(method, "library_release") || !g_strcmp0(method, "library_acquire"))
+  {
+    if(!g_strcmp0(method, "library_release") ? _library_release(b, &err) : _library_acquire(b, &err))
+      event = !g_strcmp0(method, "library_release") ? "library_released" : "library_acquired";
+  }
   else if(!g_strcmp0(method, "reset"))
     _reset(b, &err);
   else if(!g_strcmp0(method, "render"))
     _render(params, b, &err);
   else if(!g_strcmp0(method, "shutdown"))
-  {
-    _session_close();
     go_on = FALSE;
-  }
   else
     err = g_strdup_printf("unknown method '%s'", method);
 
   json_builder_end_object(b);
   // notifications (no id) get no reply
-  if(id) _reply(out, id, json_builder_get_root(b), err);
+  if(id) _reply(c, id, json_builder_get_root(b), err);
+  if(!err && event) _notify(c, event, event_img);
   g_free(err);
   g_object_unref(b);
   g_object_unref(p);
+  _cur = NULL;
   return go_on;
+}
+
+// read what a client sent and handle every complete line. FALSE: stop
+static gboolean _client_read(_client_t *c)
+{
+  char buf[65536];
+  const ssize_t n = read(c->in_fd, buf, sizeof(buf));
+  if(n < 0 && errno == EINTR) return TRUE;
+  if(n <= 0)
+  {
+    c->dead = TRUE;
+    return TRUE;
+  }
+  g_string_append_len(c->inbuf, buf, n);
+  gchar *nl;
+  while(!c->dead && (nl = memchr(c->inbuf->str, '\n', c->inbuf->len)))
+  {
+    gchar *line = g_strndup(c->inbuf->str, nl - c->inbuf->str);
+    g_string_erase(c->inbuf, 0, nl - c->inbuf->str + 1);
+    g_strstrip(line);
+    const gboolean go_on = !*line || _handle(c, line);
+    g_free(line);
+    if(!go_on) return FALSE;
+  }
+  return TRUE;
+}
+
+static gboolean _any_unsaved(void)
+{
+  for(GList *l = _sessions; l; l = g_list_next(l))
+    if(((_session_t *)l->data)->dirty) return TRUE;
+  return FALSE;
+}
+
+// a unix socket only this user can use. refuses if another engine already
+// listens on it; removes a stale one left by a crash
+static int _listen_on(const char *path)
+{
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  if(strlen(path) >= sizeof(addr.sun_path))
+  {
+    fprintf(stderr, "darktable-api: socket path too long: %s\n", path);
+    return -1;
+  }
+  g_strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
+  const int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+  if(probe >= 0 && connect(probe, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+  {
+    close(probe);
+    fprintf(stderr, "darktable-api: another engine is listening on %s\n", path);
+    return -1;
+  }
+  if(probe >= 0) close(probe);
+  g_unlink(path);
+  const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  const mode_t old = umask(0077);
+  const int bound = fd >= 0 ? bind(fd, (struct sockaddr *)&addr, sizeof(addr)) : -1;
+  umask(old);
+  if(bound != 0 || listen(fd, 16) != 0)
+  {
+    fprintf(stderr, "darktable-api: cannot listen on %s: %s\n", path, strerror(errno));
+    if(fd >= 0) close(fd);
+    return -1;
+  }
+  return fd;
 }
 
 int main(int argc, char **argv)
@@ -1421,9 +1791,19 @@ int main(int argc, char **argv)
   bind_textdomain_codeset(GETTEXT_PACKAGE, "UTF-8");
   textdomain(GETTEXT_PACKAGE);
 
+  // our options come before --core; everything after it goes to dt_init
+  const char *listen_path = NULL;
+  int idle_exit_s = 0;
   int core_start = argc;
   for(int i = 1; i < argc; i++)
+  {
     if(!g_strcmp0(argv[i], "--core")) { core_start = i + 1; break; }
+    else if(!g_strcmp0(argv[i], "--listen") && i + 1 < argc) listen_path = argv[++i];
+    else if(!g_strcmp0(argv[i], "--max-sessions") && i + 1 < argc) _max_sessions = atoi(argv[++i]);
+    else if(!g_strcmp0(argv[i], "--idle-exit") && i + 1 < argc) idle_exit_s = atoi(argv[++i]);
+  }
+  _max_sessions = MAX(_max_sessions, 1);
+  idle_exit_s = MAX(idle_exit_s, 0);
   gboolean has_configdir = FALSE;
   for(int i = core_start; i < argc; i++)
     if(!g_strcmp0(argv[i], "--configdir") || !g_strcmp0(argv[i], "--library"))
@@ -1431,7 +1811,8 @@ int main(int argc, char **argv)
   // never fall back to the user's real ~/.config/darktable by accident
   if(!has_configdir)
   {
-    fprintf(stderr, "usage: darktable-api --core --configdir <dir> [darktable options]\n");
+    fprintf(stderr, "usage: darktable-api [--listen <socket>] [--max-sessions <n>]"
+                    " [--idle-exit <seconds>] --core --configdir <dir> [darktable options]\n");
     return 1;
   }
 
@@ -1441,45 +1822,111 @@ int main(int argc, char **argv)
 
   // libdarktable prints to stdout in places: keep the real stdout for replies
   fflush(stdout);
-  FILE *out = fdopen(dup(STDOUT_FILENO), "w");
+  const int out_fd = dup(STDOUT_FILENO);
   dup2(STDERR_FILENO, STDOUT_FILENO);
+
+  int listen_fd = -1;
+  if(listen_path && (listen_fd = _listen_on(listen_path)) < 0) return 1;
 
   if(dt_init(m->len, (char **)m->pdata, FALSE, TRUE, NULL))
   {
     fprintf(stderr, "darktable-api: dt_init failed\n");
+    if(listen_path) g_unlink(listen_path);
     g_ptr_array_free(m, TRUE);
     return 1;
   }
 
-  // stop like a shutdown request on SIGTERM/SIGINT (launchd, the web app
-  // restarting): no SA_RESTART, so the blocked read returns
+  // stop like a shutdown request on SIGTERM/SIGINT (launchd, a restart): no
+  // SA_RESTART, so poll returns. a client that went away must not kill us
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
   sa.sa_handler = _on_signal;
   sigaction(SIGTERM, &sa, NULL);
   sigaction(SIGINT, &sa, NULL);
+  signal(SIGPIPE, SIG_IGN);
 
-  gchar *line = NULL;
-  size_t cap = 0;
-  ssize_t n;
-  while(!_stop && (n = getline(&line, &cap, stdin)) > 0)
+  if(listen_fd < 0)
+    _client_new(STDIN_FILENO, out_fd);
+  else
+    fprintf(stderr, "darktable-api: listening on %s\n", listen_path);
+
+  gint64 last_activity = g_get_monotonic_time();
+  gboolean go_on = TRUE;
+  while(go_on && !_stop)
   {
-    g_strstrip(line);
-    if(!*line) continue;
-    if(!_handle(line, out)) break;
-  }
-  free(line);
+    const int nfds = g_list_length(_clients) + (listen_fd >= 0);
+    struct pollfd *fds = g_new0(struct pollfd, MAX(nfds, 1));
+    int k = 0;
+    if(listen_fd >= 0)
+    {
+      fds[k].fd = listen_fd;
+      fds[k++].events = POLLIN;
+    }
+    for(GList *l = _clients; l; l = g_list_next(l))
+    {
+      fds[k].fd = ((_client_t *)l->data)->in_fd;
+      fds[k++].events = POLLIN;
+    }
+    const int ready = poll(fds, k, 1000);
+    if(ready > 0)
+    {
+      last_activity = g_get_monotonic_time();
+      k = 0;
+      if(listen_fd >= 0 && (fds[k++].revents & POLLIN))
+      {
+        const int cfd = accept(listen_fd, NULL, NULL);
+        if(cfd >= 0) _client_new(cfd, cfd);
+      }
+      // the list may change while handling (new clients); go by fd
+      for(; k < nfds && go_on; k++)
+      {
+        if(!(fds[k].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+        for(GList *l = _clients; l; l = g_list_next(l))
+        {
+          _client_t *c = l->data;
+          if(c->in_fd == fds[k].fd && !c->dead)
+          {
+            go_on = _client_read(c);
+            break;
+          }
+        }
+      }
+    }
+    g_free(fds);
 
-  _session_close();
+    // drop clients that went away; on stdin/stdout that ends the engine
+    for(GList *l = _clients; l;)
+    {
+      GList *next = g_list_next(l);
+      _client_t *c = l->data;
+      if(c->dead)
+      {
+        if(listen_fd < 0) go_on = FALSE;
+        _client_free(c);
+      }
+      l = next;
+    }
+    // with --idle-exit: stop when nobody is connected, nothing is unsaved
+    // and nothing happened for that long
+    if(listen_fd >= 0 && idle_exit_s && !_clients && !_any_unsaved()
+       && g_get_monotonic_time() - last_activity > (gint64)idle_exit_s * G_USEC_PER_SEC)
+      go_on = FALSE;
+  }
+
+  while(_clients) _client_free(_clients->data);
+  if(listen_fd >= 0)
+  {
+    close(listen_fd);
+    g_unlink(listen_path);
+  }
+  _session_close_all();
   if(_released)
   {
     // dt_cleanup would tear down the closed database and caches again;
     // there's nothing left to save
-    fflush(out);
     _exit(0);
   }
   dt_cleanup();
-  fflush(out);
   g_ptr_array_free(m, TRUE);
   return 0;
 }

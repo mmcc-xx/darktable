@@ -30,7 +30,27 @@ Build darktable as usual with the MCP server enabled (`-DUSE_MCP=ON`, or
 
 ## Run
 
-    darktable-api --core --configdir <dir> [--cachedir <dir>] [darktable options]
+    darktable-api [--listen <socket>] [--max-sessions <n>] [--idle-exit <seconds>] \
+                  --core --configdir <dir> [--cachedir <dir>] [darktable options]
+
+Without `--listen` it serves one client on stdin/stdout (the client starts
+it as a child process). With `--listen` it serves every client connecting to
+the unix socket (created with mode 0700, so only your user can connect), and
+several front ends share one library: a web app and an MCP server, for
+example. The example clients below start it this way when nobody has.
+
+- **Shared edit sessions:** sessions belong to the engine, one per open image
+  (at most `--max-sessions`, default 3; each holds a full-size raw and a
+  pipe cache, about 0.4-0.7 GB). Two clients that open the same photo edit
+  the same session, unsaved changes included. To make room the engine closes
+  the least recently used session *without* unsaved changes; it refuses to
+  open another image rather than drop someone's unsaved edit.
+- **Notifications:** every change is announced to the other clients:
+  `{"jsonrpc":"2.0","method":"event","params":{"type","imgid","history_end","unsaved","client"}}`
+  with `type` one of `edit`, `saved`, `reset`, `reopened`, `closed`,
+  `image` (rating or label), `library_released`, `library_acquired`.
+- `--idle-exit` stops the engine that many seconds after the last client
+  disconnected, unless an image has unsaved changes.
 
 It refuses to start without `--configdir` (or `--library`), so it can't open
 your default library by accident. For a copy: create a directory, copy
@@ -50,6 +70,11 @@ JSON-RPC 2.0, one request per line on stdin, one reply per line on stdout:
     {"jsonrpc":"2.0","id":2,"method":"module_set","params":{"operation":"exposure","values":{"exposure":0.5}}}
     {"jsonrpc":"2.0","id":3,"method":"render","params":{"width":1200,"height":1200,"path":"/tmp/p.jpg"}}
 
+Session methods (`module_*`, `history_*`, `save`, `reset`, `render`,
+`session_close`) take an optional `imgid`; without it they work on the image
+the client last opened. Errors are JSON-RPC errors (code -32000) with a
+message.
+
 | method | does |
 |---|---|
 | `ping` | version |
@@ -58,7 +83,7 @@ JSON-RPC 2.0, one request per line on stdin, one reply per line on stdout:
 | `image_info {imgid}` | one image, as in `images_list` |
 | `thumbnail {imgid, size, path, quality}` | JPEG from darktable's thumbnail (mipmap) cache, rendered with the current edit if not cached |
 | `set_rating {imgid, rating}` / `set_label {imgid, label, on}` | 0..5 or `"reject"` (as the lighttable); color label 0..4 (red, yellow, green, blue, purple) |
-| `session_open {imgid}` / `session_close` | load a photo and replay its history, as the darkroom does (one open photo at a time) |
+| `session_open {imgid, fresh}` / `session_close` | open a photo for editing: load it and replay its history, as the darkroom does, or join the session another client has open (`joined`, `unsaved` in the reply); `fresh` reloads it as saved, dropping unsaved changes for everyone. `session_close` closes it for everyone |
 | `module_list` | the photo's modules in pipe order: enabled, in history |
 | `module_get {operation, instance}` | settings by name through introspection: value, default, declared range, enum names and labels |
 | `module_set {operation, instance, values}` | change settings by name, all or none; range-checked; enums by name, label or number; switches the module on and adds a history item (consecutive edits of one module merge, as in the darkroom) |
@@ -67,7 +92,7 @@ JSON-RPC 2.0, one request per line on stdin, one reply per line on stdout:
 | `save` | write the history to the library (and the sidecar, if `write_sidecar_files` asks for it), as leaving the darkroom does |
 | `reset` | discard the history and reload, so darktable applies the workflow defaults and auto-apply presets again |
 | `render {width, height, path, quality}` | sRGB JPEG fitted inside width x height |
-| `library_status` / `library_release` / `library_acquire` | hand the library to darktable's GUI and take it back while running; unsaved edits are kept and restored if the photo wasn't changed meanwhile |
+| `library_status` / `library_release` / `library_acquire` | hand the library to darktable's GUI and take it back while running; unsaved edits of every open photo are kept and restored if the photo wasn't changed meanwhile |
 | `shutdown` | close and exit (SIGTERM does the same) |
 
 ## Measured (Apple M1, CPU only, 20 MP raw with a 22-step edit)
@@ -91,4 +116,4 @@ about 1/255 (mean absolute difference).
   other operations whose logic lives in GUI code
 - array fields (e.g. channel mixer coefficients), masks, module instances
   and order, styles, export, tags and metadata, import
-- one open photo per process
+- `shutdown` stops the engine for every client

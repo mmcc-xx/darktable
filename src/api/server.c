@@ -1009,6 +1009,46 @@ static void _record(dt_iop_module_t *m, const gboolean enable)
   }
 }
 
+static JsonNode *_changed_settings(const dt_iop_module_t *m, const void *before);
+
+// the darkroom control a setting is bound to (dt_bauhaus_*_from_params)
+static GtkWidget *_field_widget(dt_iop_module_t *m, const dt_introspection_field_t *f)
+{
+  const void *field = (const uint8_t *)m->params + f->header.offset;
+  for(GSList *l = m->widget_list; l; l = g_slist_next(l))
+  {
+    const dt_action_target_t *ref = l->data;
+    if(ref && DT_IS_BAUHAUS_WIDGET(ref->target) && dt_bauhaus_widget_get_field(ref->target) == field)
+      return ref->target;
+  }
+  return NULL;
+}
+
+// as moving a control in the darkroom: the module's gui_changed runs for
+// each setting changed that has one, with its previous value, and may
+// adjust other settings (exposure leaves its automatic mode, agx moves its
+// pivot, ...). in darktable's window only: headless there is no module
+// window code to run
+static void _run_gui_changed(dt_iop_module_t *m, const void *old, GList *names)
+{
+  if(!_cur->gui || !m->gui_changed || !m->gui_data) return;
+  _api_editing = TRUE;
+  // the controls show the new values first, as after a slider move
+  DT_ENTER_GUI_UPDATE();
+  dt_iop_gui_update(m);
+  DT_LEAVE_GUI_UPDATE();
+  for(GList *n = names; n; n = g_list_next(n))
+  {
+    const dt_introspection_field_t *f = _field(m, n->data);
+    if(!f) continue;
+    const size_t off = f->header.offset;
+    if(!memcmp((const uint8_t *)old + off, (const uint8_t *)m->params + off, f->header.size)) continue;
+    GtkWidget *w = _field_widget(m, f);
+    if(w) m->gui_changed(m, w, (void *)((const uint8_t *)old + off));
+  }
+  _api_editing = FALSE;
+}
+
 static gboolean _module_set(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
@@ -1066,9 +1106,22 @@ static gboolean _module_set(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   if(ok)
   {
+    void *old = g_malloc(m->params_size);
+    memcpy(old, m->params, m->params_size);
     memcpy(m->params, p, m->params_size);
+    _run_gui_changed(m, old, names);
+    g_free(old);
     // as in the darkroom: changing a module's setting switches it on
     _record(m, TRUE);
+    // what darktable set alongside (_run_gui_changed)
+    JsonNode *also = _changed_settings(m, p);
+    JsonObject *ch = json_object_get_object_member(json_node_get_object(also), "changed");
+    if(json_object_get_size(ch))
+    {
+      json_builder_set_member_name(b, "darktable_also_changed");
+      json_builder_add_value(b, json_node_copy(json_object_get_member(json_node_get_object(also), "changed")));
+    }
+    json_node_unref(also);
     json_builder_set_member_name(b, "enabled");
     json_builder_add_boolean_value(b, m->enabled);
     json_builder_set_member_name(b, "history_end");

@@ -5588,6 +5588,11 @@ static void _path_modify_property(dt_masks_form_t *const form,
 }
 
 // The function table for paths.  This must be public, i.e. no "static" keyword.
+void dt_masks_path_init_ctrl_points(dt_masks_form_t *form)
+{
+  _path_init_ctrl_points(form);
+}
+
 const dt_masks_functions_t dt_masks_functions_path = {
   .point_struct_size = sizeof(struct dt_masks_point_path_t),
   .sanitize_config = _path_sanitize_config,

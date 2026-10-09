@@ -115,6 +115,11 @@
      mask_add {operation, instance, shape, combine, inverted}
                                  -> a drawn shape (circle, ellipse, gradient,
                                     raw space) on a module's mask
+     mask_ai {operation, instance, points: [{x, y, include}], combine,
+              inverted}
+                                 -> an AI object mask (SAM) around points on
+                                    the photo, traced into path shapes on the
+                                    module's mask (needs USE_AI, AI on)
      mask_list / mask_remove {operation, instance, formid}
                                  -> the module's shapes; take one out
      sample {width, height, zoom, center_x, center_y, uncropped, points,
@@ -219,6 +224,11 @@
 #include "imageio/imageio_module.h"
 #include "common/datetime.h"
 #include "common/variables.h"
+#include "common/ras2vect.h"
+#ifdef HAVE_AI
+#include "common/ai/segmentation.h"
+#include "common/ai_models.h"
+#endif
 #include "control/signal.h"
 #include "views/view.h"
 
@@ -2504,6 +2514,56 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
   return TRUE;
 }
 
+// a new shape on a module's mask, as drawing it in the darkroom does: in
+// the module's group, joined as op (DT_MASKS_STATE_UNION, ...), drawn
+// masking on, one history item; for the darkroom's image through its path
+static gboolean _mask_attach(dt_iop_module_t *m, dt_masks_form_t *form, const int op, const gboolean inverted,
+                             JsonBuilder *b)
+{
+  dt_develop_t *dev = _cur->dev;
+  if(_cur->gui)
+  {
+    _gui_focus();
+    _api_editing = TRUE;
+    dt_dev_undo_start_record(dev);
+  }
+  dt_masks_gui_form_save_creation(dev, m, form, NULL);
+  // the group entry save_creation added: how it combines, and inverted
+  dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
+  GList *last = grp ? g_list_last(grp->points) : NULL;
+  if(last && ((dt_masks_point_group_t *)last->data)->formid == form->formid)
+  {
+    dt_masks_point_group_t *gp = last->data;
+    if(last != grp->points)
+      gp->state = (gp->state & ~(DT_MASKS_STATE_UNION | DT_MASKS_STATE_INTERSECTION | DT_MASKS_STATE_DIFFERENCE
+                                 | DT_MASKS_STATE_EXCLUSION)) | op;
+    if(inverted) gp->state |= DT_MASKS_STATE_INVERSE;
+  }
+  // the drawn tab on, keeping parametric ranges if on
+  m->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK
+                               | (m->blend_params->mask_mode & DEVELOP_MASK_CONDITIONAL);
+  if(_cur->gui)
+  {
+    dt_masks_iop_update(m);
+    dt_dev_add_history_item(dev, m, TRUE);
+    dt_dev_undo_end_record(dev);
+    _api_editing = FALSE;
+    _gui_changed_by_api();
+  }
+  else
+  {
+    m->enabled = TRUE;
+    dt_dev_add_masks_history_item_ext(dev, m, TRUE, TRUE);
+    _cur->pipe_changed = TRUE;
+    _cur->dirty = TRUE;
+  }
+  json_builder_set_member_name(b, "formid");
+  json_builder_add_int_value(b, form->formid);
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, dev->history_end);
+  return TRUE;
+}
+
 // drawn shapes on a module (not retouch's, which retouch_heal makes): one
 // shape per call in raw space (coords), as drawing it in the darkroom does.
 // combine: how it joins the shapes before it (union, intersection,
@@ -2607,48 +2667,7 @@ static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
     return FALSE;
   }
 #undef _NUM
-  dt_develop_t *dev = _cur->dev;
-  if(_cur->gui)
-  {
-    _gui_focus();
-    _api_editing = TRUE;
-    dt_dev_undo_start_record(dev);
-  }
-  dt_masks_gui_form_save_creation(dev, m, form, NULL);
-  // the group entry save_creation added: how it combines, and inverted
-  dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
-  GList *last = grp ? g_list_last(grp->points) : NULL;
-  if(last && ((dt_masks_point_group_t *)last->data)->formid == form->formid)
-  {
-    dt_masks_point_group_t *gp = last->data;
-    if(last != grp->points)
-      gp->state = (gp->state & ~(DT_MASKS_STATE_UNION | DT_MASKS_STATE_INTERSECTION | DT_MASKS_STATE_DIFFERENCE
-                                 | DT_MASKS_STATE_EXCLUSION)) | op;
-    if(inverted) gp->state |= DT_MASKS_STATE_INVERSE;
-  }
-  // the drawn tab on, keeping parametric ranges if on
-  m->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK
-                               | (m->blend_params->mask_mode & DEVELOP_MASK_CONDITIONAL);
-  if(_cur->gui)
-  {
-    dt_masks_iop_update(m);
-    dt_dev_add_history_item(dev, m, TRUE);
-    dt_dev_undo_end_record(dev);
-    _api_editing = FALSE;
-    _gui_changed_by_api();
-  }
-  else
-  {
-    m->enabled = TRUE;
-    dt_dev_add_masks_history_item_ext(dev, m, TRUE, TRUE);
-    _cur->pipe_changed = TRUE;
-    _cur->dirty = TRUE;
-  }
-  json_builder_set_member_name(b, "formid");
-  json_builder_add_int_value(b, form->formid);
-  json_builder_set_member_name(b, "history_end");
-  json_builder_add_int_value(b, dev->history_end);
-  return TRUE;
+  return _mask_attach(m, form, op, inverted, b);
 }
 
 static gboolean _mask_list(JsonObject *params, JsonBuilder *b, gchar **err)
@@ -4376,6 +4395,295 @@ static gboolean _sample(JsonObject *params, JsonBuilder *b, gchar **err)
   return ok;
 }
 
+// ---- AI object masks --------------------------------------------------------
+// what the darkroom's AI object mask does (develop/masks/object.c): SAM
+// segments the photo around points the user clicks, and the mask is traced
+// into path shapes in a group on the module's mask (holes subtracted). the
+// darkroom's version works on its own image and preview pipe; this one on
+// the session's pipe, so it runs headless too
+
+#ifdef HAVE_AI
+static dt_ai_environment_t *_seg_env = NULL;
+static dt_seg_context_t *_seg = NULL;
+static gchar *_seg_key = NULL;        // which photo and geometry _seg has encoded
+static int _seg_w = 0, _seg_h = 0;
+
+// keep only the part of the mask connected to (sx, sy): what the darkroom
+// does so stray blobs don't become shapes (object.c: _keep_seed_component)
+static void _keep_component(float *mask, const int w, const int h, const float thr, const int sx, const int sy)
+{
+  if(sx < 0 || sy < 0 || sx >= w || sy >= h || mask[(size_t)sy * w + sx] < thr) return;
+  uint8_t *keep = g_malloc0((size_t)w * h);
+  int *stack = g_malloc(sizeof(int) * 2 * (size_t)w * h);
+  size_t top = 0;
+  stack[top++] = sx;
+  stack[top++] = sy;
+  keep[(size_t)sy * w + sx] = 1;
+  while(top)
+  {
+    const int y = stack[--top], x = stack[--top];
+    static const int d[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+    for(int k = 0; k < 4; k++)
+    {
+      const int nx = x + d[k][0], ny = y + d[k][1];
+      if(nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+      const size_t i = (size_t)ny * w + nx;
+      if(keep[i] || mask[i] < thr) continue;
+      keep[i] = 1;
+      stack[top++] = nx;
+      stack[top++] = ny;
+    }
+  }
+  for(size_t i = 0; i < (size_t)w * h; i++)
+    if(!keep[i]) mask[i] = 0.0f;
+  g_free(stack);
+  g_free(keep);
+}
+#endif
+
+static gboolean _mask_ai(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+#ifndef HAVE_AI
+  *err = g_strdup("this darktable was built without AI (USE_AI)");
+  return FALSE;
+#else
+  dt_iop_module_t *m = _blend_module(params, err);
+  if(!m) return FALSE;
+  if(m->flags() & IOP_FLAGS_NO_MASKS)
+  {
+    *err = g_strdup_printf("module '%s' takes no drawn masks", m->op);
+    return FALSE;
+  }
+  if(!dt_ai_registry_is_enabled())
+  {
+    *err = g_strdup("AI features are off in darktable's preferences (plugins/ai/enabled)");
+    return FALSE;
+  }
+  JsonArray *pts = params && json_object_has_member(params, "points")
+                   && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "points"))
+                     ? json_object_get_array_member(params, "points") : NULL;
+  const guint n = pts ? json_array_get_length(pts) : 0;
+  float (*p)[3] = g_malloc0_n(MAX(n, 1), sizeof(*p));
+  int seed = -1;
+  for(guint k = 0; k < n; k++)
+  {
+    JsonObject *o = JSON_NODE_HOLDS_OBJECT(json_array_get_element(pts, k))
+                    ? json_array_get_object_element(pts, k) : NULL;
+    p[k][0] = o ? json_object_get_double_member_with_default(o, "x", -1) : -1;
+    p[k][1] = o ? json_object_get_double_member_with_default(o, "y", -1) : -1;
+    p[k][2] = o && json_object_get_boolean_member_with_default(o, "include", TRUE) ? 1 : 0;
+    if(!(p[k][0] >= 0 && p[k][0] <= 1 && p[k][1] >= 0 && p[k][1] <= 1))
+    {
+      g_free(p);
+      *err = g_strdup_printf("point %u: x, y as fractions 0..1 of the photo as rendered", k);
+      return FALSE;
+    }
+    if(p[k][2] > 0 && seed < 0) seed = k;
+  }
+  if(seed < 0)
+  {
+    g_free(p);
+    *err = g_strdup("mask_ai needs points [{x, y, include}] with at least one include point on the object");
+    return FALSE;
+  }
+  const char *combine = params ? json_object_get_string_member_with_default(params, "combine", "union") : "union";
+  static const struct { const char *name; int state; } ops[] = {
+    { "union", DT_MASKS_STATE_UNION }, { "intersection", DT_MASKS_STATE_INTERSECTION },
+    { "difference", DT_MASKS_STATE_DIFFERENCE }, { "exclusion", DT_MASKS_STATE_EXCLUSION }, { NULL, 0 } };
+  int op = -1;
+  for(int k = 0; ops[k].name; k++)
+    if(!g_ascii_strcasecmp(combine, ops[k].name)) op = ops[k].state;
+  if(op < 0)
+  {
+    g_free(p);
+    *err = g_strdup("combine: union, intersection, difference or exclusion");
+    return FALSE;
+  }
+  const gboolean inverted = params ? json_object_get_boolean_member_with_default(params, "inverted", FALSE) : FALSE;
+  const gint64 t0 = g_get_monotonic_time();
+
+  // the model, loaded once
+  if(!_seg)
+  {
+    if(!_seg_env) _seg_env = dt_ai_env_init(NULL);
+    gchar *model = dt_ai_models_get_active_for_task("mask");
+    _seg = model && _seg_env ? dt_seg_load(_seg_env, model) : NULL;
+    g_free(model);
+    if(!_seg)
+    {
+      g_free(p);
+      *err = g_strdup("no AI mask model could be loaded (darktable's preferences: AI models)");
+      return FALSE;
+    }
+  }
+
+  // the photo as rendered, encoded at darktable's size (1536 by default);
+  // kept while the photo and its geometry stay the same
+  _session_t *gui = _cur;
+  _session_t *s = _pipe_session(err);
+  if(!s)
+  {
+    g_free(p);
+    return FALSE;
+  }
+  _cur = s;
+  _pipe_sync(s);
+  const dt_hash_t dh = dt_dev_hash_distort_plus(s->dev, &s->pipe, 0, DT_DEV_TRANSFORM_DIR_ALL);
+  gchar *key = g_strdup_printf("%d:%" PRIu64 ":%dx%d", s->dev->image_storage.id, (uint64_t)dh,
+                               s->pipe.processed_width, s->pipe.processed_height);
+  gboolean encoded = _seg_key && !g_strcmp0(key, _seg_key) && dt_seg_is_encoded(_seg);
+  if(!encoded)
+  {
+    const int size = MAX(dt_conf_key_exists("plugins/darkroom/masks/object/render_size")
+                         ? dt_conf_get_int("plugins/darkroom/masks/object/render_size") : 1536, 1024);
+    _view_t v;
+    if(!_process_view(NULL, size, size, &v, err))
+    {
+      _cur = gui;
+      g_free(key);
+      g_free(p);
+      return FALSE;
+    }
+    uint8_t *rgb = g_malloc((size_t)v.w * v.h * 3);
+    const uint8_t *src = s->pipe.backbuf;
+    for(size_t k = 0; k < (size_t)v.w * v.h; k++)
+    {
+      rgb[3 * k + 0] = src[4 * k + 2];
+      rgb[3 * k + 1] = src[4 * k + 1];
+      rgb[3 * k + 2] = src[4 * k + 0];
+    }
+    dt_seg_reset_encoding(_seg);
+    encoded = dt_seg_encode_image(_seg, rgb, v.w, v.h);
+    g_free(rgb);
+    _seg_w = v.w;
+    _seg_h = v.h;
+    g_free(_seg_key);
+    _seg_key = encoded ? g_strdup(key) : NULL;
+  }
+  g_free(key);
+  if(!encoded)
+  {
+    _cur = gui;
+    g_free(p);
+    *err = g_strdup("the AI mask model could not encode the photo");
+    return FALSE;
+  }
+  const gint64 t1 = g_get_monotonic_time();
+
+  // the points in encoding pixels, then the mask
+  dt_seg_point_t *sp = g_new(dt_seg_point_t, n);
+  for(guint k = 0; k < n; k++)
+  {
+    sp[k].x = p[k][0] * _seg_w;
+    sp[k].y = p[k][1] * _seg_h;
+    sp[k].label = (int)p[k][2];
+  }
+  dt_seg_reset_prev_mask(_seg);
+  int mw = 0, mh = 0;
+  float *mask = dt_seg_compute_mask(_seg, sp, n, &mw, &mh);
+  g_free(sp);
+  const float thr = CLAMP(dt_conf_key_exists("plugins/darkroom/masks/object/threshold")
+                          ? dt_conf_get_float("plugins/darkroom/masks/object/threshold") : 0.5f, 0.3f, 0.9f);
+  if(!mask || !mw || !mh)
+  {
+    _cur = gui;
+    g_free(mask);
+    g_free(p);
+    *err = g_strdup("the AI mask model found nothing");
+    return FALSE;
+  }
+  _keep_component(mask, mw, mh, thr, (int)(p[seed][0] * mw), (int)(p[seed][1] * mh));
+  g_free(p);
+  size_t area = 0;
+  for(size_t k = 0; k < (size_t)mw * mh; k++)
+  {
+    if(mask[k] >= thr) area++;
+    mask[k] = 1.0f - mask[k];          // ras2forms: below threshold is inside
+  }
+  GList *signs = NULL;
+  GList *forms = ras2forms(mask, mw, mh, NULL, 1.0f - thr,
+                           dt_conf_key_exists("plugins/darkroom/masks/object/cleanup")
+                             ? dt_conf_get_int("plugins/darkroom/masks/object/cleanup") : 10,
+                           dt_conf_key_exists("plugins/darkroom/masks/object/smoothing")
+                             ? dt_conf_get_float("plugins/darkroom/masks/object/smoothing") : 0.0,
+                           &signs);
+  g_free(mask);
+  if(!forms)
+  {
+    _cur = gui;
+    g_list_free(signs);
+    *err = g_strdup("the AI mask had no outline to trace");
+    return FALSE;
+  }
+
+  // mask pixels to the pipe's input, normalized (raw space), as the
+  // darkroom's _register_vectorized_forms does through its preview pipe
+  const double kx = (double)s->pipe.processed_width / mw, ky = (double)s->pipe.processed_height / mh;
+  for(GList *l = forms; l; l = g_list_next(l))
+  {
+    dt_masks_form_t *f = l->data;
+    const int np = g_list_length(f->points);
+    float *xy = g_new(float, 6 * MAX(np, 1));
+    int i = 0;
+    for(GList *q = f->points; q; q = g_list_next(q))
+    {
+      dt_masks_point_path_t *pt = q->data;
+      xy[i++] = pt->corner[0] * kx; xy[i++] = pt->corner[1] * ky;
+      xy[i++] = pt->ctrl1[0] * kx;  xy[i++] = pt->ctrl1[1] * ky;
+      xy[i++] = pt->ctrl2[0] * kx;  xy[i++] = pt->ctrl2[1] * ky;
+    }
+    dt_dev_distort_backtransform_plus(s->dev, &s->pipe, 0, DT_DEV_TRANSFORM_DIR_ALL, xy, 3 * np);
+    i = 0;
+    for(GList *q = f->points; q; q = g_list_next(q))
+    {
+      dt_masks_point_path_t *pt = q->data;
+      pt->corner[0] = xy[i++] / s->pipe.iwidth; pt->corner[1] = xy[i++] / s->pipe.iheight;
+      pt->ctrl1[0] = xy[i++] / s->pipe.iwidth;  pt->ctrl1[1] = xy[i++] / s->pipe.iheight;
+      pt->ctrl2[0] = xy[i++] / s->pipe.iwidth;  pt->ctrl2[1] = xy[i++] / s->pipe.iheight;
+    }
+    g_free(xy);
+  }
+  _cur = gui;
+
+  // the paths in a group, holes subtracted, named as the darkroom names them
+  dt_develop_t *dev = _cur->dev;
+  int paths = 0, groups = 0;
+  for(GList *l = dev->forms; l; l = g_list_next(l))
+  {
+    const dt_masks_form_t *f = l->data;
+    if(g_str_has_prefix(f->name, _("ai object group"))) groups++;
+    else if(g_str_has_prefix(f->name, _("ai object"))) paths++;
+  }
+  dt_masks_form_t *grp = dt_masks_create(DT_MASKS_GROUP);
+  int npaths = 0;
+  GList *sg = signs;
+  for(GList *l = forms; l; l = g_list_next(l), sg = sg ? g_list_next(sg) : NULL)
+  {
+    dt_masks_form_t *f = l->data;
+    snprintf(f->name, sizeof(f->name), "%s #%d", _("ai object"), ++paths);
+    dev->forms = g_list_append(dev->forms, f);
+    dt_masks_point_group_t *gp = dt_masks_group_add_form(grp, f);
+    if(gp && sg && GPOINTER_TO_INT(sg->data) == '-')
+      gp->state = (gp->state & ~DT_MASKS_STATE_UNION) | DT_MASKS_STATE_DIFFERENCE;
+    npaths++;
+  }
+  g_list_free(forms);
+  g_list_free(signs);
+  if(!_mask_attach(m, grp, op, inverted, b)) return FALSE;
+  // save_creation numbered it as a plain group
+  snprintf(grp->name, sizeof(grp->name), "%s #%d", _("ai object group"), groups + 1);
+  json_builder_set_member_name(b, "paths");
+  json_builder_add_int_value(b, npaths);
+  json_builder_set_member_name(b, "area");
+  json_builder_add_double_value(b, round(1e4 * area / ((double)mw * mh)) / 1e4);
+  json_builder_set_member_name(b, "encode_ms");
+  json_builder_add_int_value(b, (t1 - t0) / 1000);
+  json_builder_set_member_name(b, "ms");
+  json_builder_add_int_value(b, (g_get_monotonic_time() - t0) / 1000);
+  return TRUE;
+#endif
+}
+
 // ---- clients ------------------------------------------------------------
 // stdin/stdout is one client; with a socket, every connection is one. the
 // sockets are GLib sources of the default main context: the engine's own
@@ -4534,7 +4842,7 @@ static const char *_methods[] = {
   "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
   "module_enable", "preset_list", "preset_apply", "history_list", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "blend_get", "blend_set", "mask_add", "mask_list",
-  "mask_remove", "sample", "module_add", "module_remove", "module_rename", "history_compress",
+  "mask_remove", "mask_ai", "sample", "module_add", "module_remove", "module_rename", "history_compress",
   "render.history_end", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
   "library_status", "library_release", "library_acquire", "handover", "shutdown", NULL };
 
@@ -4544,7 +4852,7 @@ static const struct { const char *method; const char *event; } _session_methods[
   { "geometry_get", NULL }, { "preset_list", NULL }, { "preset_apply", "edit" },
   { "coords", NULL }, { "retouch_list", NULL }, { "retouch_heal", "edit" },
   { "blend_get", NULL }, { "blend_set", "edit" }, { "mask_add", "edit" }, { "mask_list", NULL },
-  { "mask_remove", "edit" }, { "sample", NULL },
+  { "mask_remove", "edit" }, { "mask_ai", "edit" }, { "sample", NULL },
   { "module_add", "edit" }, { "module_remove", "edit" }, { "module_rename", "edit" }, { "history_compress", "saved" },
   { "module_set", "edit" }, { "module_enable", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" },
   { "save", "saved" }, { "reset", "reset" }, { "session_close", "closed" }, { NULL, NULL } };
@@ -4691,6 +4999,8 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _blend_set(params, b, &err);
   else if(!g_strcmp0(method, "mask_add"))
     _mask_add(params, b, &err);
+  else if(!g_strcmp0(method, "mask_ai"))
+    _mask_ai(params, b, &err);
   else if(!g_strcmp0(method, "mask_list"))
     _mask_list(params, b, &err);
   else if(!g_strcmp0(method, "mask_remove"))

@@ -52,6 +52,31 @@ example. The example clients below start it this way when nobody has.
 - `--idle-exit` stops the engine that many seconds after the last client
   disconnected, unless an image has unsaved changes.
 
+## darktable's window serves the same API
+
+Started with `--api` (socket next to the config dir, the same rule as the
+example clients) or `--api-socket <path>`, darktable itself serves the
+library on that socket while its window is open, on GTK's main thread:
+
+- clients don't need to know who serves them (`ping` and `library_status`
+  say `"server": "gui"` or `"engine"`);
+- the image shown in the darkroom is edited through the darkroom's own path:
+  an API change moves darktable's sliders and adds to its history panel;
+  undo is the history panel's undo; a change made in the window reaches the
+  clients as an `edit` event (`client` 0). Renders of that image go through
+  a copy reloaded from the darkroom's history when it changed;
+- other images get sessions as in the engine;
+- **automatic hand-off:** at startup, darktable asks an engine serving the
+  same socket to hand over (`handover`: the engine releases the library,
+  sends its unsaved edits, tells its clients and exits) before opening the
+  library itself. When darktable quits, the clients start an engine again.
+  Unsaved edits of images other than the darkroom's are kept in
+  `<socket>.drafts.json` when a server stops and restored by the next one;
+- `library_release` and `shutdown` are refused while the window serves.
+
+Measured: hand-off ~0.2 s plus darktable's startup; clients back on an
+engine ~3 s after darktable quit.
+
 It refuses to start without `--configdir` (or `--library`), so it can't open
 your default library by accident. For a copy: create a directory, copy
 `library.db`, `data.db` and `darktablerc` from your darktable config dir into

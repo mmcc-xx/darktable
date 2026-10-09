@@ -117,9 +117,11 @@ message.
 | `module_set {operation, instance, values}` | change settings by name, all or none; range-checked; enums by name, label or number; switches the module on and adds a history item (consecutive edits of one module merge, as in the darkroom) |
 | `module_enable {operation, instance, enabled}` | module on/off |
 | `history_list`, `history_end {end}` | history items; undo/redo to a step (0 = original) |
+| `geometry_get` | orientation (`rotation` clockwise from the raw file, `mirrored`), straightening `angle` and `autocrop` (rotate and perspective), `crop` box (`left`, `top`, `right`, `bottom`, fractions of the uncropped image), `aspect`, and the uncropped (`frame_width`/`frame_height`) and final sizes |
+| `geometry_set {rotate, flip, angle, autocrop, crop, aspect}` | as the darkroom does, all or nothing: `rotate` turns by 90° steps (clockwise; -90 left) and `flip` (`horizontal`/`vertical`) mirrors in the flip module, and an existing crop box follows; `angle` straightens (degrees, positive turns counter-clockwise) and the automatic crop is refitted as ashift's GUI does; `crop` sets the box (`null` removes it); `aspect` (`free`, `original`, `square`, `W:H`) fits the largest box of that ratio inside the given or current one |
 | `save` | write the history to the library (and the sidecar, if `write_sidecar_files` asks for it), as leaving the darkroom does |
 | `reset` | discard the history and reload, so darktable applies the workflow defaults and auto-apply presets again |
-| `render {width, height, path, quality}` | sRGB JPEG fitted inside width x height |
+| `render {width, height, path, quality, uncropped}` | sRGB JPEG fitted inside width x height; `uncropped` leaves crop's box out (as the darkroom shows the image while crop has the focus), to draw a box on |
 | `library_status` / `library_release` / `library_acquire` | hand the library to darktable's GUI and take it back while running; unsaved edits of every open photo are kept and restored if the photo wasn't changed meanwhile |
 | `shutdown` | close and exit (SIGTERM does the same) |
 
@@ -144,4 +146,6 @@ about 1/255 (mean absolute difference).
   other operations whose logic lives in GUI code
 - array fields (e.g. channel mixer coefficients), masks, module instances
   and order, styles, export, tags and metadata, import
+- perspective correction (ashift's line detection and fitting); the
+  geometry calls cover orientation, straightening and crop only
 - `shutdown` stops the engine for every client

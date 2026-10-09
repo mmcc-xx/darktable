@@ -819,6 +819,15 @@ static gboolean _module_get(JsonObject *params, JsonBuilder *b, gchar **err)
   json_builder_add_boolean_value(b, m->enabled);
   json_builder_set_member_name(b, "version");
   json_builder_add_int_value(b, m->version());
+  if(params && json_object_get_boolean_member_with_default(params, "raw", FALSE))
+  {
+    // the settings as darktable stores them (history, XMP): every field,
+    // also those module_get doesn't list
+    char *hex = dt_exif_xmp_encode_internal((const unsigned char *)m->params, m->params_size, NULL, FALSE);
+    json_builder_set_member_name(b, "params_hex");
+    json_builder_add_string_value(b, hex ? hex : "");
+    free(hex);
+  }
   json_builder_set_member_name(b, "fields");
   json_builder_begin_array(b);
   for(dt_introspection_field_t *f = m->so->get_introspection_linear();
@@ -893,6 +902,11 @@ static gboolean _module_get(JsonObject *params, JsonBuilder *b, gchar **err)
 }
 
 // parse one requested value into the field's number, or explain why not
+// module_set {strict: false} lets values outside a field's declared range
+// through: darktable stores some there itself (borders' aspect -1 is the
+// image's), so a client copying an edit needs them
+static gboolean _range_checks = TRUE;
+
 static gboolean _parse_value_named(const dt_introspection_field_t *f, const char *name, JsonNode *v,
                                    double *out, gchar **err)
 {
@@ -936,7 +950,7 @@ static gboolean _parse_value_named(const dt_introspection_field_t *f, const char
     return FALSE;
   }
   double lo, hi, def;
-  if(_range(f, &lo, &hi, &def) && (*out < lo || *out > hi))
+  if(_range_checks && _range(f, &lo, &hi, &def) && (*out < lo || *out > hi))
   {
     *err = g_strdup_printf("'%s': %g is outside %g..%g", name, *out, lo, hi);
     return FALSE;
@@ -1072,6 +1086,7 @@ static gboolean _module_set(JsonObject *params, JsonBuilder *b, gchar **err)
     return FALSE;
   }
 
+  _range_checks = json_object_get_boolean_member_with_default(params, "strict", TRUE);
   // all or nothing: check every field before changing any
   void *p = g_malloc(m->params_size);
   memcpy(p, m->params, m->params_size);
@@ -1143,6 +1158,7 @@ static gboolean _module_set(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   g_list_free(names);
   g_free(p);
+  _range_checks = TRUE;
   return ok;
 }
 
@@ -2759,7 +2775,7 @@ static void _add_blend(JsonBuilder *b, const dt_iop_module_t *m)
       json_builder_set_member_name(b, "range");
       json_builder_begin_array(b);
       for(int k = 0; k < 4; k++)
-        json_builder_add_double_value(b, round(_to_display(c, bp->blendif_parameters[4 * idx + k], boost) * 1e3) / 1e3);
+        json_builder_add_double_value(b, _to_display(c, bp->blendif_parameters[4 * idx + k], boost));
       json_builder_end_array(b);
       json_builder_set_member_name(b, "inverted");
       json_builder_add_boolean_value(b, (bp->blendif & (1u << (idx + 16))) != 0);
@@ -3059,8 +3075,19 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
 // a new shape on a module's mask, as drawing it in the darkroom does: in
 // the module's group, joined as op (DT_MASKS_STATE_UNION, ...), drawn
 // masking on, one history item; for the darkroom's image through its path
+static gboolean _mask_attach_ext(dt_iop_module_t *m, dt_masks_form_t *form, const int op,
+                                 const gboolean inverted, const float opacity, JsonBuilder *b);
+
 static gboolean _mask_attach(dt_iop_module_t *m, dt_masks_form_t *form, const int op, const gboolean inverted,
                              JsonBuilder *b)
+{
+  return _mask_attach_ext(m, form, op, inverted, -1.0f, b);
+}
+
+// opacity: the shape's in the module's group (the mask manager's), or < 0
+// for the user's default
+static gboolean _mask_attach_ext(dt_iop_module_t *m, dt_masks_form_t *form, const int op,
+                                 const gboolean inverted, const float opacity, JsonBuilder *b)
 {
   dt_develop_t *dev = _cur->dev;
   if(_cur->gui)
@@ -3080,6 +3107,7 @@ static gboolean _mask_attach(dt_iop_module_t *m, dt_masks_form_t *form, const in
       gp->state = (gp->state & ~(DT_MASKS_STATE_UNION | DT_MASKS_STATE_INTERSECTION | DT_MASKS_STATE_DIFFERENCE
                                  | DT_MASKS_STATE_EXCLUSION)) | op;
     if(inverted) gp->state |= DT_MASKS_STATE_INVERSE;
+    if(opacity >= 0.0f) gp->opacity = opacity;
   }
   // the drawn tab on, keeping parametric ranges if on
   m->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK
@@ -3110,38 +3138,75 @@ static gboolean _mask_attach(dt_iop_module_t *m, dt_masks_form_t *form, const in
 // shape per call in raw space (coords), as drawing it in the darkroom does.
 // combine: how it joins the shapes before it (union, intersection,
 // difference, exclusion)
-static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
+// a shape from a request, not yet on a module: circle, ellipse, gradient,
+// path, brush, or a group of them (members, each with its combine,
+// inverted and opacity, as the mask manager groups shapes). a group's
+// members go into the image's forms; the shape itself is added by
+// _mask_attach
+static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err)
 {
-  dt_iop_module_t *m = _blend_module(params, err);
-  if(!m) return FALSE;
-  if(m->flags() & IOP_FLAGS_NO_MASKS)
-  {
-    *err = g_strdup_printf("module '%s' takes no drawn masks (retouch: retouch_heal)", m->op);
-    return FALSE;
-  }
-  JsonObject *sh = params && json_object_has_member(params, "shape")
-                   && JSON_NODE_HOLDS_OBJECT(json_object_get_member(params, "shape"))
-                     ? json_object_get_object_member(params, "shape") : NULL;
   const char *type = sh ? json_object_get_string_member_with_default(sh, "type", "") : "";
-  const char *combine = params ? json_object_get_string_member_with_default(params, "combine", "union") : "union";
-  const gboolean inverted = params ? json_object_get_boolean_member_with_default(params, "inverted", FALSE) : FALSE;
-  static const struct { const char *name; int state; } ops[] = {
-    { "union", DT_MASKS_STATE_UNION }, { "intersection", DT_MASKS_STATE_INTERSECTION },
-    { "difference", DT_MASKS_STATE_DIFFERENCE }, { "exclusion", DT_MASKS_STATE_EXCLUSION }, { NULL, 0 } };
-  int op = -1;
-  for(int k = 0; ops[k].name; k++)
-    if(!g_ascii_strcasecmp(combine, ops[k].name)) op = ops[k].state;
-  if(op < 0)
+  if(!g_strcmp0(type, "group"))
   {
-    *err = g_strdup("combine: union, intersection, difference or exclusion");
-    return FALSE;
+    JsonArray *mem = json_object_has_member(sh, "members")
+                     && JSON_NODE_HOLDS_ARRAY(json_object_get_member(sh, "members"))
+                       ? json_object_get_array_member(sh, "members") : NULL;
+    if(!mem || !json_array_get_length(mem) || depth > 4)
+    {
+      *err = g_strdup("group: members [{shape, combine, inverted, opacity}, ...]");
+      return NULL;
+    }
+    dt_masks_form_t *grp = dt_masks_create(DT_MASKS_GROUP);
+    GList *children = NULL;
+    for(guint k = 0; k < json_array_get_length(mem); k++)
+    {
+      JsonNode *e = json_array_get_element(mem, k);
+      JsonObject *o = JSON_NODE_HOLDS_OBJECT(e) ? json_node_get_object(e) : NULL;
+      dt_masks_form_t *f = _shape_form(o, depth + 1, err);
+      if(!f)
+      {
+        g_list_free_full(children, (GDestroyNotify)dt_masks_free_form);
+        dt_masks_free_form(grp);
+        return NULL;
+      }
+      children = g_list_append(children, f);
+    }
+    dt_develop_t *dev = _cur->dev;
+    guint k = 0;
+    for(GList *l = children; l; l = g_list_next(l), k++)
+    {
+      dt_masks_form_t *f = l->data;
+      JsonObject *o = json_array_get_object_element(mem, k);
+      while(dt_masks_get_from_id(dev, f->formid)) f->formid++;
+      const char *name = json_object_get_string_member_with_default(o, "name", NULL);
+      if(name) g_strlcpy(f->name, name, sizeof(f->name));
+      else if(f->functions && f->functions->set_form_name)
+        f->functions->set_form_name(f, g_list_length(dev->forms) + 1);
+      dev->forms = g_list_append(dev->forms, f);
+      dt_masks_point_group_t *gp = malloc(sizeof(dt_masks_point_group_t));
+      gp->formid = f->formid;
+      gp->parentid = grp->formid;
+      const char *combine = json_object_get_string_member_with_default(o, "combine", "union");
+      int state = !g_ascii_strcasecmp(combine, "intersection") ? DT_MASKS_STATE_INTERSECTION
+                  : !g_ascii_strcasecmp(combine, "difference") ? DT_MASKS_STATE_DIFFERENCE
+                  : !g_ascii_strcasecmp(combine, "exclusion") ? DT_MASKS_STATE_EXCLUSION
+                  : DT_MASKS_STATE_UNION;
+      if(!grp->points) state = 0;
+      gp->state = DT_MASKS_STATE_SHOW | DT_MASKS_STATE_USE | state
+                  | (json_object_get_boolean_member_with_default(o, "inverted", FALSE) ? DT_MASKS_STATE_INVERSE : 0);
+      gp->opacity = json_object_get_double_member_with_default(o, "opacity",
+                                                               dt_conf_get_float("plugins/darkroom/masks/opacity"));
+      grp->points = g_list_append(grp->points, gp);
+    }
+    g_list_free(children);
+    return grp;
   }
 #define _NUM(o, k, d) json_object_get_double_member_with_default((o), (k), (d))
   dt_masks_form_t *form = NULL;
   if(!g_strcmp0(type, "path") || !g_strcmp0(type, "brush"))
   {
     // corners in raw space; control points smoothed through them as the
-    // path and brush tools draw them
+    // path and brush tools draw them, or as given
     const gboolean brush = !g_strcmp0(type, "brush");
     JsonArray *pts = json_object_has_member(sh, "points")
                      && JSON_NODE_HOLDS_ARRAY(json_object_get_member(sh, "points"))
@@ -3154,65 +3219,119 @@ static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
     const double density = _NUM(sh, "density", dt_conf_get_float("plugins/darkroom/masks/brush/density"));
     gboolean ok = n >= (brush ? 2 : 3) && border > 0.0 && border <= 1.0
                   && hardness >= 0.0 && hardness <= 1.0 && density >= 0.0 && density <= 1.0;
+    // a point is [x, y] (smoothed through its neighbours) or an object as
+    // mask_list gives it: corner, ctrl1, ctrl2, border (pairs), hardness,
+    // density, smooth (false: the control points stay as given)
+    typedef struct { float corner[2], ctrl1[2], ctrl2[2], border[2], hardness, density; gboolean smooth, has_ctrl; } _pt_t;
+    _pt_t *pt = g_new0(_pt_t, MAX(n, 1));
+    gboolean all_ctrl = TRUE;
     for(guint k = 0; ok && k < n; k++)
     {
       JsonNode *e = json_array_get_element(pts, k);
-      JsonArray *p = JSON_NODE_HOLDS_ARRAY(e) ? json_node_get_array(e) : NULL;
-      ok = p && json_array_get_length(p) == 2;
-      for(int c = 0; ok && c < 2; c++)
+      _pt_t *q = &pt[k];
+      q->border[0] = q->border[1] = brush ? border : MAX(0.0005f, border);
+      q->hardness = hardness;
+      q->density = density;
+      q->smooth = TRUE;
+      gboolean got_ctrl = FALSE;
+      if(JSON_NODE_HOLDS_ARRAY(e))
       {
-        const double v = json_array_get_double_element(p, c);
-        ok = v >= 0.0 && v <= 1.0;
+        JsonArray *p = json_node_get_array(e);
+        ok = json_array_get_length(p) == 2;
+        for(int c = 0; ok && c < 2; c++) q->corner[c] = json_array_get_double_element(p, c);
       }
+      else if(JSON_NODE_HOLDS_OBJECT(e))
+      {
+        JsonObject *o = json_node_get_object(e);
+        static const char *keys[4] = { "corner", "ctrl1", "ctrl2", "border" };
+        float *dst[4] = { q->corner, q->ctrl1, q->ctrl2, q->border };
+        ok = json_object_has_member(o, "corner");
+        for(int k2 = 0; ok && k2 < 4; k2++)
+        {
+          if(!json_object_has_member(o, keys[k2])) continue;
+          JsonNode *v = json_object_get_member(o, keys[k2]);
+          JsonArray *p = JSON_NODE_HOLDS_ARRAY(v) ? json_node_get_array(v) : NULL;
+          ok = p && json_array_get_length(p) == 2;
+          for(int c = 0; ok && c < 2; c++) dst[k2][c] = json_array_get_double_element(p, c);
+          if(k2 == 1 || k2 == 2) got_ctrl = TRUE;
+        }
+        q->hardness = _NUM(o, "hardness", q->hardness);
+        q->density = _NUM(o, "density", q->density);
+        q->smooth = json_object_get_boolean_member_with_default(o, "smooth", !got_ctrl);
+        q->has_ctrl = got_ctrl;
+      }
+      else
+        ok = FALSE;
+      ok = ok && q->corner[0] >= 0.0 && q->corner[0] <= 1.0 && q->corner[1] >= 0.0 && q->corner[1] <= 1.0
+              && q->border[0] >= 0.0 && q->border[1] >= 0.0 && q->hardness >= 0.0 && q->hardness <= 1.0
+              && q->density >= 0.0 && q->density <= 1.0;
+      if(ok && !q->smooth && !got_ctrl) ok = FALSE;
+      if(!got_ctrl) all_ctrl = FALSE;
     }
     if(!ok)
     {
-      *err = g_strdup(brush ? "brush: points [[x, y], ...] (2 or more, raw space), width 0..1 (relative to the"
-                              " shorter side), hardness and density 0..1"
-                            : "path: points [[x, y], ...] (3 or more, raw space; closed), border 0..1 (relative"
-                              " to the shorter side)");
-      return FALSE;
+      g_free(pt);
+      *err = g_strdup(brush ? "brush: points (2 or more, raw space): [x, y] or {corner, ctrl1, ctrl2, border,"
+                              " hardness, density, smooth}; width 0..1 (relative to the shorter side), hardness"
+                              " and density 0..1"
+                            : "path: points (3 or more, raw space; closed): [x, y] or {corner, ctrl1, ctrl2,"
+                              " border, smooth}; border 0..1 (relative to the shorter side)");
+      return NULL;
     }
     form = dt_masks_create(brush ? DT_MASKS_BRUSH : DT_MASKS_PATH);
     for(guint k = 0; k < n; k++)
     {
-      JsonArray *p = json_array_get_array_element(pts, k);
-      const float px = json_array_get_double_element(p, 0), py = json_array_get_double_element(p, 1);
+      const _pt_t *q = &pt[k];
+      const dt_masks_points_states_t state = q->smooth ? DT_MASKS_POINT_STATE_NORMAL : DT_MASKS_POINT_STATE_USER;
+      // control points given are kept, whatever the state: darktable
+      // renders the stored ones (the tools recompute smooth points only
+      // when they edit the shape)
+      const gboolean keep = q->has_ctrl;
       if(brush)
       {
-        dt_masks_point_brush_t *pt = malloc(sizeof(dt_masks_point_brush_t));
-        pt->corner[0] = px;
-        pt->corner[1] = py;
-        pt->ctrl1[0] = pt->ctrl1[1] = pt->ctrl2[0] = pt->ctrl2[1] = -1.0f;
-        pt->border[0] = pt->border[1] = border;
-        pt->hardness = hardness;
-        pt->density = density;
-        pt->state = DT_MASKS_POINT_STATE_NORMAL;
-        form->points = g_list_append(form->points, pt);
+        dt_masks_point_brush_t *p = malloc(sizeof(dt_masks_point_brush_t));
+        memcpy(p->corner, q->corner, sizeof(p->corner));
+        memcpy(p->border, q->border, sizeof(p->border));
+        p->ctrl1[0] = !keep ? -1.0f : q->ctrl1[0];
+        p->ctrl1[1] = !keep ? -1.0f : q->ctrl1[1];
+        p->ctrl2[0] = !keep ? -1.0f : q->ctrl2[0];
+        p->ctrl2[1] = !keep ? -1.0f : q->ctrl2[1];
+        p->hardness = q->hardness;
+        p->density = q->density;
+        p->state = state;
+        form->points = g_list_append(form->points, p);
       }
       else
       {
-        dt_masks_point_path_t *pt = malloc(sizeof(dt_masks_point_path_t));
-        pt->corner[0] = px;
-        pt->corner[1] = py;
-        pt->ctrl1[0] = pt->ctrl1[1] = pt->ctrl2[0] = pt->ctrl2[1] = -1.0f;
-        pt->border[0] = pt->border[1] = MAX(0.0005f, border);
-        pt->state = DT_MASKS_POINT_STATE_NORMAL;
-        form->points = g_list_append(form->points, pt);
+        dt_masks_point_path_t *p = malloc(sizeof(dt_masks_point_path_t));
+        memcpy(p->corner, q->corner, sizeof(p->corner));
+        memcpy(p->border, q->border, sizeof(p->border));
+        p->ctrl1[0] = !keep ? -1.0f : q->ctrl1[0];
+        p->ctrl1[1] = !keep ? -1.0f : q->ctrl1[1];
+        p->ctrl2[0] = !keep ? -1.0f : q->ctrl2[0];
+        p->ctrl2[1] = !keep ? -1.0f : q->ctrl2[1];
+        p->state = state;
+        form->points = g_list_append(form->points, p);
       }
     }
-    if(brush)
-      dt_masks_brush_init_ctrl_points(form);
-    else
-      dt_masks_path_init_ctrl_points(form);
-    return _mask_attach(m, form, op, inverted, b);
+    g_free(pt);
+    // points without control points get them smoothed through their
+    // neighbours (which also redoes those of the other smooth points)
+    if(!all_ctrl)
+    {
+      if(brush)
+        dt_masks_brush_init_ctrl_points(form);
+      else
+        dt_masks_path_init_ctrl_points(form);
+    }
+    return form;
   }
   const double x = sh ? _NUM(sh, "x", -1) : -1, y = sh ? _NUM(sh, "y", -1) : -1;
   if(!(x >= 0.0 && x <= 1.0 && y >= 0.0 && y <= 1.0))
   {
     *err = g_strdup("shape needs type (circle, ellipse, gradient, path, brush) and x, y in 0..1"
                     " (raw space, coords)");
-    return FALSE;
+    return NULL;
   }
   if(!g_strcmp0(type, "circle"))
   {
@@ -3221,7 +3340,7 @@ static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
     if(!(r > 0.0 && r <= 1.0 && border >= 0.0 && border <= 1.0))
     {
       *err = g_strdup("circle: r in 0..1 and border in 0..1 (relative to the shorter side)");
-      return FALSE;
+      return NULL;
     }
     form = dt_masks_create(DT_MASKS_CIRCLE);
     dt_masks_point_circle_t *c = malloc(sizeof(dt_masks_point_circle_t));
@@ -3238,7 +3357,7 @@ static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
     if(!(ra > 0.0 && ra <= 1.0 && rb > 0.0 && rb <= 1.0 && border >= 0.0 && border <= 1.0))
     {
       *err = g_strdup("ellipse: ra, rb in 0..1, border in 0..1, rotation in degrees");
-      return FALSE;
+      return NULL;
     }
     form = dt_masks_create(DT_MASKS_ELLIPSE);
     dt_masks_point_ellipse_t *e = malloc(sizeof(dt_masks_point_ellipse_t));
@@ -3259,7 +3378,7 @@ static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
     if(!(comp >= 0.0 && comp <= 1.0 && steep >= 0.0 && steep <= 1.0 && curv >= -2.0 && curv <= 2.0))
     {
       *err = g_strdup("gradient: rotation in degrees, compression 0..1, steepness 0..1, curvature -2..2");
-      return FALSE;
+      return NULL;
     }
     form = dt_masks_create(DT_MASKS_GRADIENT);
     dt_masks_point_gradient_t *g = malloc(sizeof(dt_masks_point_gradient_t));
@@ -3276,19 +3395,130 @@ static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
   else
   {
     *err = g_strdup("shape type: circle, ellipse, gradient, path or brush");
-    return FALSE;
+    return NULL;
   }
 #undef _NUM
-  return _mask_attach(m, form, op, inverted, b);
+  return form;
 }
 
-static gboolean _mask_list(JsonObject *params, JsonBuilder *b, gchar **err)
+static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   dt_iop_module_t *m = _blend_module(params, err);
   if(!m) return FALSE;
-  json_builder_set_member_name(b, "shapes");
+  if(m->flags() & IOP_FLAGS_NO_MASKS)
+  {
+    *err = g_strdup_printf("module '%s' takes no drawn masks (retouch: retouch_heal)", m->op);
+    return FALSE;
+  }
+  JsonObject *sh = params && json_object_has_member(params, "shape")
+                   && JSON_NODE_HOLDS_OBJECT(json_object_get_member(params, "shape"))
+                     ? json_object_get_object_member(params, "shape") : NULL;
+  const char *combine = params ? json_object_get_string_member_with_default(params, "combine", "union") : "union";
+  const gboolean inverted = params ? json_object_get_boolean_member_with_default(params, "inverted", FALSE) : FALSE;
+  static const struct { const char *name; int state; } ops[] = {
+    { "union", DT_MASKS_STATE_UNION }, { "intersection", DT_MASKS_STATE_INTERSECTION },
+    { "difference", DT_MASKS_STATE_DIFFERENCE }, { "exclusion", DT_MASKS_STATE_EXCLUSION }, { NULL, 0 } };
+  int op = -1;
+  for(int k = 0; ops[k].name; k++)
+    if(!g_ascii_strcasecmp(combine, ops[k].name)) op = ops[k].state;
+  if(op < 0)
+  {
+    *err = g_strdup("combine: union, intersection, difference or exclusion");
+    return FALSE;
+  }
+  const float opacity = params ? json_object_get_double_member_with_default(params, "opacity", -1.0) : -1.0;
+  if(opacity > 1.0f)
+  {
+    *err = g_strdup("opacity: 0..1");
+    return FALSE;
+  }
+  dt_masks_form_t *form = _shape_form(sh, 0, err);
+  if(!form) return FALSE;
+  return _mask_attach_ext(m, form, op, inverted, opacity, b);
+}
+
+#define _KV(k, v) do { json_builder_set_member_name(b, (k)); json_builder_add_double_value(b, (v)); } while(0)
+static void _add_xy(JsonBuilder *b, const char *k, const float *v)
+{
+  json_builder_set_member_name(b, k);
   json_builder_begin_array(b);
-  dt_masks_form_t *grp = dt_masks_get_from_id(_cur->dev, m->blend_params->mask_id);
+  json_builder_add_double_value(b, v[0]);
+  json_builder_add_double_value(b, v[1]);
+  json_builder_end_array(b);
+}
+
+// a shape's geometry in raw space, as mask_add takes it (paths and brushes:
+// each point with its control points, which mask_add keeps as given)
+static void _add_shape_geometry(JsonBuilder *b, const dt_masks_form_t *form)
+{
+  if(!form->points) return;
+  if(form->type & DT_MASKS_CIRCLE)
+  {
+    const dt_masks_point_circle_t *c = form->points->data;
+    _KV("x", c->center[0]);
+    _KV("y", c->center[1]);
+    _KV("r", c->radius);
+    _KV("border", c->border);
+  }
+  else if(form->type & DT_MASKS_ELLIPSE)
+  {
+    const dt_masks_point_ellipse_t *e = form->points->data;
+    _KV("x", e->center[0]);
+    _KV("y", e->center[1]);
+    _KV("ra", e->radius[0]);
+    _KV("rb", e->radius[1]);
+    _KV("rotation", e->rotation);
+    _KV("border", e->border);
+    json_builder_set_member_name(b, "proportional");
+    json_builder_add_boolean_value(b, (e->flags & DT_MASKS_ELLIPSE_PROPORTIONAL) != 0);
+  }
+  else if(form->type & DT_MASKS_GRADIENT)
+  {
+    const dt_masks_point_gradient_t *g = form->points->data;
+    _KV("x", g->anchor[0]);
+    _KV("y", g->anchor[1]);
+    _KV("rotation", g->rotation);
+    _KV("compression", g->compression);
+    _KV("steepness", g->steepness);
+    _KV("curvature", g->curvature);
+    json_builder_set_member_name(b, "linear");
+    json_builder_add_boolean_value(b, g->state == DT_MASKS_GRADIENT_STATE_LINEAR);
+  }
+  else if(form->type & (DT_MASKS_PATH | DT_MASKS_BRUSH))
+  {
+    const gboolean brush = (form->type & DT_MASKS_BRUSH) != 0;
+    json_builder_set_member_name(b, "points");
+    json_builder_begin_array(b);
+    for(GList *q = form->points; q; q = g_list_next(q))
+    {
+      // the two point types share their first fields
+      const dt_masks_point_path_t *p = q->data;
+      json_builder_begin_object(b);
+      _add_xy(b, "corner", p->corner);
+      _add_xy(b, "ctrl1", p->ctrl1);
+      _add_xy(b, "ctrl2", p->ctrl2);
+      _add_xy(b, "border", p->border);
+      if(brush)
+      {
+        const dt_masks_point_brush_t *bp = q->data;
+        _KV("hardness", bp->hardness);
+        _KV("density", bp->density);
+      }
+      json_builder_set_member_name(b, "smooth");
+      json_builder_add_boolean_value(b, ((brush ? ((const dt_masks_point_brush_t *)q->data)->state : p->state)
+                                         & DT_MASKS_POINT_STATE_NORMAL) != 0);
+      json_builder_end_object(b);
+    }
+    json_builder_end_array(b);
+  }
+}
+#undef _KV
+
+// a group's shapes, each with how it joins the ones before it; groups
+// within (the mask manager's, or an AI mask) with their members
+static void _add_group_shapes(JsonBuilder *b, const dt_masks_form_t *grp, const int depth)
+{
+  json_builder_begin_array(b);
   for(GList *l = grp && (grp->type & DT_MASKS_GROUP) ? grp->points : NULL; l; l = g_list_next(l))
   {
     const dt_masks_point_group_t *gp = l->data;
@@ -3312,32 +3542,25 @@ static gboolean _mask_list(JsonObject *params, JsonBuilder *b, gchar **err)
     json_builder_add_boolean_value(b, (gp->state & DT_MASKS_STATE_INVERSE) != 0);
     json_builder_set_member_name(b, "active");
     json_builder_add_boolean_value(b, (gp->state & DT_MASKS_STATE_USE) != 0);
-    if(form->points && (form->type & (DT_MASKS_CIRCLE | DT_MASKS_ELLIPSE | DT_MASKS_GRADIENT)))
+    json_builder_set_member_name(b, "opacity");
+    json_builder_add_double_value(b, gp->opacity);
+    _add_shape_geometry(b, form);
+    if((form->type & DT_MASKS_GROUP) && depth < 4)
     {
-      const float *p = form->points->data;   // center or anchor first in all three
-      json_builder_set_member_name(b, "x");
-      json_builder_add_double_value(b, p[0]);
-      json_builder_set_member_name(b, "y");
-      json_builder_add_double_value(b, p[1]);
-    }
-    if(form->type & (DT_MASKS_PATH | DT_MASKS_BRUSH))
-    {
-      // corners first in both point types
-      json_builder_set_member_name(b, "points");
-      json_builder_begin_array(b);
-      for(GList *q = form->points; q; q = g_list_next(q))
-      {
-        const float *p = q->data;
-        json_builder_begin_array(b);
-        json_builder_add_double_value(b, p[0]);
-        json_builder_add_double_value(b, p[1]);
-        json_builder_end_array(b);
-      }
-      json_builder_end_array(b);
+      json_builder_set_member_name(b, "members");
+      _add_group_shapes(b, form, depth + 1);
     }
     json_builder_end_object(b);
   }
   json_builder_end_array(b);
+}
+
+static gboolean _mask_list(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_iop_module_t *m = _blend_module(params, err);
+  if(!m) return FALSE;
+  json_builder_set_member_name(b, "shapes");
+  _add_group_shapes(b, dt_masks_get_from_id(_cur->dev, m->blend_params->mask_id), 0);
   return TRUE;
 }
 
@@ -3859,8 +4082,9 @@ static void _add_curves(JsonBuilder *b, dt_iop_module_t *m, const _curve_mod_t *
     {
       const uint8_t *n = p.nodes + k * p.node_size;
       json_builder_begin_array(b);
-      json_builder_add_double_value(b, round(*(const float *)(n + p.x_off) * 1e5) / 1e5);
-      json_builder_add_double_value(b, round(*(const float *)(n + p.y_off) * 1e5) / 1e5);
+      // unrounded: a curve read and set again must come back the same
+      json_builder_add_double_value(b, *(const float *)(n + p.x_off));
+      json_builder_add_double_value(b, *(const float *)(n + p.y_off));
       json_builder_end_array(b);
     }
     json_builder_end_array(b);

@@ -108,7 +108,9 @@ message.
 | `ping` | version, `server` (`engine` or `gui`) and `methods`: the methods this server has, and options added to a method later (`render.zoom`), so a client can check before calling |
 | `film_rolls` | film rolls with image counts |
 | `images_list {film_id, rating, label, offset, limit}` | images in folder/filename order with rating, reject, color labels; `rating` is `visible` (default), `all`, `rejected` or `1`..`5` (at least) |
-| `image_info {imgid}` | one image, as in `images_list` |
+| `image_info {imgid}` | one image, as in `images_list`, and its camera data (`exif`: maker, model, lens, aperture, exposure time, bias, ISO, focal length, focus distance, crop factor, when taken, raw / HDR / monochrome) |
+| `collection {offset, limit}` | darktable's current collection (the lighttable's and filmstrip's photos, in their order), its rules, and the selected images |
+| `darkroom_open {imgid}` | darktable's window only: shows the photo in the darkroom, as clicking it in the filmstrip (in the darkroom) or double-clicking it in the lighttable does; the switch completes on the main loop (a `darkroom` event, `library_status` `darkroom_imgid`) |
 | `thumbnail {imgid, size, path, quality}` | JPEG from darktable's thumbnail (mipmap) cache, rendered with the current edit if not cached, scaled to fit inside size x size (never enlarged) |
 | `image_metadata {imgid}` | an image's tags (not darktable's own `darktable\|...`), metadata fields as the metadata editor names them (title, description, creator, publisher, rights, notes, version name, ...) and location (`latitude`, `longitude`, `elevation`, or null) |
 | `set_tags {imgids, attach, detach}` / `tag_list {filter}` | attach and detach tags by name (`\|` for the hierarchy; new ones created) as the tagging module does; the library's tags with how many images carry each |

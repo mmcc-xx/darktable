@@ -125,6 +125,8 @@
                                  -> a style, or an image's saved edit, onto
                                     images in the library as the lighttable
                                     does; open ones saved first, reopened
+     collection {offset, limit}  -> darktable's current collection, selection
+     darkroom_open {imgid}       -> the photo in darktable's darkroom (window)
      image_metadata / set_tags / set_metadata / set_location / tag_list
                                  -> tags, metadata fields and location, as
                                     darktable's tagging, metadata editor
@@ -272,6 +274,8 @@
 #include "common/metadata.h"
 #include "imageio/imageio_dng.h"
 #include "control/jobs.h"
+#include "control/control.h"
+#include "common/selection.h"
 #include "bauhaus/bauhaus.h"
 #include "common/color_picker.h"
 #include "dtgtk/paint.h"
@@ -5588,6 +5592,150 @@ static gboolean _image_info(JsonObject *params, JsonBuilder *b, gchar **err)
     _add_image_row(b, st);
   }
   sqlite3_finalize(st);
+  // the camera's data, as the image information panel shows it
+  const dt_image_t *img = dt_image_cache_get(imgid, 'r');
+  if(img)
+  {
+    json_builder_set_member_name(b, "exif");
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "maker");
+    json_builder_add_string_value(b, img->exif_maker);
+    json_builder_set_member_name(b, "model");
+    json_builder_add_string_value(b, img->exif_model);
+    json_builder_set_member_name(b, "lens");
+    json_builder_add_string_value(b, img->exif_lens);
+    json_builder_set_member_name(b, "aperture");
+    json_builder_add_double_value(b, img->exif_aperture);
+    json_builder_set_member_name(b, "exposure_time");
+    json_builder_add_double_value(b, img->exif_exposure);
+    json_builder_set_member_name(b, "exposure_bias");
+    json_builder_add_double_value(b, img->exif_exposure_bias);
+    json_builder_set_member_name(b, "iso");
+    json_builder_add_double_value(b, img->exif_iso);
+    json_builder_set_member_name(b, "focal_length");
+    json_builder_add_double_value(b, img->exif_focal_length);
+    json_builder_set_member_name(b, "focus_distance");
+    json_builder_add_double_value(b, img->exif_focus_distance);
+    json_builder_set_member_name(b, "crop_factor");
+    json_builder_add_double_value(b, img->exif_crop);
+    char dt[64] = { 0 };
+    json_builder_set_member_name(b, "taken");
+    if(img->exif_datetime_taken && dt_datetime_gtimespan_to_exif(dt, sizeof(dt), img->exif_datetime_taken))
+      json_builder_add_string_value(b, dt);
+    else
+      json_builder_add_null_value(b);
+    json_builder_set_member_name(b, "raw");
+    json_builder_add_boolean_value(b, dt_image_is_raw(img));
+    json_builder_set_member_name(b, "hdr");
+    json_builder_add_boolean_value(b, dt_image_is_hdr(img));
+    json_builder_set_member_name(b, "monochrome");
+    json_builder_add_boolean_value(b, dt_image_is_monochrome(img));
+    json_builder_end_object(b);
+    dt_image_cache_read_release(img);
+  }
+  return TRUE;
+}
+
+// darktable's current collection (the lighttable's, as the collections
+// module set it), in its order, and the selected images
+static gboolean _collection(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  const int offset = params ? json_object_get_int_member_with_default(params, "offset", 0) : 0;
+  const int limit = params ? json_object_get_int_member_with_default(params, "limit", 200) : 200;
+  if(!_in_gui) dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
+                                          DT_COLLECTION_PROP_UNDEF, NULL);
+  sqlite3_stmt *st;
+  int total = 0;
+  sqlite3_prepare_v2(dt_database_get(darktable.db), "SELECT COUNT(*) FROM memory.collected_images",
+                     -1, &st, NULL);
+  if(sqlite3_step(st) == SQLITE_ROW) total = sqlite3_column_int(st, 0);
+  sqlite3_finalize(st);
+  json_builder_set_member_name(b, "total");
+  json_builder_add_int_value(b, total);
+  json_builder_set_member_name(b, "rules");
+  json_builder_begin_array(b);
+  const int n = dt_conf_get_int("plugins/lighttable/collect/num_rules");
+  for(int k = 0; k < n; k++)
+  {
+    gchar *ki = g_strdup_printf("plugins/lighttable/collect/item%d", k);
+    gchar *ks = g_strdup_printf("plugins/lighttable/collect/string%d", k);
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "property");
+    json_builder_add_string_value(b, dt_collection_name(dt_conf_get_int(ki)));
+    json_builder_set_member_name(b, "text");
+    json_builder_add_string_value(b, dt_conf_get_string_const(ks));
+    json_builder_end_object(b);
+    g_free(ki);
+    g_free(ks);
+  }
+  json_builder_end_array(b);
+  json_builder_set_member_name(b, "images");
+  json_builder_begin_array(b);
+  // clang-format off
+  sqlite3_prepare_v2(dt_database_get(darktable.db),
+                     "SELECT i.id, i.filename, f.folder, i.version, i.flags, i.width, i.height,"
+                     "       i.change_timestamp,"
+                     "       (SELECT GROUP_CONCAT(color) FROM main.color_labels WHERE imgid = i.id),"
+                     "       i.history_end"
+                     " FROM memory.collected_images AS c"
+                     " JOIN main.images AS i ON i.id = c.imgid"
+                     " JOIN main.film_rolls AS f ON f.id = i.film_id"
+                     " ORDER BY c.rowid LIMIT ?1 OFFSET ?2",
+                     -1, &st, NULL);
+  // clang-format on
+  sqlite3_bind_int(st, 1, limit);
+  sqlite3_bind_int(st, 2, offset);
+  while(sqlite3_step(st) == SQLITE_ROW) _add_image_row(b, st);
+  sqlite3_finalize(st);
+  json_builder_end_array(b);
+  json_builder_set_member_name(b, "selected");
+  json_builder_begin_array(b);
+  sqlite3_prepare_v2(dt_database_get(darktable.db), "SELECT imgid FROM main.selected_images ORDER BY imgid",
+                     -1, &st, NULL);
+  while(sqlite3_step(st) == SQLITE_ROW) json_builder_add_int_value(b, sqlite3_column_int(st, 0));
+  sqlite3_finalize(st);
+  json_builder_end_array(b);
+  return TRUE;
+}
+
+// opens a photo in darktable's darkroom (its window only), as clicking it
+// in the filmstrip does when the darkroom shows, else as double-clicking
+// it in the lighttable. the switch completes on the main loop: the client
+// gets a "darkroom" event (library_status: darkroom_imgid)
+static gboolean _darkroom_open(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  const dt_imgid_t imgid = params ? json_object_get_int_member_with_default(params, "imgid", NO_IMGID) : NO_IMGID;
+  if(!_in_gui)
+  {
+    *err = g_strdup("darkroom_open needs darktable's window serving the API");
+    return FALSE;
+  }
+  if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
+  {
+    *err = g_strdup_printf("no image with id %d", imgid);
+    return FALSE;
+  }
+  if(_darkroom_image() == imgid)
+    ;
+  else if(dt_view_get_current() == DT_VIEW_DARKROOM)
+  {
+    // the darkroom writes the edit it leaves (_dev_change_image)
+    dt_selection_deselect(darktable.selection, darktable.develop->image_storage.id);
+    dt_selection_select(darktable.selection, imgid);
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_VIEWMANAGER_THUMBTABLE_ACTIVATE, imgid);
+  }
+  else
+  {
+    // the darkroom opens the image acted on: hovered, else selected
+    // (dt_act_on_get_main_image)
+    dt_selection_select_single(darktable.selection, imgid);
+    dt_control_set_mouse_over_id(imgid);
+    dt_ctl_switch_mode_to("darkroom");
+  }
+  json_builder_set_member_name(b, "imgid");
+  json_builder_add_int_value(b, imgid);
+  json_builder_set_member_name(b, "darkroom_imgid");
+  json_builder_add_int_value(b, _darkroom_image());
   return TRUE;
 }
 
@@ -7951,7 +8099,7 @@ static const char *_methods[] = {
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
   "retouch_remove", "blend_get", "blend_set", "mask_add", "mask_list",
   "mask_remove", "mask_add.path", "mask_ai", "mask_ai_encode", "export.background", "sample", "ai_denoise", "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "style_list", "style_create", "style_delete", "style_apply",
-  "history_paste", "image_metadata", "tag_list", "set_tags",
+  "history_paste", "collection", "darkroom_open", "image_info.exif", "image_metadata", "tag_list", "set_tags",
   "set_metadata", "set_location", "picker_list", "picker_apply", "module_remove", "module_rename", "history_compress",
   "render.history_end", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
   "library_status", "library_release", "library_acquire", "handover", "shutdown", NULL };
@@ -8126,6 +8274,10 @@ static gboolean _handle(_client_t *c, const gchar *line)
         ? json_object_get_int_member(params, "imgid") : c->current;
     }
   }
+  else if(!g_strcmp0(method, "collection"))
+    _collection(params, b, &err);
+  else if(!g_strcmp0(method, "darkroom_open"))
+    _darkroom_open(params, b, &err);
   else if(!g_strcmp0(method, "image_metadata"))
     _image_metadata(params, c->current, b, &err);
   else if(!g_strcmp0(method, "tag_list"))

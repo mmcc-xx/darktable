@@ -24,9 +24,15 @@ the branch owner.
 ## Build
 
 Build darktable as usual with the MCP server enabled (`-DUSE_MCP=ON`, or
-`./build.sh --enable-mcp`); `darktable-api` is built with it:
+`./build.sh --enable-mcp`); `darktable-api` is built with it. The AI
+methods (`mask_ai`, `ai_denoise`) need `-DUSE_AI=ON`:
 
     cmake --build build --target darktable-api
+
+Tested on macOS (Apple M1) and Linux (Ubuntu 24.04, gcc 13), headless and
+with darktable's window. On Linux, ONNX Runtime is loaded by file name, so
+darktable run from the build tree needs `plugins/ai/ort_library_path`
+(an install puts the library next to darktable).
 
 ## Run
 
@@ -172,12 +178,12 @@ about 1/255 (mean absolute difference).
 
 ## Not done
 
-- settings the GUI adjusts alongside a change (`gui_changed`), pickers and
-  other operations whose logic lives in GUI code
-- integer arrays and other arrays of structs than curves, path and brush
-  shapes, raster masks
-  and order, styles, tags and metadata, import; export to storages other
-  than disk
+- headless, settings the module's GUI code adjusts alongside a change
+  (`gui_changed`) are left as they are; in darktable's window they follow
+- pickers headless: `picker_apply` needs darktable's window
+- integer arrays and arrays of structs other than curves, path and brush
+  shapes
+- import; export to storages other than disk
 - perspective correction (ashift's line detection and fitting); the
   geometry calls cover orientation, straightening and crop only
 - `shutdown` stops the engine for every client

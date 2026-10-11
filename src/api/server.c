@@ -271,6 +271,7 @@
 #include "common/exif.h"
 #include "common/film.h"
 #include "common/grouping.h"
+#include "common/overlay.h"
 #include "common/metadata.h"
 #include "imageio/imageio_dng.h"
 #include "control/jobs.h"
@@ -4281,6 +4282,83 @@ static gboolean _image_duplicate(JsonObject *params, const dt_imgid_t current, g
   return ok;
 }
 
+// remove images from the library, as the lighttable's "remove" does
+// (control_jobs.c, _control_remove_images_job_run): the files stay, other
+// versions of the same file keep their own edits. all or nothing: refused
+// for the darkroom's photo, unsaved changes, a local copy, or an image used
+// as an overlay. open sessions of the removed images are closed. returns
+// the removed ids in *removed
+static gboolean _image_remove(JsonObject *params, GList **removed, JsonBuilder *b, gchar **err)
+{
+  JsonArray *ids = params && json_object_has_member(params, "imgids")
+    ? json_object_get_array_member(params, "imgids") : NULL;
+  if(!ids || !json_array_get_length(ids))
+  {
+    *err = g_strdup("imgids: a list of image ids to remove");
+    return FALSE;
+  }
+  const guint n = json_array_get_length(ids);
+  for(guint i = 0; i < n; i++)
+  {
+    const dt_imgid_t imgid = json_array_get_int_element(ids, i);
+    if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
+      *err = g_strdup_printf("no image with id %d", imgid);
+    else if(imgid == _darkroom_image())
+      *err = g_strdup_printf("image %d is open in darktable's darkroom: open another photo there first", imgid);
+    else
+    {
+      const _session_t *s = _session_find_listed(imgid);
+      const dt_image_t *img = dt_image_cache_get(imgid, 'r');
+      const gboolean local_copy = img && (img->flags & DT_IMAGE_LOCAL_COPY);
+      dt_image_cache_read_release(img);
+      GList *users = dt_overlay_get_used_in_imgs(imgid, TRUE);
+      int in_use = 0;
+      for(GList *l = users; l; l = g_list_next(l))
+        if(dt_image_exists(GPOINTER_TO_INT(l->data))) in_use++;
+      g_list_free(users);
+      if(s && s->dirty)
+        *err = g_strdup_printf("image %d has unsaved changes: save or discard them first", imgid);
+      else if(local_copy)
+        *err = g_strdup_printf("image %d is a local copy: reset it in darktable first", imgid);
+      else if(in_use)
+        *err = g_strdup_printf("image %d is used as an overlay in %d image(s)", imgid, in_use);
+    }
+    if(*err) return FALSE;
+  }
+  GList *paths = NULL;
+  for(guint i = 0; i < n; i++)
+  {
+    const dt_imgid_t imgid = json_array_get_int_element(ids, i);
+    if(g_list_find(*removed, GINT_TO_POINTER(imgid))) continue;
+    _session_close(_session_find_listed(imgid));
+    char path[PATH_MAX] = { 0 };
+    gboolean from_cache = FALSE;
+    dt_image_full_path(imgid, path, sizeof(path), &from_cache);
+    dt_image_remove(imgid);
+    *removed = g_list_append(*removed, GINT_TO_POINTER(imgid));
+    if(*path && !g_list_find_custom(paths, path, (GCompareFunc)g_strcmp0))
+      paths = g_list_prepend(paths, g_strdup(path));
+  }
+  // the other versions of these files: their sidecars list the versions
+  for(GList *l = paths; l; l = g_list_next(l))
+    dt_image_synch_all_xmp(l->data);
+  g_list_free_full(paths, g_free);
+  dt_film_remove_empty();
+  if(_in_gui)
+  {
+    dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
+                               DT_COLLECTION_PROP_UNDEF, g_list_copy(*removed));
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_FILMROLLS_CHANGED);
+    dt_control_queue_redraw_center();
+  }
+  json_builder_set_member_name(b, "removed");
+  json_builder_begin_array(b);
+  for(GList *l = *removed; l; l = g_list_next(l))
+    json_builder_add_int_value(b, GPOINTER_TO_INT(l->data));
+  json_builder_end_array(b);
+  return TRUE;
+}
+
 // ---- styles and copy/paste ---------------------------------------------------
 // these change an image's saved edit in the library with darktable's own
 // code (common/styles.c, common/history.c), as the lighttable does; an image
@@ -8126,7 +8204,7 @@ static const char *_methods[] = {
   "module_enable", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
   "retouch_remove", "blend_get", "blend_set", "mask_add", "mask_list",
-  "mask_remove", "mask_add.path", "mask_ai", "mask_ai_encode", "export.background", "sample", "ai_denoise", "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "style_list", "style_create", "style_delete", "style_apply",
+  "mask_remove", "mask_add.path", "mask_ai", "mask_ai_encode", "export.background", "sample", "ai_denoise", "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "image_remove", "style_list", "style_create", "style_delete", "style_apply",
   "history_paste", "collection", "darkroom_open", "image_info.exif", "image_metadata", "tag_list", "set_tags",
   "set_metadata", "set_location", "picker_list", "picker_apply", "module_remove", "module_rename", "history_compress",
   "render.history_end", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
@@ -8194,7 +8272,7 @@ static gboolean _handle(_client_t *c, const gchar *line)
   if(err)
     ;
   else if(_jobs_running() && (!g_strcmp0(method, "library_release") || !g_strcmp0(method, "handover")
-                               || !g_strcmp0(method, "shutdown")))
+                               || !g_strcmp0(method, "shutdown") || !g_strcmp0(method, "image_remove")))
     err = g_strdup("a background job is running (job_list): wait for it, or job_cancel it, first");
   else if(_released && g_strcmp0(method, "ping") && g_strcmp0(method, "library_status")
      && g_strcmp0(method, "library_acquire") && g_strcmp0(method, "shutdown")
@@ -8301,6 +8379,22 @@ static gboolean _handle(_client_t *c, const gchar *line)
       event_img = params && json_object_has_member(params, "imgid")
         ? json_object_get_int_member(params, "imgid") : c->current;
     }
+  }
+  else if(!g_strcmp0(method, "image_remove"))
+  {
+    GList *removed = NULL;
+    if(_image_remove(params, &removed, b, &err))
+      for(GList *l = removed; l; l = g_list_next(l))
+      {
+        const dt_imgid_t gone = GPOINTER_TO_INT(l->data);
+        for(GList *k = _clients; k; k = g_list_next(k))
+        {
+          _client_t *other = k->data;
+          if(other->current == gone) other->current = NO_IMGID;
+        }
+        _notify(c, "removed", gone);
+      }
+    g_list_free(removed);
   }
   else if(!g_strcmp0(method, "collection"))
     _collection(params, b, &err);

@@ -81,7 +81,8 @@ library on that socket while its window is open, on GTK's main thread:
   library itself. When darktable quits, the clients start an engine again.
   Unsaved edits of images other than the darkroom's are kept in
   `<socket>.drafts.json` when a server stops and restored by the next one;
-- `library_release` and `shutdown` are refused while the window serves.
+- `library_release` is refused while the window serves; `shutdown` too,
+  unless `quit_window` (darktable quits as from its quit menu).
 
 Measured: hand-off ~0.2 s plus darktable's startup; clients back on an
 engine ~3 s after darktable quit.
@@ -118,6 +119,7 @@ message.
 | `collection {offset, limit}` | darktable's current collection (the lighttable's and filmstrip's photos, in their order), its rules, and the selected images |
 | `darkroom_open {imgid}` | darktable's window only: shows the photo in the darkroom, as clicking it in the filmstrip (in the darkroom) or double-clicking it in the lighttable does; the switch completes on the main loop (a `darkroom` event, `library_status` `darkroom_imgid`) |
 | `thumbnail {imgid, size, path, quality}` | JPEG from darktable's thumbnail (mipmap) cache, rendered with the current edit if not cached, scaled to fit inside size x size (never enlarged) |
+| `thumbnails {imgids \| film_id, size, outdated_only}` | a background job that makes thumbnails in bulk, as `darktable-generate-cache` does: for each image (the `imgids`, a film roll, or with neither the whole library) the thumbnail levels up to the one holding `size` (default 720) are rendered with the saved edit and written to darktable's disk cache, where darktable's lighttable and `thumbnail` find them. With `outdated_only` (default) an image is skipped when every level is on disk and its history hasn't changed since. One at a time; cancellable. The job's result: `images`, `generated`, `skipped`, `failed`, `max_level`, `disk_cache` (darktable's preference; off, they stay in memory only) |
 | `image_metadata {imgid}` | an image's tags (not darktable's own `darktable\|...`), metadata fields as the metadata editor names them (title, description, creator, publisher, rights, notes, version name, ...) and location (`latitude`, `longitude`, `elevation`, or null) |
 | `set_tags {imgids, attach, detach}` / `tag_list {filter}` | attach and detach tags by name (`\|` for the hierarchy; new ones created) as the tagging module does; the library's tags with how many images carry each |
 | `set_metadata {imgids, values}` | metadata fields by name or xmp key (`""` clears one), as the metadata editor |
@@ -137,7 +139,7 @@ message.
 | `mask_ai {operation, instance, points: [{x, y, include}], combine, inverted}` | darktable's AI object mask (SAM, `src/common/ai/segmentation.c`): the photo as rendered is encoded (kept while its geometry is unchanged; ~4-13 s the first time on an M1, then ~50 ms per mask), the mask around the include points (fractions of the image) is traced into path shapes (`ras2forms`) in a group on the module's mask, holes subtracted. Needs a build with `USE_AI` and `plugins/ai/enabled` |
 | `mask_ai_encode` | the slow part of a first `mask_ai` on a photo (encoding it) as a background job; `mask_ai` is refused while it runs, and quick after |
 | `ai_denoise {imgid, strength, path}` | darktable's AI raw denoise (neural restore: RawNIND on the sensor data, as its raw denoise does) as a background job: a DNG (by default darktable's output pattern beside the photo), imported into the photo's film roll and group with its rating, labels, metadata and tags. Replies the job at once |
-| `job_status {job}` / `job_list` / `job_cancel {job}` | background jobs: state (running, done, failed, cancelled), progress where known, result (`new_imgid`, `file`) or error. Every client gets `{"type": "job", ...}` when one ends. In darktable's window a job has a darktable job handle (progress in its progress bar; cancel stops the computation); headless, progress is unknown and a cancelled job's result is discarded. `library_release`, `handover` and `shutdown` are refused while a job runs |
+| `job_status {job}` / `job_list` / `job_cancel {job}` | background jobs: state (running, done, failed, cancelled), progress where known, result (`new_imgid`, `file`) or error. Every client gets `{"type": "job", ...}` when one ends. In darktable's window a job has a darktable job handle (progress in its progress bar; cancel stops the computation); headless, progress is unknown (`thumbnails` counts its images) and a cancelled job's result is discarded. `library_release`, `handover` and `shutdown` are refused while a job runs |
 | `sample {width, height, zoom, center_x, center_y, uncropped, points, radius, boxes, bins}` | render as `render` does and read the output (display sRGB): color (sRGB, Lab, luminance range) at points and in boxes, R/G/B/luminance histograms, clipped highlight/shadow fractions |
 | `preset_list {operation, instance}` / `preset_apply {operation, instance, name}` | the module's presets for its version (`name`, `label` as the menu shows it, `builtin`, `autoapply`); apply one by name or label as the presets menu does: settings, on/off, blending and the module's label, one history item |
 | `module_enable {operation, instance, enabled}` | module on/off |
@@ -163,7 +165,7 @@ message.
 | `darkroom_snapshot {history_end, show}` | darktable's window only: a snapshot in the darkroom's snapshots module of its photo at a history step (0 = the original), shown split against the edit as clicking it does (`show`, default true); the edit stays where it is. Refused when all 10 slots are used |
 | `share {kind, imgid, data}` | relay something to the other clients as a `shared` event with its `kind` and `data`, e.g. a comparison an AI prepared for the web app to show (`compare`: `{history_end}`, `variants`: `{variants}`); the engine doesn't interpret it |
 | `library_status` / `library_release` / `library_acquire` | hand the library to darktable's GUI and take it back while running; unsaved edits of every open photo are kept and restored if the photo wasn't changed meanwhile |
-| `shutdown` | close and exit (SIGTERM does the same) |
+| `shutdown {quit_window}` | close and exit (SIGTERM does the same). Served by darktable's window, only with `quit_window: true`: darktable quits as from its quit menu (the darkroom's history saved), after replying; refused while a modal dialog is open. For a client that needs the library; on macOS this needs no Automation permission, unlike a quit request from another application |
 
 ## Measured (Apple M1, CPU only, 20 MP raw with a 22-step edit)
 

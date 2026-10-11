@@ -7144,6 +7144,12 @@ typedef struct _job_t
   int rw, rh;
   gchar *seg_key;
   gboolean ok;
+  // thumbnails: the images, how far the thread is, and what it did
+  GList *imgs;
+  dt_mipmap_size_t max_mip;
+  gboolean outdated_only;
+  gint done, total;
+  int generated, skipped, failed;
 } _job_t;
 
 static GList *_jobs = NULL;
@@ -7169,7 +7175,8 @@ static void _add_job(JsonBuilder *b, const _job_t *j)
   json_builder_add_int_value(b, j->imgid);
   json_builder_set_member_name(b, "state");
   json_builder_add_string_value(b, _job_states[j->state]);
-  const double progress = j->handle && j->state == _JOB_RUNNING ? dt_control_job_get_progress(j->handle) : -1.0;
+  double progress = j->handle && j->state == _JOB_RUNNING ? dt_control_job_get_progress(j->handle) : -1.0;
+  if(progress < 0.0 && j->total > 0) progress = (double)g_atomic_int_get(&j->done) / j->total;
   json_builder_set_member_name(b, "progress");
   if(j->state != _JOB_RUNNING) json_builder_add_double_value(b, 1.0);
   else if(progress >= 0.0) json_builder_add_double_value(b, round(progress * 1e3) / 1e3);
@@ -7607,6 +7614,182 @@ static gboolean _export_job(JsonObject *params, const dt_imgid_t current, gboole
   _jobs = g_list_append(_jobs, j);
   j->thread = g_thread_new("api-export", _export_job_run, j);
   _add_job(b, j);
+  return TRUE;
+}
+
+// ---- thumbnails in bulk ------------------------------------------------------
+// what darktable-generate-cache does, as a job: each image's thumbnail
+// levels up to max_mip rendered into the mipmap cache (the largest one, the
+// smaller ones scaled from it) and written to darktable's disk cache, so
+// darktable's lighttable and thumbnail requests find them. a thumbnail is
+// outdated when a level is missing on disk or the image's history changed
+// since it was made (history hash), as darktable's darkroom checks it
+
+static gboolean _thumbs_stale(const dt_imgid_t imgid)
+{
+  sqlite3_stmt *stmt;
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "SELECT mipmap_hash IS NOT current_hash FROM main.history_hash WHERE imgid = ?1",
+                              -1, &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
+  const gboolean stale = sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0);
+  sqlite3_finalize(stmt);
+  return stale;
+}
+
+static gboolean _thumbs_on_disk(const dt_imgid_t imgid, const dt_mipmap_size_t max_mip)
+{
+  for(dt_mipmap_size_t k = DT_MIPMAP_0; k <= max_mip; k++)
+  {
+    char file[PATH_MAX] = { 0 };
+    snprintf(file, sizeof(file), "%s.d/%d/%d.jpg", darktable.mipmap_cache->cachedir, (int)k, imgid);
+    if(!dt_util_test_image_file(file)) return FALSE;
+  }
+  return TRUE;
+}
+
+static gboolean _thumbnails_finish(gpointer data)
+{
+  _job_t *j = data;
+  g_thread_join(j->thread);
+  j->thread = NULL;
+  j->finished = g_get_monotonic_time();
+  const gboolean cancelled = g_atomic_int_get(&j->cancel)
+                             || (j->handle && dt_control_job_get_state(j->handle) == DT_JOB_STATE_CANCELLED);
+  j->state = cancelled ? _JOB_CANCELLED : j->failed && !j->generated && !j->skipped ? _JOB_FAILED : _JOB_DONE;
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "images");
+  json_builder_add_int_value(b, j->total);
+  json_builder_set_member_name(b, "generated");
+  json_builder_add_int_value(b, j->generated);
+  json_builder_set_member_name(b, "skipped");
+  json_builder_add_int_value(b, j->skipped);
+  json_builder_set_member_name(b, "failed");
+  json_builder_add_int_value(b, j->failed);
+  json_builder_set_member_name(b, "max_level");
+  json_builder_add_int_value(b, j->max_mip);
+  json_builder_set_member_name(b, "disk_cache");
+  json_builder_add_boolean_value(b, dt_conf_get_bool("cache_disk_backend"));
+  json_builder_end_object(b);
+  j->result = json_builder_get_root(b);
+  g_object_unref(b);
+  if(j->state == _JOB_FAILED) j->error = g_strdup("no thumbnail could be made (are the files there?)");
+  if(j->handle)
+  {
+    dt_control_job_dispose(j->handle);
+    j->handle = NULL;
+  }
+  g_list_free(j->imgs);
+  j->imgs = NULL;
+  _notify_job(j);
+  return G_SOURCE_REMOVE;
+}
+
+static gpointer _thumbnails_run(gpointer data)
+{
+  _job_t *j = data;
+  const gboolean disk = dt_conf_get_bool("cache_disk_backend") && darktable.mipmap_cache->cachedir[0];
+  for(GList *l = j->imgs; l; l = g_list_next(l))
+  {
+    if(g_atomic_int_get(&j->cancel)
+       || (j->handle && dt_control_job_get_state(j->handle) == DT_JOB_STATE_CANCELLED))
+      break;
+    const dt_imgid_t imgid = GPOINTER_TO_INT(l->data);
+    const gboolean stale = _thumbs_stale(imgid);
+    if(j->outdated_only && !stale && disk && _thumbs_on_disk(imgid, j->max_mip))
+      j->skipped++;
+    else
+    {
+      // made from an older history: thrown away (in memory and on disk) first
+      if(stale || !j->outdated_only) dt_mipmap_cache_remove(imgid);
+      gboolean ok = TRUE;
+      for(int k = j->max_mip; k >= DT_MIPMAP_0; k--)
+      {
+        dt_mipmap_buffer_t buf;
+        dt_mipmap_cache_get(&buf, imgid, k, DT_MIPMAP_BLOCKING, 'r');
+        // darktable's stand-ins for a missing or unreadable file are at
+        // most 29 px (mipmap_cache.c: ERR_IMG_MAX_DIM), and never written
+        if(!buf.buf || buf.width <= 29 || buf.height <= 29) ok = FALSE;
+        dt_mipmap_cache_release(&buf);
+      }
+      if(ok)
+      {
+        // written to disk as they leave the memory cache
+        if(disk) dt_mipmap_cache_evict(imgid);
+        dt_history_hash_set_mipmap(imgid);
+        j->generated++;
+      }
+      else
+        j->failed++;
+    }
+    g_atomic_int_inc(&j->done);
+    if(j->handle) dt_control_job_set_progress(j->handle, (double)g_atomic_int_get(&j->done) / j->total);
+  }
+  g_idle_add(_thumbnails_finish, j);
+  return NULL;
+}
+
+// thumbnails {imgids | film_id, size, outdated_only}: no imgids nor film_id
+// is the whole library
+static gboolean _thumbnails(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  for(GList *l = _jobs; l; l = g_list_next(l))
+  {
+    const _job_t *o = l->data;
+    if(o->state == _JOB_RUNNING && !g_strcmp0(o->type, "thumbnails"))
+    {
+      *err = g_strdup_printf("thumbnails are being made already (job %d)", o->id);
+      return FALSE;
+    }
+  }
+  const int size = params ? json_object_get_int_member_with_default(params, "size", 720) : 720;
+  if(size < 1 || size > 8192)
+  {
+    *err = g_strdup("size: 1..8192 (pixels; the thumbnail levels up to the one that holds it are made)");
+    return FALSE;
+  }
+  GList *imgs = NULL;
+  if(params && json_object_has_member(params, "imgids"))
+  {
+    if(!(imgs = _imgids(params, NO_IMGID, err))) return FALSE;
+  }
+  else
+  {
+    const int film_id = params ? json_object_get_int_member_with_default(params, "film_id", -1) : -1;
+    sqlite3_stmt *stmt;
+    DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                                "SELECT id FROM main.images WHERE ?1 < 0 OR film_id = ?1 ORDER BY id", -1,
+                                &stmt, NULL);
+    DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, film_id);
+    while(sqlite3_step(stmt) == SQLITE_ROW) imgs = g_list_prepend(imgs, GINT_TO_POINTER(sqlite3_column_int(stmt, 0)));
+    sqlite3_finalize(stmt);
+    imgs = g_list_reverse(imgs);
+    if(!imgs)
+    {
+      *err = film_id < 0 ? g_strdup("the library has no images") : g_strdup_printf("film roll %d has no images", film_id);
+      return FALSE;
+    }
+  }
+  _job_t *j = g_new0(_job_t, 1);
+  j->id = _next_job++;
+  j->type = "thumbnails";
+  j->imgid = NO_IMGID;
+  j->state = _JOB_RUNNING;
+  j->started = g_get_monotonic_time();
+  j->imgs = imgs;
+  j->total = g_list_length(imgs);
+  j->max_mip = dt_mipmap_cache_get_matching_size(size, size);
+  j->outdated_only = params ? json_object_get_boolean_member_with_default(params, "outdated_only", TRUE) : TRUE;
+  j->handle = dt_control_job_create(NULL, "api: thumbnails");
+  if(j->handle) dt_control_job_add_progress(j->handle, _("thumbnails"), TRUE);
+  _jobs = g_list_append(_jobs, j);
+  j->thread = g_thread_new("api-thumbnails", _thumbnails_run, j);
+  _add_job(b, j);
+  json_builder_set_member_name(b, "images");
+  json_builder_add_int_value(b, j->total);
+  json_builder_set_member_name(b, "note");
+  json_builder_add_string_value(b, "runs in the background: job_status, or wait for the \"job\" event");
   return TRUE;
 }
 
@@ -8434,8 +8617,34 @@ static void _notify_job(const _job_t *j)
   g_object_unref(b);
 }
 
+// darktable's own quit, as its quit menu item and Cmd+Q do (gui/gtk.c,
+// _quit_callback): the darkroom's history written, then darktable's
+// shutdown. for clients that need the library (on macOS a quit request
+// from another application is an Apple event, which needs that
+// application's Automation permission)
+static gboolean _modal_open(void)
+{
+  gboolean open = FALSE;
+  GList *windows = gtk_window_list_toplevels();
+  for(GList *w = windows; w && !open; w = g_list_next(w))
+    open = gtk_window_get_modal(GTK_WINDOW(w->data)) && gtk_widget_get_visible(GTK_WIDGET(w->data));
+  g_list_free(windows);
+  return open;
+}
+
+static gboolean _quit_window(gpointer data)
+{
+  if(darktable.develop && dt_view_get_current() == DT_VIEW_DARKROOM)
+  {
+    dt_dev_write_history(darktable.develop);
+    dt_image_write_sidecar_file(darktable.develop->image_storage.id);
+  }
+  dt_control_quit();
+  return G_SOURCE_REMOVE;
+}
+
 static const char *_methods[] = {
-  "ping", "film_rolls", "images_list", "image_info", "thumbnail", "set_rating", "set_label",
+  "ping", "film_rolls", "images_list", "image_info", "thumbnail", "thumbnails", "set_rating", "set_label",
   "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
   "module_enable", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
@@ -8444,7 +8653,7 @@ static const char *_methods[] = {
   "history_paste", "collection", "darkroom_open", "image_info.exif", "image_metadata", "tag_list", "set_tags",
   "set_metadata", "set_location", "picker_list", "picker_apply", "module_remove", "module_rename", "history_compress",
   "render.history_end", "render_variants", "darkroom_snapshot", "share", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
-  "library_status", "library_release", "library_acquire", "handover", "shutdown", NULL };
+  "library_status", "library_release", "library_acquire", "handover", "shutdown", "shutdown.quit_window", NULL };
 
 // methods that work on an edit session, and the event each one sends
 static const struct { const char *method; const char *event; } _session_methods[] = {
@@ -8538,6 +8747,8 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _image_info(params, b, &err);
   else if(!g_strcmp0(method, "thumbnail"))
     _thumbnail(params, b, &err);
+  else if(!g_strcmp0(method, "thumbnails"))
+    _thumbnails(params, b, &err);
   else if(!g_strcmp0(method, "export"))
   {
     gboolean saved = FALSE;
@@ -8765,10 +8976,15 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _render_variants(params, b, &err);
   else if(!g_strcmp0(method, "shutdown"))
   {
-    if(_opt.in_gui)
-      err = g_strdup("darktable's window serves the library; it can't be shut down from here");
-    else
+    if(!_opt.in_gui)
       go_on = FALSE;
+    else if(!(params && json_object_get_boolean_member_with_default(params, "quit_window", FALSE)))
+      err = g_strdup("darktable's window serves the library: shutdown {quit_window: true} quits darktable");
+    else if(_modal_open())
+      err = g_strdup("a dialog is open in darktable's window: darktable doesn't quit under it");
+    else
+      // after the reply has gone out
+      g_idle_add(_quit_window, NULL);
   }
   else
     err = g_strdup_printf("unknown method '%s'", method);

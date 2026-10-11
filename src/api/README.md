@@ -71,6 +71,10 @@ library on that socket while its window is open, on GTK's main thread:
   undo is the history panel's undo; a change made in the window reaches the
   clients as an `edit` event (`client` 0). Renders of that image go through
   a copy reloaded from the darkroom's history when it changed;
+- ratings, rejects and color labels changed in the window (stars clicked,
+  shortcuts, undo, the filmstrip) reach the clients as `image` events; the
+  API's `set_rating` / `set_label` redraw the window's thumbnails, as
+  darktable's own rating and color label shortcuts do;
 - `library_status` reports `darkroom_imgid`, the photo the darkroom shows
   (0 if none), and clients get a `darkroom` event when that changes, so they
   can follow the user;

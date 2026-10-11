@@ -5955,6 +5955,8 @@ static gboolean _thumbnail(JsonObject *params, JsonBuilder *b, gchar **err)
   return ok;
 }
 
+static void _marks_note(const dt_imgid_t imgid);
+
 static gboolean _set_rating(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   const dt_imgid_t imgid = params ? json_object_get_int_member_with_default(params, "imgid", -1) : -1;
@@ -5981,6 +5983,12 @@ static gboolean _set_rating(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   // as the lighttable: rejecting keeps the stars, a rating clears the reject
   dt_ratings_apply_on_image(imgid, rating, FALSE, FALSE, FALSE);
+  _marks_note(imgid);
+  // darktable's window redraws the thumbnail and filters again, as after
+  // its own rating shortcut (ratings.c, _action_process_rating)
+  if(_in_gui)
+    dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
+                               DT_COLLECTION_PROP_RATING_RANGE, g_list_prepend(NULL, GINT_TO_POINTER(imgid)));
   return _image_info(params, b, err);
 }
 
@@ -6004,6 +6012,11 @@ static gboolean _set_label(JsonObject *params, JsonBuilder *b, gchar **err)
   else
     dt_colorlabels_remove_label(imgid, label);
   dt_image_write_sidecar_file(imgid);
+  _marks_note(imgid);
+  // as after darktable's own color label shortcut (colorlabels.c)
+  if(_in_gui)
+    dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
+                               DT_COLLECTION_PROP_COLORLABEL, g_list_prepend(NULL, GINT_TO_POINTER(imgid)));
   return _image_info(params, b, err);
 }
 
@@ -9172,6 +9185,81 @@ static void _gui_info_cb(gpointer instance, GList *imgs, gpointer user_data)
     _notify(NULL, "image", GPOINTER_TO_INT(l->data));
 }
 
+// ratings, rejects and color labels changed in darktable's window (stars
+// clicked on a thumbnail, shortcuts, undo, the filmstrip): darktable raises
+// "metadata changed" without saying which images, or "collection changed"
+// with them only for some paths. so on either, once the main loop is idle,
+// each image's marks are read again (one query) and compared with the last
+// seen; the changed images get an "image" event. the API's own changes are
+// noted as they are made, so they aren't announced twice
+
+static GHashTable *_marks = NULL;      // imgid -> its marks + 1 (0 is "absent")
+static guint _marks_timer = 0;
+
+static GHashTable *_marks_read(const dt_imgid_t only)
+{
+  GHashTable *h = g_hash_table_new(NULL, NULL);
+  sqlite3_stmt *st;
+  // bits 0-2 the rating, 3 the reject flag (DT_IMAGE_REJECTED), 4- the labels
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "SELECT i.id, (i.flags & 15)"
+                              "  | (IFNULL((SELECT SUM(1 << color) FROM main.color_labels"
+                              "            WHERE imgid = i.id), 0) << 4)"
+                              " FROM main.images AS i WHERE ?1 < 1 OR i.id = ?1",
+                              -1, &st, NULL);
+  DT_DEBUG_SQLITE3_BIND_INT(st, 1, only);
+  while(sqlite3_step(st) == SQLITE_ROW)
+    g_hash_table_insert(h, GINT_TO_POINTER(sqlite3_column_int(st, 0)),
+                        GINT_TO_POINTER(sqlite3_column_int(st, 1) + 1));
+  sqlite3_finalize(st);
+  return h;
+}
+
+static void _marks_note(const dt_imgid_t imgid)
+{
+  if(!_marks) return;
+  GHashTable *one = _marks_read(imgid);
+  gpointer v = g_hash_table_lookup(one, GINT_TO_POINTER(imgid));
+  if(v) g_hash_table_insert(_marks, GINT_TO_POINTER(imgid), v);
+  g_hash_table_destroy(one);
+}
+
+static gboolean _marks_check(gpointer data)
+{
+  _marks_timer = 0;
+  GHashTable *now = _marks_read(NO_IMGID);
+  GHashTableIter it;
+  gpointer id, v;
+  g_hash_table_iter_init(&it, now);
+  while(g_hash_table_iter_next(&it, &id, &v))
+  {
+    const gpointer was = _marks ? g_hash_table_lookup(_marks, id) : NULL;
+    // new images (an import) aren't changes to announce
+    if(was && was != v) _notify(NULL, "image", GPOINTER_TO_INT(id));
+  }
+  if(_marks) g_hash_table_destroy(_marks);
+  _marks = now;
+  return G_SOURCE_REMOVE;
+}
+
+static void _marks_changed(void)
+{
+  // a burst of signals (a rating on a selection) is one check
+  if(_marks && !_marks_timer) _marks_timer = g_timeout_add(100, _marks_check, NULL);
+}
+
+static void _gui_metadata_cb(gpointer instance, const guint type, gpointer user_data)
+{
+  _marks_changed();
+}
+
+static void _gui_collection_cb(gpointer instance, const dt_collection_change_t query_change,
+                               const dt_collection_properties_t changed_property, gpointer imgs,
+                               const int next, gpointer user_data)
+{
+  _marks_changed();
+}
+
 static void _drafts_load(void);
 
 gboolean dt_api_handover(const char *path)
@@ -9245,6 +9333,9 @@ void dt_api_start(const dt_api_options_t *options)
     DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_CONTROL_PICKERDATA_READY, _gui_pickerdata_cb, NULL);
     DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED, _gui_preview_finished_cb, NULL);
     DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_UI_PIPE_FINISHED, _gui_full_finished_cb, NULL);
+    DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_METADATA_CHANGED, _gui_metadata_cb, NULL);
+    DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_COLLECTION_CHANGED, _gui_collection_cb, NULL);
+    _marks = _marks_read(NO_IMGID);
   }
   // unsaved edits handed over by an engine (dt_api_handover) or kept by the
   // last server that stopped
@@ -9331,6 +9422,12 @@ gboolean dt_api_stop(void)
     DT_CONTROL_SIGNAL_DISCONNECT(_gui_pickerdata_cb, NULL);
     DT_CONTROL_SIGNAL_DISCONNECT(_gui_preview_finished_cb, NULL);
     DT_CONTROL_SIGNAL_DISCONNECT(_gui_full_finished_cb, NULL);
+    DT_CONTROL_SIGNAL_DISCONNECT(_gui_metadata_cb, NULL);
+    DT_CONTROL_SIGNAL_DISCONNECT(_gui_collection_cb, NULL);
+    if(_marks_timer) g_source_remove(_marks_timer);
+    _marks_timer = 0;
+    if(_marks) g_hash_table_destroy(_marks);
+    _marks = NULL;
     if(_gui_session.mirror) _session_free(_gui_session.mirror);
     _gui_session.mirror = NULL;
   }

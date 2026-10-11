@@ -575,6 +575,25 @@ static gboolean _session_open(const dt_imgid_t imgid, const gboolean fresh,
   return TRUE;
 }
 
+// a module instance as darktable's history panel names it ("local contrast",
+// "exposure • sky"), without its markup
+static void _add_label(JsonBuilder *b, const dt_iop_module_t *m, const char *multi_name,
+                       const gboolean hand_edited)
+{
+  gchar *label;
+  if(!multi_name || !*multi_name || !g_strcmp0(multi_name, "0"))
+    label = g_strdup(m->name());
+  else
+  {
+    gchar *l = hand_edited ? g_strdup(multi_name) : dt_util_localize_segmented_name(multi_name, FALSE);
+    label = g_strdup_printf("%s • %s", m->name(), l);
+    g_free(l);
+  }
+  json_builder_set_member_name(b, "label");
+  json_builder_add_string_value(b, label);
+  g_free(label);
+}
+
 static gboolean _module_list(JsonBuilder *b, gchar **err)
 {
   if(!_cur)
@@ -596,6 +615,7 @@ static gboolean _module_list(JsonBuilder *b, gchar **err)
     json_builder_add_int_value(b, m->multi_priority);
     json_builder_set_member_name(b, "name");
     json_builder_add_string_value(b, m->multi_name);
+    _add_label(b, m, m->multi_name, m->multi_name_hand_edited);
     json_builder_set_member_name(b, "enabled");
     json_builder_add_boolean_value(b, m->enabled);
     json_builder_set_member_name(b, "in_history");
@@ -1029,17 +1049,24 @@ static void _record(dt_iop_module_t *m, const gboolean enable)
 
 static JsonNode *_changed_settings(const dt_iop_module_t *m, const void *before);
 
-// the darkroom control a setting is bound to (dt_bauhaus_*_from_params)
+// the darkroom control a setting is bound to (dt_bauhaus_*_from_params).
+// some modules bind two controls to one setting and show only one of them,
+// e.g. local contrast's highlights and range, one per mode; its gui_changed
+// switches the mode by which control moved, so take the one shown
 static GtkWidget *_field_widget(dt_iop_module_t *m, const dt_introspection_field_t *f)
 {
   const void *field = (const uint8_t *)m->params + f->header.offset;
+  GtkWidget *first = NULL;
   for(GSList *l = m->widget_list; l; l = g_slist_next(l))
   {
     const dt_action_target_t *ref = l->data;
     if(ref && DT_IS_BAUHAUS_WIDGET(ref->target) && dt_bauhaus_widget_get_field(ref->target) == field)
-      return ref->target;
+    {
+      if(gtk_widget_get_visible(ref->target)) return ref->target;
+      if(!first) first = ref->target;
+    }
   }
-  return NULL;
+  return first;
 }
 
 // as moving a control in the darkroom: the module's gui_changed runs for
@@ -1208,6 +1235,7 @@ static gboolean _history_list(JsonBuilder *b, gchar **err)
     json_builder_add_int_value(b, hi->multi_priority);
     json_builder_set_member_name(b, "name");
     json_builder_add_string_value(b, hi->multi_name);
+    if(hi->module) _add_label(b, hi->module, hi->multi_name, hi->multi_name_hand_edited);
     json_builder_set_member_name(b, "enabled");
     json_builder_add_boolean_value(b, hi->enabled);
     json_builder_set_member_name(b, "applied");
@@ -8095,7 +8123,7 @@ static void _notify_job(const _job_t *j)
 static const char *_methods[] = {
   "ping", "film_rolls", "images_list", "image_info", "thumbnail", "set_rating", "set_label",
   "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
-  "module_enable", "preset_list", "preset_apply", "history_list", "history_end", "geometry_get",
+  "module_enable", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
   "retouch_remove", "blend_get", "blend_set", "mask_add", "mask_list",
   "mask_remove", "mask_add.path", "mask_ai", "mask_ai_encode", "export.background", "sample", "ai_denoise", "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "style_list", "style_create", "style_delete", "style_apply",

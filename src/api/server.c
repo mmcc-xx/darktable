@@ -3148,7 +3148,11 @@ static gboolean _mask_attach_ext(dt_iop_module_t *m, dt_masks_form_t *form, cons
   if(_cur->gui)
   {
     dt_masks_iop_update(m);
-    dt_dev_add_history_item(dev, m, TRUE);
+    // with the forms, as darktable's mask manager records a shape's combine
+    // or inverse change: dt_masks_gui_form_save_creation recorded them (and
+    // synced the darkroom's pipes) before the group entry got them above,
+    // and a module history item alone keeps that earlier copy
+    dt_dev_add_masks_history_item(dev, m, TRUE);
     dt_dev_undo_end_record(dev);
     _api_editing = FALSE;
     _gui_changed_by_api();

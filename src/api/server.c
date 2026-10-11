@@ -5845,6 +5845,59 @@ static gboolean _darkroom_open(JsonObject *params, JsonBuilder *b, gchar **err)
   return TRUE;
 }
 
+// a snapshot in the darkroom's snapshots module of its image at a history
+// step, shown split against the edit as clicking the snapshot does: the
+// window's own before/after
+static gboolean _darkroom_snapshot(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  const dt_imgid_t imgid = _darkroom_image();
+  if(!dt_is_valid_imgid(imgid))
+  {
+    *err = g_strdup("darkroom_snapshot needs darktable's window serving the API, with a photo in the darkroom");
+    return FALSE;
+  }
+  if(params && json_object_has_member(params, "imgid") && json_object_get_int_member(params, "imgid") != imgid)
+  {
+    *err = g_strdup_printf("the darkroom has image %d open", imgid);
+    return FALSE;
+  }
+  const int items = g_list_length(darktable.develop->history);
+  const int end = params ? json_object_get_int_member_with_default(params, "history_end", 0) : 0;
+  if(end < 0 || end > items)
+  {
+    *err = g_strdup_printf("history_end must be 0..%d", items);
+    return FALSE;
+  }
+  int (*take_at)(dt_lib_module_t *, int, gboolean) = NULL;
+  dt_lib_module_t *lib = NULL;
+  for(GList *l = darktable.lib->plugins; l; l = g_list_next(l))
+  {
+    dt_lib_module_t *m = l->data;
+    if(!g_strcmp0(m->plugin_name, "snapshots")) lib = m;
+  }
+  if(!lib || !lib->module || !g_module_symbol(lib->module, "dt_lib_snapshots_take_at", (gpointer *)&take_at))
+  {
+    *err = g_strdup("this darktable's snapshots module can't take a snapshot for the API");
+    return FALSE;
+  }
+  const gboolean show = params ? json_object_get_boolean_member_with_default(params, "show", TRUE) : TRUE;
+  const int slot = take_at(lib, end, show);
+  if(slot < 0)
+  {
+    *err = g_strdup("every snapshot slot is in use: remove one in the snapshots module first");
+    return FALSE;
+  }
+  json_builder_set_member_name(b, "imgid");
+  json_builder_add_int_value(b, imgid);
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, end);
+  json_builder_set_member_name(b, "slot");
+  json_builder_add_int_value(b, slot);
+  json_builder_set_member_name(b, "shown");
+  json_builder_add_boolean_value(b, show);
+  return TRUE;
+}
+
 // a thumbnail from darktable's mipmap cache (rendered with the image's
 // current history if the cache has none), as darktable's lighttable shows it
 static gboolean _thumbnail(JsonObject *params, JsonBuilder *b, gchar **err)
@@ -6203,6 +6256,158 @@ static gboolean _tag_list(JsonObject *params, JsonBuilder *b, gchar **err)
   json_builder_end_array(b);
   sqlite3_finalize(st);
   g_free(like);
+  return TRUE;
+}
+
+// ---- alternatives -------------------------------------------------------------
+// render_variants: each variant's steps applied to the edit, rendered, then
+// taken back, so nothing of them stays in the history. in darktable's window
+// they run on the render mirror, never on the darkroom's own edit
+
+// edit methods a variant may use: none of them adds or removes a module
+// instance or moves one, so restoring the history restores the edit
+static const char *_variant_methods[] = {
+  "module_set", "module_enable", "preset_apply", "blend_set", "curve_set", "geometry_set", NULL };
+
+static gboolean _variant_step(const char *method, JsonObject *params, gchar **err)
+{
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  gboolean ok;
+  if(!g_strcmp0(method, "module_set")) ok = _module_set(params, b, err);
+  else if(!g_strcmp0(method, "module_enable")) ok = _module_enable(params, b, err);
+  else if(!g_strcmp0(method, "preset_apply")) ok = _preset_apply(params, b, err);
+  else if(!g_strcmp0(method, "blend_set")) ok = _blend_set(params, b, err);
+  else if(!g_strcmp0(method, "curve_set")) ok = _curve_set(params, b, err);
+  else if(!g_strcmp0(method, "geometry_set")) ok = _geometry_set(params, b, err);
+  else
+  {
+    GString *names = g_string_new(NULL);
+    for(int k = 0; _variant_methods[k]; k++)
+      g_string_append_printf(names, "%s%s", k ? ", " : "", _variant_methods[k]);
+    *err = g_strdup_printf("a variant step can't be '%s' (one of: %s)", method, names->str);
+    g_string_free(names, TRUE);
+    ok = FALSE;
+  }
+  json_builder_end_object(b);
+  g_object_unref(b);
+  return ok;
+}
+
+static gboolean _render_variants(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = g_strdup("no open session");
+    return FALSE;
+  }
+  JsonArray *variants = params && json_object_has_member(params, "variants")
+                        && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "variants"))
+    ? json_object_get_array_member(params, "variants") : NULL;
+  const guint n = variants ? json_array_get_length(variants) : 0;
+  if(!n || n > 12)
+  {
+    *err = g_strdup("render_variants needs variants: 1 to 12 of {label, path, steps: [{method, params}]}");
+    return FALSE;
+  }
+  for(guint i = 0; i < n; i++)
+  {
+    JsonNode *vn = json_array_get_element(variants, i);
+    JsonObject *v = JSON_NODE_HOLDS_OBJECT(vn) ? json_node_get_object(vn) : NULL;
+    if(!v || !json_object_get_string_member_with_default(v, "path", NULL)
+       || (json_object_has_member(v, "steps") && !JSON_NODE_HOLDS_ARRAY(json_object_get_member(v, "steps"))))
+    {
+      *err = g_strdup_printf("variant %u needs a path, and steps as a list", i);
+      return FALSE;
+    }
+  }
+
+  _session_t *owner = _cur;
+  _session_t *s = owner->gui ? _pipe_session(err) : owner;
+  if(!s) return FALSE;
+  _cur = s;
+  dt_develop_t *dev = s->dev;
+  GList *history = dt_history_duplicate(dev->history);
+  GList *forms = dt_masks_dup_forms_deep(dev->forms, NULL);
+  const int end = dev->history_end;
+  const gboolean dirty = s->dirty;
+  const gboolean focus = dev->focus_hash;
+  const guint instances = g_list_length(dev->iop);
+
+  // the size and options every variant renders with
+  JsonObject *view = json_object_new();
+  const char *keys[] = { "width", "height", "quality", "uncropped", NULL };
+  for(int k = 0; keys[k]; k++)
+    if(json_object_has_member(params, keys[k]))
+      json_object_set_member(view, keys[k], json_node_copy(json_object_get_member(params, keys[k])));
+
+  json_builder_set_member_name(b, "variants");
+  json_builder_begin_array(b);
+  for(guint i = 0; i < n; i++)
+  {
+    JsonObject *v = json_array_get_object_element(variants, i);
+    JsonArray *steps = json_object_has_member(v, "steps") ? json_object_get_array_member(v, "steps") : NULL;
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "label");
+    json_builder_add_string_value(b, json_object_get_string_member_with_default(v, "label", ""));
+    gchar *verr = NULL;
+    guint k = 0;
+    for(; steps && k < json_array_get_length(steps) && !verr; k++)
+    {
+      JsonNode *sn = json_array_get_element(steps, k);
+      JsonObject *st = JSON_NODE_HOLDS_OBJECT(sn) ? json_node_get_object(sn) : NULL;
+      JsonNode *pn = st ? json_object_get_member(st, "params") : NULL;
+      gchar *serr = NULL;
+      if(!st || !json_object_get_string_member_with_default(st, "method", NULL))
+        serr = g_strdup("a step needs a method");
+      else
+        _variant_step(json_object_get_string_member(st, "method"),
+                      pn && JSON_NODE_HOLDS_OBJECT(pn) ? json_node_get_object(pn) : NULL, &serr);
+      if(serr) verr = g_strdup_printf("step %u: %s", k, serr);
+      g_free(serr);
+    }
+    if(!verr)
+    {
+      json_object_set_string_member(view, "path", json_object_get_string_member(v, "path"));
+      json_builder_set_member_name(b, "path");
+      json_builder_add_string_value(b, json_object_get_string_member(v, "path"));
+      _render_session(view, b, &verr);
+    }
+    if(verr)
+    {
+      json_builder_set_member_name(b, "error");
+      json_builder_add_string_value(b, verr);
+      g_free(verr);
+    }
+    json_builder_end_object(b);
+
+    // take the variant back: the history as it was, replayed. history_end
+    // first, so the replay doesn't swap the shapes itself: that parks the
+    // old ones on darktable.develop (dt_masks_replace_current_forms), which
+    // in darktable's window is the darkroom's edit
+    g_list_free_full(dev->history, dt_dev_free_history_item);
+    dev->history = dt_history_duplicate(history);
+    dev->history_end = end;
+    dt_dev_pop_history_items_ext(dev, end);
+    g_list_free_full(dev->forms, (void (*)(void *))dt_masks_free_form);
+    dev->forms = dt_masks_dup_forms_deep(forms, NULL);
+    s->pipe_changed = TRUE;
+  }
+  json_builder_end_array(b);
+  json_object_unref(view);
+
+  g_list_free_full(history, dt_dev_free_history_item);
+  g_list_free_full(forms, (void (*)(void *))dt_masks_free_form);
+  s->dirty = dirty;
+  dev->focus_hash = focus;
+  _cur = owner;
+  if(g_list_length(dev->iop) != instances)
+  {
+    // a step added an instance after all: the edit can't be trusted any more
+    if(owner->gui) owner->mirror_gen = 0;
+    *err = g_strdup("a variant changed the module instances; reopen the photo with fresh");
+    return FALSE;
+  }
   return TRUE;
 }
 
@@ -8176,6 +8381,37 @@ static void _notify(const struct _client_t *from, const char *type, const dt_img
   g_object_unref(b);
 }
 
+// share: something a client wants the others to show, e.g. a comparison
+// an AI prepared (kind "compare" or "variants"); the engine only relays it
+static void _notify_shared(const struct _client_t *from, const dt_imgid_t imgid, const char *kind, JsonNode *data)
+{
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "jsonrpc");
+  json_builder_add_string_value(b, "2.0");
+  json_builder_set_member_name(b, "method");
+  json_builder_add_string_value(b, "event");
+  json_builder_set_member_name(b, "params");
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "type");
+  json_builder_add_string_value(b, "shared");
+  json_builder_set_member_name(b, "imgid");
+  json_builder_add_int_value(b, imgid);
+  json_builder_set_member_name(b, "kind");
+  json_builder_add_string_value(b, kind);
+  json_builder_set_member_name(b, "data");
+  json_builder_add_value(b, data ? json_node_copy(data) : json_node_new(JSON_NODE_NULL));
+  json_builder_set_member_name(b, "client");
+  json_builder_add_int_value(b, from ? from->id : 0);
+  json_builder_end_object(b);
+  json_builder_end_object(b);
+  JsonNode *root = json_builder_get_root(b);
+  for(GList *l = _clients; l; l = g_list_next(l))
+    if(l->data != from) _send_node(l->data, root);
+  json_node_unref(root);
+  g_object_unref(b);
+}
+
 // a job ended: every client hears it (the one that started it too)
 static void _notify_job(const _job_t *j)
 {
@@ -8207,12 +8443,13 @@ static const char *_methods[] = {
   "mask_remove", "mask_add.path", "mask_ai", "mask_ai_encode", "export.background", "sample", "ai_denoise", "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "image_remove", "style_list", "style_create", "style_delete", "style_apply",
   "history_paste", "collection", "darkroom_open", "image_info.exif", "image_metadata", "tag_list", "set_tags",
   "set_metadata", "set_location", "picker_list", "picker_apply", "module_remove", "module_rename", "history_compress",
-  "render.history_end", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
+  "render.history_end", "render_variants", "darkroom_snapshot", "share", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
   "library_status", "library_release", "library_acquire", "handover", "shutdown", NULL };
 
 // methods that work on an edit session, and the event each one sends
 static const struct { const char *method; const char *event; } _session_methods[] = {
   { "module_list", NULL }, { "module_get", NULL }, { "history_list", NULL }, { "render", NULL },
+  { "render_variants", NULL },
   { "geometry_get", NULL }, { "preset_list", NULL }, { "preset_apply", "edit" },
   { "coords", NULL }, { "retouch_list", NULL }, { "retouch_heal", "edit" },
   { "retouch_add", "edit" }, { "retouch_set", "edit" }, { "retouch_remove", "edit" },
@@ -8400,6 +8637,21 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _collection(params, b, &err);
   else if(!g_strcmp0(method, "darkroom_open"))
     _darkroom_open(params, b, &err);
+  else if(!g_strcmp0(method, "darkroom_snapshot"))
+    _darkroom_snapshot(params, b, &err);
+  else if(!g_strcmp0(method, "share"))
+  {
+    const char *kind = params ? json_object_get_string_member_with_default(params, "kind", NULL) : NULL;
+    if(!kind || !*kind)
+      err = g_strdup("share needs a kind");
+    else
+    {
+      const dt_imgid_t imgid = json_object_get_int_member_with_default(params, "imgid", c->current);
+      _notify_shared(c, imgid, kind, json_object_get_member(params, "data"));
+      json_builder_set_member_name(b, "clients");
+      json_builder_add_int_value(b, g_list_length(_clients) - 1);
+    }
+  }
   else if(!g_strcmp0(method, "image_metadata"))
     _image_metadata(params, c->current, b, &err);
   else if(!g_strcmp0(method, "tag_list"))
@@ -8509,6 +8761,8 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _reset(b, &err);
   else if(!g_strcmp0(method, "render"))
     _render(params, b, &err);
+  else if(!g_strcmp0(method, "render_variants"))
+    _render_variants(params, b, &err);
   else if(!g_strcmp0(method, "shutdown"))
   {
     if(_opt.in_gui)

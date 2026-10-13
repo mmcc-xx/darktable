@@ -18,6 +18,9 @@ https://github.com/mmcc-xx/darktable-api-web
 An MCP server using it, for AI assistants:
 https://github.com/mmcc-xx/darktable-api-mcp
 
+A demo video (the web app, darktable's window and an AI assistant on one
+photo): https://www.youtube.com/watch?v=VDfZbxvvniY
+
 This code was written with AI assistance (Claude), directed and reviewed by
 the branch owner.
 

@@ -97,7 +97,7 @@ The README's Compile section has the commands, for the `build.sh` route and
 for driving cmake by hand. What it does not say:
 
 - `--enable-ai` and `-DUSE_AI=ON` are the same switch: `build.sh` uppercases
-  the feature name and prefixes `USE_`. The features are `ai`, `camera`,
+  the feature name and prefixes `USE_`. The features are `ai`, `api`, `camera`,
   `colord`, `gmic`, `graphicsmagick`, `imagemagick`, `jxl`, `kwallet`,
   `libsecret`, `lua`, `mac_integration`, `map`, `mcp`, `opencl`, `opencv`,
   `openexr`, `openmp`, `unity` and `webp`. Left alone, cmake enables what it

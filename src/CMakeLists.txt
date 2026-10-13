@@ -184,8 +184,8 @@ FILE(GLOB SOURCE_FILES
   )
 
 # the darktable-api request server, used by the darktable-api engine and by
-# darktable's window (--api)
-if(USE_MCP)
+# darktable's window (--api-socket)
+if(USE_API)
   list(APPEND SOURCE_FILES "api/server.c")
   add_definitions(-DHAVE_API)
 endif()
@@ -1234,9 +1234,12 @@ add_subdirectory(cli)
 # have a Model Context Protocol server exposing the raw engine to AI agents
 if(USE_MCP)
   add_subdirectory(mcp)
-  # long-running edit engine (proof of concept), built with the MCP server;
-  # its request server is part of libdarktable (see below), so that
-  # darktable's window can serve the same API
+endif()
+
+# long-running edit engine (proof of concept); its request server is part
+# of libdarktable (see above), so that darktable's window can serve the
+# same API
+if(USE_API)
   add_subdirectory(api)
 endif()
 

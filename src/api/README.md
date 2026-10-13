@@ -26,9 +26,12 @@ the branch owner.
 
 ## Build
 
-Build darktable as usual with the MCP server enabled (`-DUSE_MCP=ON`, or
-`./build.sh --enable-mcp`); `darktable-api` is built with it. The AI
-methods (`mask_ai`, `ai_denoise`) need `-DUSE_AI=ON`:
+Build darktable as usual with the API enabled (`-DUSE_API=ON`, or
+`./build.sh --enable-api`; off by default). That builds `darktable-api`
+and lets darktable's window serve the API (`--api-socket`); without it
+neither exists (a build folder configured before the option existed
+needs `cmake -B build -DUSE_API=ON` once). The AI methods (`mask_ai`,
+`ai_denoise`) need `-DUSE_AI=ON`:
 
     cmake --build build --target darktable-api
 

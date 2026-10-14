@@ -284,6 +284,7 @@
 #include "gui/color_picker_proxy.h"
 #include "libs/colorpicker.h"
 #include "libs/lib.h"
+#include "api/compat.h"
 #ifdef HAVE_AI
 #include "common/ai/segmentation.h"
 #include "common/ai/restore.h"
@@ -1473,10 +1474,10 @@ static gboolean _preset_apply(JsonObject *params, JsonBuilder *b, gchar **err)
     memcpy(m->params, op && op_len == m->params_size ? op : m->default_params, m->params_size);
     m->enabled = sqlite3_column_int(st, 2);
     if(bl && bl_version == dt_develop_blend_version() && bl_len == sizeof(dt_develop_blend_params_t))
-      dt_iop_commit_blend_params(m, bl, NULL);
+      dt_api_commit_blend_params(m, bl);
     else if(!bl || dt_develop_blend_legacy_params(m, bl, bl_version, m->blend_params,
                                                   dt_develop_blend_version(), bl_len))
-      dt_iop_commit_blend_params(m, m->default_blendop_params, NULL);
+      dt_api_commit_blend_params(m, m->default_blendop_params);
     // dt_iop_update_multi_name, without its history item and header update
     if(dt_conf_get_bool("darkroom/ui/auto_module_name_update") && !m->multi_name_hand_edited)
     {
@@ -3097,7 +3098,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
   if(raster) bp.mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER;
   // the sink registered with its source, so the source keeps its mask
   // (dt_iop_commit_blend_params, as the raster mask menu's history item)
-  dt_iop_commit_blend_params(m, &bp, NULL);
+  dt_api_commit_blend_params(m, &bp);
   _record(m, TRUE);
   json_builder_set_member_name(b, "history_end");
   json_builder_add_int_value(b, _cur->dev->history_end);
@@ -3829,7 +3830,7 @@ static gboolean _module_add(JsonObject *params, JsonBuilder *b, gchar **err)
         memcpy(m->params, base->params, m->params_size);
         if(m->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
         {
-          dt_iop_commit_blend_params(m, base->blend_params, NULL);
+          dt_api_commit_blend_params(m, base->blend_params);
           // its own group with the base's shapes, as the darkroom's copy
           if(dt_is_valid_maskid(base->blend_params->mask_id))
           {
@@ -4875,7 +4876,7 @@ static gchar *_export_target(const dt_imgid_t imgid, const char *pattern_in, con
   vp->sequence = 1;
 
   gchar *pattern = dt_util_fix_path(pattern_in);
-  gchar *base = dt_variables_expand_path(vp, pattern, TRUE);
+  gchar *base = dt_api_expand_path(vp, pattern, TRUE);
   const size_t n = base ? strlen(base) : 0;
   if(n && (base[n - 1] == '/' || base[n - 1] == '\\'))
   {
@@ -4884,7 +4885,7 @@ static gchar *_export_target(const dt_imgid_t imgid, const char *pattern_in, con
     while(k > 1 && (pattern[k - 1] == '/' || pattern[k - 1] == '\\')) pattern[--k] = '\0';
     gchar *p2 = g_strconcat(pattern, G_DIR_SEPARATOR_S "$(FILE_NAME)", NULL);
     g_free(base);
-    base = dt_variables_expand_path(vp, p2, TRUE);
+    base = dt_api_expand_path(vp, p2, TRUE);
     g_free(p2);
   }
   g_free(pattern);
@@ -7475,7 +7476,7 @@ static gpointer _ai_denoise_thread(gpointer data)
     dt_free_align(rgb);
   }
   if(!j->status && dt_conf_get_bool("plugins/lighttable/neural_restore/mark_output"))
-    dt_exif_xmp_write_neural_restore(j->file, "raw-denoise");
+    dt_api_mark_neural_restore(j->file, "raw-denoise");
   if(ctx) dt_restore_unref(ctx);
   if(env) dt_restore_env_destroy(env);
   return NULL;
@@ -7627,7 +7628,7 @@ static gboolean _ai_denoise(JsonObject *params, const dt_imgid_t current, JsonBu
   vp->jobcode = "neural_restore";
   vp->imgid = imgid;
   vp->sequence = 1;
-  gchar *base = dt_variables_expand_path(vp, (gchar *)pattern, TRUE);
+  gchar *base = dt_api_expand_path(vp, (gchar *)pattern, TRUE);
   dt_variables_params_destroy(vp);
   g_free(conf);
   if(!base || !*base)
@@ -8090,7 +8091,7 @@ static GList *_controls(dt_iop_module_t *m)
       if(paint == dtgtk_cairo_paint_colorpicker) picker = TRUE;
       else if(paint != dtgtk_cairo_paint_wand) continue;
     }
-    else if(g_object_get_data(G_OBJECT(w), DT_COLOR_PICKER_INSTANCE_KEY))
+    else if(dt_api_is_picker_button(w))
       picker = TRUE;
     else if(!GTK_IS_BUTTON(w) || GTK_IS_TOGGLE_BUTTON(w))
       continue;
@@ -8147,7 +8148,7 @@ static gboolean _picker_list(JsonObject *params, JsonBuilder *b, gchar **err)
     if(c->picker)
     {
       json_builder_set_member_name(b, "active");
-      json_builder_add_boolean_value(b, dt_iop_color_picker_is_active(c->widget));
+      json_builder_add_boolean_value(b, dt_api_picker_is_active(c->widget));
     }
     json_builder_end_object(b);
   }
@@ -8181,7 +8182,7 @@ static gboolean _press(dt_iop_module_t *m, const _control_t *c)
   // turns into a click a quarter second later (gtk_real_button_activate):
   // click it now, so the pipe runs that follow see the press
   if(GTK_IS_BUTTON(c->widget) && !c->picker && !DT_IS_BAUHAUS_WIDGET(c->widget)
-     && !g_object_get_data(G_OBJECT(c->widget), DT_ACTION_GESTURE_KEY))
+     && !dt_api_button_has_gesture(c->widget))
   {
     if(!gtk_widget_is_sensitive(c->widget)) return FALSE;
     gtk_button_clicked(GTK_BUTTON(c->widget));
@@ -8320,10 +8321,10 @@ static void _run_pipes(dt_develop_t *dev)
 static const char *_pick_arm(_job_t *j, dt_iop_module_t *m, const _control_t *c)
 {
   dt_develop_t *dev = darktable.develop;
-  if(!dt_iop_color_picker_is_active(c->widget) && !_press(m, c))
+  if(!dt_api_picker_is_active(c->widget) && !_press(m, c))
     return "darktable didn't accept the press";
   const dt_iop_color_picker_t *proxy = darktable.lib->proxy.colorpicker.picker_proxy;
-  if(!proxy || proxy->module != m || !dt_iop_color_picker_is_active(c->widget))
+  if(!proxy || proxy->module != m || !dt_api_picker_is_active(c->widget))
     return "darktable didn't switch the picker on";
   if(j->point)
   {
@@ -8339,7 +8340,7 @@ static const char *_pick_arm(_job_t *j, dt_iop_module_t *m, const _control_t *c)
   }
   // a run already under way samples the old area: then the first sample
   // is not this one (_gui_pickerdata_cb)
-  j->phase = dt_pipe_processing(dev->preview_pipe) ? 0 : 1;
+  j->phase = dt_api_pipe_processing(dev->preview_pipe) ? 0 : 1;
   _run_preview(dev);
   return NULL;
 }
@@ -8413,13 +8414,13 @@ static gboolean _pick_watch(gpointer data)
   {
     // the preview pipe may not have run (see _run_pipes): ask again now
     // and then
-    if(++j->presses % 20 == 0 && !dt_pipe_processing(dev->preview_pipe)) _run_preview(dev);
+    if(++j->presses % 20 == 0 && !dt_api_pipe_processing(dev->preview_pipe)) _run_preview(dev);
     return G_SOURCE_CONTINUE;
   }
   // buttons: once both pipes have run since the last step and are idle,
   // press (phase 0) or read what the press did (phase 1)
   // (a run cut short by a newer change ends too, but leaves its pipe dirty)
-  const gboolean idle = !dt_pipe_processing(dev->full.pipe) && !dt_pipe_processing(dev->preview_pipe)
+  const gboolean idle = !dt_api_pipe_processing(dev->full.pipe) && !dt_api_pipe_processing(dev->preview_pipe)
                         && dev->full.pipe->status == DT_DEV_PIXELPIPE_VALID
                         && dev->preview_pipe->status == DT_DEV_PIXELPIPE_VALID
                         && _preview_runs > j->preview_mark && _full_runs > j->full_mark;

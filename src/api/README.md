@@ -35,6 +35,13 @@ needs `cmake -B build -DUSE_API=ON` once). The AI methods (`mask_ai`,
 
     cmake --build build --target darktable-api
 
+`src/api` builds against darktable master and against releases from 5.6.2
+on. What differs between them is in `compat.h`, chosen by the feature
+checks in `compat.cmake` (what a darktable has, not its version number).
+A few features use functions only this branch adds to darktable, looked up
+at runtime: without them, sliders' pickers and wands aren't listed,
+`darkroom_snapshot` refuses, and straightening doesn't fit the crop.
+
 Tested on macOS (Apple M1) and Linux (Ubuntu 24.04, gcc 13), headless and
 with darktable's window. On Linux, ONNX Runtime is loaded by file name, so
 darktable run from the build tree needs `plugins/ai/ort_library_path`

@@ -188,6 +188,7 @@ FILE(GLOB SOURCE_FILES
 if(USE_API)
   list(APPEND SOURCE_FILES "api/server.c")
   add_definitions(-DHAVE_API)
+  include(api/compat.cmake)
 endif()
 
 FILE(GLOB HEADER_FILES "*.h" "common/*.h" "external/OpenCL/CL/*.h" "control/*.h" "iop/*.h" "libs/*.h" "views/*.h")

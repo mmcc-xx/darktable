@@ -175,6 +175,14 @@ FILE(GLOB SOURCE_FILES
   "views/view.c"
   )
 
+# the darktable-api request server, used by the darktable-api engine and by
+# darktable's window (--api-socket)
+if(USE_API)
+  list(APPEND SOURCE_FILES "api/server.c")
+  add_definitions(-DHAVE_API)
+  include(api/compat.cmake)
+endif()
+
 FILE(GLOB HEADER_FILES "*.h" "common/*.h" "external/OpenCL/CL/*.h" "control/*.h" "iop/*.h" "libs/*.h" "views/*.h")
 
 if(APPLE)
@@ -1093,6 +1101,13 @@ endif(HAVE_OPENCL)
 
 # have a command line interface
 add_subdirectory(cli)
+
+# long-running edit engine (proof of concept); its request server is part
+# of libdarktable (see above), so that darktable's window can serve the
+# same API
+if(USE_API)
+  add_subdirectory(api)
+endif()
 
 # have a command line utility to generate all the thumbnails
 add_subdirectory(generate-cache)

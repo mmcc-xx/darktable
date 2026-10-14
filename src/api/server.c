@@ -526,6 +526,20 @@ static void _session_info(JsonBuilder *b, const _session_t *s)
   json_builder_add_boolean_value(b, s->dirty);
 }
 
+// edits after this start their own history item instead of merging into
+// the top one, which darktable's window or another client made before (the
+// darkroom merges a module's edits into the top item while it has focus,
+// develop.c, _dev_add_history_item_ext): undo back to here then restores
+// what was there. As dt_dev_reload_history_items does for items read from
+// the library
+static void _history_boundary(dt_develop_t *dev)
+{
+  dt_pthread_mutex_lock(&dev->history_mutex);
+  GList *top = dev->history_end > 0 ? g_list_nth(dev->history, dev->history_end - 1) : NULL;
+  if(top) ((dt_dev_history_item_t *)top->data)->focus_hash = FALSE;
+  dt_pthread_mutex_unlock(&dev->history_mutex);
+}
+
 // open an image for editing. a session another client has open is joined,
 // unsaved changes included, unless fresh asks to reload it as saved (which
 // drops those changes for everyone)
@@ -569,6 +583,7 @@ static gboolean _session_open(const dt_imgid_t imgid, const gboolean fresh,
   }
   s->last_use = g_get_monotonic_time();
   _cur = s;
+  _history_boundary(s->dev);
   _session_info(b, s);
   json_builder_set_member_name(b, "joined");
   json_builder_add_boolean_value(b, joined);

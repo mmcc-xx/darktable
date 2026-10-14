@@ -1802,6 +1802,9 @@ static void auto_adjust_exposure_boost(GtkWidget *quad, dt_iop_module_t *self)
     return;
   }
 
+  // the histogram is otherwise computed only when the graph is drawn,
+  // which it never is from the masking tab, where the wands are
+  update_histogram(self);
   if(!g->luminance_valid || self->dev->full.pipe->processing || !g->histogram_valid)
   {
     dt_control_log(_("wait for the preview to finish recomputing"));
@@ -1868,6 +1871,8 @@ static void auto_adjust_contrast_boost(GtkWidget *quad, dt_iop_module_t *self)
     return;
   }
 
+  // as in auto_adjust_exposure_boost
+  update_histogram(self);
   if(!g->luminance_valid || self->dev->full.pipe->processing || !g->histogram_valid)
   {
     dt_control_log(_("wait for the preview to finish recomputing"));

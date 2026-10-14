@@ -3175,6 +3175,103 @@ static gboolean _mask_attach_ext(dt_iop_module_t *m, dt_masks_form_t *form, cons
 // shape per call in raw space (coords), as drawing it in the darkroom does.
 // combine: how it joins the shapes before it (union, intersection,
 // difference, exclusion)
+// control points of a path's or brush's smooth corners, from the corners
+// around them (Catmull-Rom to Bézier), as path.c and brush.c do for points
+// drawn in the darkroom. a path is closed; a brush's ends mirror their
+// neighbours
+static void _bezier_from_catmull(const float *p1, const float *p2, const float *p3,
+                                 const float *p4, float *b1, float *b2)
+{
+  b1[0] = (-p1[0] + 6 * p2[0] + p3[0]) / 6;
+  b1[1] = (-p1[1] + 6 * p2[1] + p3[1]) / 6;
+  b2[0] = (p2[0] + 6 * p3[0] - p4[0]) / 6;
+  b2[1] = (p2[1] + 6 * p3[1] - p4[1]) / 6;
+}
+
+static void _init_ctrl_points(dt_masks_form_t *form, const gboolean brush)
+{
+  if(g_list_shorter_than(form->points, 2)) return;
+  // path and brush points start alike: corner, ctrl1, ctrl2
+#define _CORNER(l) (brush ? ((dt_masks_point_brush_t *)(l)->data)->corner \
+                          : ((dt_masks_point_path_t *)(l)->data)->corner)
+#define _CTRL1(l) (brush ? ((dt_masks_point_brush_t *)(l)->data)->ctrl1 \
+                         : ((dt_masks_point_path_t *)(l)->data)->ctrl1)
+#define _CTRL2(l) (brush ? ((dt_masks_point_brush_t *)(l)->data)->ctrl2 \
+                         : ((dt_masks_point_path_t *)(l)->data)->ctrl2)
+  for(GList *l = form->points; l; l = g_list_next(l))
+  {
+    const dt_masks_points_states_t state = brush
+      ? ((dt_masks_point_brush_t *)l->data)->state
+      : ((dt_masks_point_path_t *)l->data)->state;
+    if(!(state & DT_MASKS_POINT_STATE_NORMAL)) continue;
+    GList *prev = l->prev, *next = l->next;
+    if(!brush)
+    {
+      if(!prev) prev = g_list_last(form->points);
+      if(!next) next = form->points;
+    }
+    GList *prevprev = prev ? prev->prev : NULL, *nextnext = next ? next->next : NULL;
+    if(!brush)
+    {
+      if(!prevprev) prevprev = g_list_last(form->points);
+      if(!nextnext) nextnext = form->points;
+    }
+    const float *c3 = _CORNER(l);
+    float m1[2], m2[2], m4[2], m5[2];
+    const float *c2 = prev ? _CORNER(prev) : NULL, *c4 = next ? _CORNER(next) : NULL;
+    const float *c1 = prevprev ? _CORNER(prevprev) : NULL;
+    const float *c5 = nextnext ? _CORNER(nextnext) : NULL;
+    if(!c2)
+    {
+      m2[0] = m1[0] = 2 * c3[0] - c4[0];
+      m2[1] = m1[1] = 2 * c3[1] - c4[1];
+      c1 = m1;
+      c2 = m2;
+    }
+    else if(!c1)
+    {
+      m1[0] = 2 * c2[0] - c3[0];
+      m1[1] = 2 * c2[1] - c3[1];
+      c1 = m1;
+    }
+    if(!c4)
+    {
+      m4[0] = m5[0] = 2 * c3[0] - c2[0];
+      m4[1] = m5[1] = 2 * c3[1] - c2[1];
+      c4 = m4;
+      c5 = m5;
+    }
+    else if(!c5)
+    {
+      m5[0] = 2 * c4[0] - c3[0];
+      m5[1] = 2 * c4[1] - c3[1];
+      c5 = m5;
+    }
+    float b1[2], b2[2];
+    _bezier_from_catmull(c1, c2, c3, c4, b1, b2);
+    if(prev)
+    {
+      float *ctrl2 = _CTRL2(prev);
+      if(ctrl2[0] == -1.0f) ctrl2[0] = b1[0];
+      if(ctrl2[1] == -1.0f) ctrl2[1] = b1[1];
+    }
+    _CTRL1(l)[0] = b2[0];
+    _CTRL1(l)[1] = b2[1];
+    _bezier_from_catmull(c2, c3, c4, c5, b1, b2);
+    if(next)
+    {
+      float *ctrl1 = _CTRL1(next);
+      if(ctrl1[0] == -1.0f) ctrl1[0] = b2[0];
+      if(ctrl1[1] == -1.0f) ctrl1[1] = b2[1];
+    }
+    _CTRL2(l)[0] = b1[0];
+    _CTRL2(l)[1] = b1[1];
+  }
+#undef _CORNER
+#undef _CTRL1
+#undef _CTRL2
+}
+
 // a shape from a request, not yet on a module: circle, ellipse, gradient,
 // path, brush, or a group of them (members, each with its combine,
 // inverted and opacity, as the mask manager groups shapes). a group's
@@ -3356,10 +3453,7 @@ static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err
     // neighbours (which also redoes those of the other smooth points)
     if(!all_ctrl)
     {
-      if(brush)
-        dt_masks_brush_init_ctrl_points(form);
-      else
-        dt_masks_path_init_ctrl_points(form);
+      _init_ctrl_points(form, brush);
     }
     return form;
   }
@@ -7962,6 +8056,25 @@ static void _control_free(gpointer p)
 // dt_color_picker_new) and auto buttons (tone equalizer's wands, plain
 // buttons such as rgb levels' "auto levels"), named by their action's path
 // below the module, in english: "exposure range/auto tune levels"
+// a bauhaus widget's quad (a color picker, a wand), when this darktable
+// has dt_bauhaus_widget_get_quad_paint, looked up at runtime so the API
+// builds against a darktable without it; NULL otherwise
+static dt_bauhaus_quad_paint_f _quad_paint(GtkWidget *w)
+{
+  typedef dt_bauhaus_quad_paint_f (*get_f)(GtkWidget *);
+  static get_f get = NULL;
+  static gsize looked_up = 0;
+  if(g_once_init_enter(&looked_up))
+  {
+    GModule *self = g_module_open(NULL, 0);
+    if(self && !g_module_symbol(self, "dt_bauhaus_widget_get_quad_paint", (gpointer *)&get))
+      get = NULL;
+    // the program's own handle stays open: its symbols are used from here on
+    g_once_init_leave(&looked_up, 1);
+  }
+  return get ? get(w) : NULL;
+}
+
 static GList *_controls(dt_iop_module_t *m)
 {
   GList *list = NULL;
@@ -7973,7 +8086,7 @@ static GList *_controls(dt_iop_module_t *m)
     gboolean picker = FALSE;
     if(DT_IS_BAUHAUS_WIDGET(w))
     {
-      const dt_bauhaus_quad_paint_f paint = dt_bauhaus_widget_get_quad_paint(w);
+      const dt_bauhaus_quad_paint_f paint = _quad_paint(w);
       if(paint == dtgtk_cairo_paint_colorpicker) picker = TRUE;
       else if(paint != dtgtk_cairo_paint_wand) continue;
     }

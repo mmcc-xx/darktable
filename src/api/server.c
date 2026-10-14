@@ -8816,6 +8816,32 @@ static const struct { const char *method; const char *event; } _session_methods[
   { "save", "saved" }, { "reset", "reset" }, { "session_close", "closed" }, { NULL, NULL } };
 
 // returns FALSE when the engine should stop
+// darktable's window, right after an API edit of the darkroom's photo, can
+// show the module's blend params at their defaults for some 50 ms (seen
+// after mask_ai: no mask, so a request then listed no shapes or attached a
+// shape to a new mask; #38, the cause not yet found). Before the next
+// request on that photo, let the window's pending work run until 300 ms
+// after the edit and the darkroom's pipes are idle (2 s at most). The API's
+// own sockets wait meanwhile (_settling), so no request runs inside another
+static gint64 _gui_last_edit = 0;
+static gboolean _settling = FALSE;
+
+static void _gui_settle(void)
+{
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->gui_attached || _settling) return;
+  const gint64 quiet = _gui_last_edit + 300000;
+  const gint64 until = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+  _settling = TRUE;
+  while(g_get_monotonic_time() < until
+        && (g_get_monotonic_time() < quiet
+            || dt_api_pipe_processing(dev->full.pipe) || dt_api_pipe_processing(dev->preview_pipe)))
+  {
+    if(!g_main_context_iteration(NULL, FALSE)) g_usleep(2000);
+  }
+  _settling = FALSE;
+}
+
 static gboolean _handle(_client_t *c, const gchar *line)
 {
   JsonParser *p = json_parser_new();
@@ -8855,7 +8881,10 @@ static gboolean _handle(_client_t *c, const gchar *line)
       ? json_object_get_int_member(params, "imgid") : c->current;
     _cur = _session_find(imgid);
     if(_cur)
+    {
       _cur->last_use = g_get_monotonic_time();
+      if(_cur->gui) _gui_settle();
+    }
     else if(dt_is_valid_imgid(imgid))
       err = g_strdup_printf("image %d is not open: call session_open first", imgid);
     event_img = imgid;
@@ -9137,6 +9166,7 @@ static gboolean _handle(_client_t *c, const gchar *line)
 
   json_builder_end_object(b);
   // notifications (no id) get no reply
+  if(!err && event && _cur && _cur->gui) _gui_last_edit = g_get_monotonic_time();
   if(id) _reply(c, id, json_builder_get_root(b), err);
   if(!err && event) _notify(c, event, event_img);
   g_free(err);
@@ -9149,6 +9179,7 @@ static gboolean _handle(_client_t *c, const gchar *line)
 static gboolean _client_cb(gint fd, GIOCondition cond, gpointer data)
 {
   _client_t *c = data;
+  if(_settling) return G_SOURCE_CONTINUE;   // read once _gui_settle is done
   _last_activity = g_get_monotonic_time();
   char buf[65536];
   const ssize_t n = (cond & G_IO_IN) ? read(c->in_fd, buf, sizeof(buf)) : 0;
@@ -9181,6 +9212,7 @@ static gboolean _client_cb(gint fd, GIOCondition cond, gpointer data)
 
 static gboolean _accept_cb(gint fd, GIOCondition cond, gpointer data)
 {
+  if(_settling) return G_SOURCE_CONTINUE;
   const int cfd = accept(fd, NULL, NULL);
   if(cfd >= 0) _client_new(cfd, cfd);
   _last_activity = g_get_monotonic_time();

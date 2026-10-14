@@ -2169,6 +2169,39 @@ gboolean _iop_validate_params(dt_introspection_field_t *field,
   return all_ok;
 }
 
+// dt_masks_group_hash, with the group's shapes looked up in the given
+// develop's forms rather than the darkroom's
+static dt_hash_t _masks_group_hash(dt_hash_t hash,
+                                   dt_masks_form_t *form,
+                                   GList *forms_list)
+{
+  if(!form) return hash;
+  hash = dt_hash(hash, &form->type, sizeof(dt_masks_type_t));
+  hash = dt_hash(hash, &form->formid, sizeof(dt_mask_id_t));
+  hash = dt_hash(hash, &form->version, sizeof(int));
+  hash = dt_hash(hash, &form->source, sizeof(float) * 2);
+
+  for(const GList *forms = form->points; forms; forms = g_list_next(forms))
+  {
+    if(form->type & DT_MASKS_GROUP)
+    {
+      const dt_masks_point_group_t *grpt = forms->data;
+      dt_masks_form_t *f = dt_masks_get_from_id_ext(forms_list, grpt->formid);
+      if(f)
+      {
+        hash = dt_hash(hash, &grpt->state, sizeof(int));
+        hash = dt_hash(hash, &grpt->opacity, sizeof(float));
+        hash = _masks_group_hash(hash, f, forms_list);
+      }
+    }
+    else if(form->functions)
+    {
+      hash = dt_hash(hash, forms->data, form->functions->point_struct_size);
+    }
+  }
+  return hash;
+}
+
 void dt_iop_commit_params(dt_iop_module_t *module,
                           dt_iop_params_t *params,
                           dt_develop_blend_params_t *blendop_params,
@@ -2232,10 +2265,12 @@ void dt_iop_commit_params(dt_iop_module_t *module,
     {
       phash = dt_hash(phash, blendop_params, sizeof(dt_develop_blend_params_t));
 
-      dt_masks_form_t *grp = dt_masks_get_from_id(darktable.develop, blendop_params->mask_id);
+      // the module's own develop: a pipe of another image than the
+      // darkroom's (an export, darktable-api) has its own shapes
+      dt_masks_form_t *grp = dt_masks_get_from_id(module->dev, blendop_params->mask_id);
       if(grp)
       {
-        phash = dt_masks_group_hash(phash, grp);
+        phash = _masks_group_hash(phash, grp, module->dev->forms);
       }
 
       if(blendop_params->mask_mode & DEVELOP_MASK_RASTER && new_raster)

@@ -1012,6 +1012,38 @@ static void _lib_snapshots_toggled_callback(GtkToggleButton *widget,
   dt_control_queue_redraw_center();
 }
 
+// the darktable-api looks this up by name (g_module_symbol): a snapshot of
+// the darkroom's image as it was at history step history_end (0 = the
+// original), shown if show, without moving the edit there. the snapshot
+// copies the saved history below its step (history_snapshot.c), so only
+// history_end has to name that step while it is taken. returns its slot,
+// or -1 when every slot is used or the step doesn't exist
+#pragma GCC visibility push(default)
+int dt_lib_snapshots_take_at(dt_lib_module_t *self,
+                             const int history_end,
+                             const gboolean show)
+{
+  dt_lib_snapshots_t *d = self->data;
+  dt_develop_t *dev = darktable.develop;
+
+  if(d->num_snapshots >= MAX_SNAPSHOT
+     || history_end < 0
+     || history_end > (int)g_list_length(dev->history))
+    return -1;
+
+  const int end = dev->history_end;
+  dev->history_end = history_end;
+  _lib_snapshots_add_button_clicked_callback(d->take_button, self);
+  dev->history_end = end;
+  dt_dev_write_history(dev);
+
+  const int index = d->num_snapshots - 1;
+  if(show)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->snapshot[index].button), TRUE);
+  return index;
+}
+#pragma GCC visibility pop
+
 static void _lib_snapshots_restore_callback(GtkButton *widget,
                                             dt_lib_module_t *self)
 {

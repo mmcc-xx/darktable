@@ -1931,7 +1931,21 @@ static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
     _pipe_sync(s);
     const dt_dev_pixelpipe_iop_t *ap = _piece(s, "ashift");
     if(fit && ap)
-      autocropped = fit(ashift->params, ap->buf_in.width, ap->buf_in.height);
+    {
+      const int w = ap->buf_in.width, h = ap->buf_in.height;
+      const double cropmode = _param(ashift, "cropmode");
+      autocropped = fit(ashift->params, w, h);
+      if(!autocropped && MAX(w, h) > 1200)
+      {
+        // again at about the size the darkroom fits it at (its preview):
+        // the fit's break criterion is in pixels, and at full size it can
+        // run out of iterations (a 5492 px wide raw did); the box is in
+        // fractions. A failed fit switched the automatic crop off: back on
+        _set_param(ashift, "cropmode", cropmode);
+        const float sc = 1200.0f / MAX(w, h);
+        autocropped = fit(ashift->params, MAX(lroundf(w * sc), 1), MAX(lroundf(h * sc), 1));
+      }
+    }
     else
       autocropped = FALSE;
     _record(ashift, TRUE);

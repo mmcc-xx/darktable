@@ -39,7 +39,9 @@ needs `cmake -B build -DUSE_API=ON` once). The AI methods (`mask_ai`,
 on: branch `darktable-api` is darktable master, `darktable-api-5.6` is
 darktable 5.6.2 (the same `src/api`; use the one matching the darktable
 that edits the library, as newer module versions can't be read by an
-older darktable). What differs between them is in `compat.h`, chosen by the feature
+older darktable). `darktable-api` merges darktable master weekly once the
+tests pass, and release branches merge darktable's point releases; nothing
+is rebased or force-pushed, so `git pull` and a rebuild update a clone. What differs between them is in `compat.h`, chosen by the feature
 checks in `compat.cmake` (what a darktable has, not its version number).
 A few features use functions only this branch adds to darktable, looked up
 at runtime: without them, sliders' pickers and wands aren't listed,

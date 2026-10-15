@@ -44,10 +44,15 @@ DT_MODULE_INTROSPECTION(2, dt_iop_overlay_params_t)
 // Compositing precision. Not exposed in the UI: every new edit uses the
 // high-precision float path, while edits created before it existed are pinned
 // to LEGACY by legacy_params() so their rendering never changes.
+// NATIVE is HQ with the overlay image rendered at its own size instead of the
+// parent image's: an overlay placed 1:1 (a patch at a pixel position) is then
+// sampled at whole pixels and composited without resampling. Set by scripts
+// (darktable-api's AI fill), not by the UI.
 typedef enum dt_iop_overlay_compositing_t
 {
   DT_OVERLAY_COMPOSITE_HQ = 0,
-  DT_OVERLAY_COMPOSITE_LEGACY = 1
+  DT_OVERLAY_COMPOSITE_LEGACY = 1,
+  DT_OVERLAY_COMPOSITE_NATIVE = 2
 } dt_iop_overlay_compositing_t;
 
 typedef enum dt_iop_overlay_base_scale_t
@@ -128,12 +133,13 @@ typedef struct dt_iop_overlay_global_data_t
   //    so compositing stays high-precision and colour-matched to the host pipe.
   //  - LEGACY: 8-bit Cairo ARGB32 (the original behaviour), kept for backward
   //    compatibility with edits made before the float path existed.
-  // cache_legacy[] records which format the slot currently holds, so a mode
+  //  - NATIVE: as HQ, at the overlay image's own size.
+  // cache_mode[] records which mode the slot currently holds, so a mode
   // change invalidates and re-renders it.
   void *cache[MAX_OVERLAY];
   size_t cwidth[MAX_OVERLAY];
   size_t cheight[MAX_OVERLAY];
-  gboolean cache_legacy[MAX_OVERLAY];
+  dt_iop_overlay_compositing_t cache_mode[MAX_OVERLAY];
   dt_pthread_mutex_t overlay_threadsafe;
   int kernel_overlay_blend;        // float RGBA blend (HQ)
   int kernel_overlay_blend_legacy; // 8-bit Cairo ARGB blend (legacy)
@@ -289,7 +295,7 @@ static void _module_remove_callback(gpointer instance,
 
 static void _setup_overlay(dt_iop_module_t *self,
                            const dt_dev_pixelpipe_iop_t *piece,
-                           const gboolean legacy,
+                           const dt_iop_overlay_compositing_t mode,
                            void **pbuf,
                            size_t *pwidth,
                            size_t *pheight)
@@ -348,7 +354,7 @@ static void _setup_overlay(dt_iop_module_t *self,
     // than as an 8-bit ARGB display backbuf.
     // LEGACY (legacy == TRUE): render the 8-bit ARGB display backbuf (want_float
     // FALSE), the original behaviour that the Cairo compositing path expects.
-    const gboolean want_float = !legacy;
+    const gboolean want_float = mode != DT_OVERLAY_COMPOSITE_LEGACY;
 
     // Render at the parent image's storage resolution. The result is
     // scale-stable and cached across host-pipe zoom changes; the float
@@ -357,8 +363,20 @@ static void _setup_overlay(dt_iop_module_t *self,
     // zoom-dependent target would change the output of scale-dependent
     // modules in the overlay's pipeline (sharpen, denoise, local contrast,
     // lens correction, ...) and break preview/export consistency.
-    const size_t width  = dev->image_storage.width;
-    const size_t height = dev->image_storage.height;
+    size_t width  = dev->image_storage.width;
+    size_t height = dev->image_storage.height;
+    int native_width = 0;
+    int native_height = 0;
+    if(mode == DT_OVERLAY_COMPOSITE_NATIVE)
+    {
+      // the image cache's size is only known once the full image was loaded
+      dt_image_get_final_size(imgid, &native_width, &native_height);
+      if(native_width > 0 && native_height > 0)
+      {
+        width = native_width;
+        height = native_height;
+      }
+    }
 
     dt_dev_image(imgid,
                  width,
@@ -617,15 +635,15 @@ static float *_get_overlay_rgba_f(dt_iop_module_t *self,
   if(!dt_is_valid_imgid(data->imgid))
     _clear_cache_entry(self, index);
 
-  // drop a cached buffer left over from the other compositing mode
-  if(use_cache && gd->cache[index] && gd->cache_legacy[index])
+  // drop a cached buffer left over from another compositing mode
+  if(use_cache && gd->cache[index] && gd->cache_mode[index] != data->compositing)
     _clear_cache_entry(self, index);
 
   if(!*pbuf)
   {
-    _setup_overlay(self, piece, FALSE /* legacy */, pbuf, pwidth, pheight);
+    _setup_overlay(self, piece, data->compositing, pbuf, pwidth, pheight);
     if(use_cache)
-      gd->cache_legacy[index] = FALSE;
+      gd->cache_mode[index] = data->compositing;
   }
 
   if(!*pbuf)
@@ -775,15 +793,15 @@ static guint8 *_get_overlay_argb(dt_iop_module_t *self,
   if(!dt_is_valid_imgid(data->imgid))
     _clear_cache_entry(self, index);
 
-  // drop a cached buffer left over from the HQ float mode
-  if(use_cache && gd->cache[index] && !gd->cache_legacy[index])
+  // drop a cached buffer left over from a float mode
+  if(use_cache && gd->cache[index] && gd->cache_mode[index] != DT_OVERLAY_COMPOSITE_LEGACY)
     _clear_cache_entry(self, index);
 
   if(!*pbuf)
   {
-    _setup_overlay(self, piece, TRUE /* legacy */, pbuf, pwidth, pheight);
+    _setup_overlay(self, piece, DT_OVERLAY_COMPOSITE_LEGACY, pbuf, pwidth, pheight);
     if(use_cache)
-      gd->cache_legacy[index] = TRUE;
+      gd->cache_mode[index] = DT_OVERLAY_COMPOSITE_LEGACY;
   }
 
   if(!*pbuf)

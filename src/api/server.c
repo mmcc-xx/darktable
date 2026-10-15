@@ -334,6 +334,50 @@ typedef struct _session_t
 static GList *_sessions = NULL;
 static _session_t *_cur = NULL;
 
+// error codes: JSON-RPC's own, and the API's from -32000 down. A handler
+// sets *err with _ERR / _ERRF to give its error a code and the parameter
+// concerned; a plain g_strdup message stays API_E_FAILED. The reply's
+// error.data has the code's name, whether retrying later can help, and
+// the parameter
+typedef enum _api_error_t
+{
+  API_E_PARSE = -32700,         // the request isn't JSON
+  API_E_METHOD = -32601,        // no such method
+  API_E_PARAMS = -32602,        // a parameter is missing, of the wrong type or out of range
+  API_E_FAILED = -32000,        // the operation failed (the default)
+  API_E_NOT_FOUND = -32001,     // no such image, module, instance, mask, preset, style, job, ...
+  API_E_NOT_OPEN = -32002,      // a session method on an image no session has open
+  API_E_RELEASED = -32003,      // the library is released, or held by darktable's window
+  API_E_BUSY = -32004,          // a job, a dialog or another client's work is in the way: retry later
+  API_E_UNAVAILABLE = -32005,   // not possible on this server (headless vs window, a build without AI)
+  API_E_UNSAVED = -32006,       // the image has unsaved changes the method would lose or ignore: save first
+} _api_error_t;
+
+static const struct { _api_error_t code; const char *name; gboolean retry; } _error_names[] = {
+  { API_E_PARSE, "parse_error", FALSE },     { API_E_METHOD, "unknown_method", FALSE },
+  { API_E_PARAMS, "invalid_params", FALSE }, { API_E_FAILED, "failed", FALSE },
+  { API_E_NOT_FOUND, "not_found", FALSE },   { API_E_NOT_OPEN, "not_open", FALSE },
+  { API_E_RELEASED, "released", TRUE },      { API_E_BUSY, "busy", TRUE },
+  { API_E_UNAVAILABLE, "unavailable", FALSE }, { API_E_UNSAVED, "unsaved_changes", FALSE },
+};
+
+// the code goes with the message it was made with: an error passed on
+// as a copy (g_strdup(inner)) falls back to API_E_FAILED
+static const gchar *_err_msg = NULL;
+static _api_error_t _err_code = API_E_FAILED;
+static const char *_err_param = NULL;
+
+static gchar *_err_note(const _api_error_t code, const char *param, gchar *msg)
+{
+  _err_msg = msg;
+  _err_code = code;
+  _err_param = param;
+  return msg;
+}
+
+#define _ERR(code, param, msg) _err_note((code), (param), g_strdup(msg))
+#define _ERRF(code, param, ...) _err_note((code), (param), g_strdup_printf(__VA_ARGS__))
+
 // ashift's automatic crop fit (iop/ashift.c: dt_iop_ashift_fit_crop)
 typedef gboolean (*_fit_crop_t)(dt_iop_params_t *params, int width, int height);
 static int _max_sessions = 3;        // each holds a full-size raw and a pipe cache
@@ -548,7 +592,7 @@ static gboolean _session_open(const dt_imgid_t imgid, const gboolean fresh,
 {
   if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
   {
-    *err = g_strdup_printf("no image with id %d", imgid);
+    *err = _ERRF(API_E_NOT_FOUND, "imgid", "no image with id %d", imgid);
     return FALSE;
   }
   const gint64 t0 = g_get_monotonic_time();
@@ -573,7 +617,7 @@ static gboolean _session_open(const dt_imgid_t imgid, const gboolean fresh,
       }
       if(!victim)
       {
-        *err = g_strdup_printf("%d images are open with unsaved changes: save one, or reopen it"
+        *err = _ERRF(API_E_UNSAVED, NULL, "%d images are open with unsaved changes: save one, or reopen it"
                                " with fresh to discard them, first", _max_sessions);
         return FALSE;
       }
@@ -615,7 +659,7 @@ static gboolean _module_list(JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   json_builder_set_member_name(b, "modules");
@@ -650,7 +694,7 @@ static dt_iop_module_t *_find_module(JsonObject *params, gchar **err)
   const gchar *op = params ? json_object_get_string_member_with_default(params, "operation", NULL) : NULL;
   const int instance = params ? json_object_get_int_member_with_default(params, "instance", 0) : 0;
   dt_iop_module_t *m = op ? dt_iop_get_module_by_op_priority(_cur->dev->iop, op, instance) : NULL;
-  if(!m) *err = g_strdup_printf("no module '%s' instance %d", op ? op : "", instance);
+  if(!m) *err = _ERRF(API_E_NOT_FOUND, "operation", "no module '%s' instance %d", op ? op : "", instance);
   return m;
 }
 
@@ -842,14 +886,14 @@ static gboolean _module_get(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   dt_iop_module_t *m = _find_module(params, err);
   if(!m) return FALSE;
   if(!m->so->have_introspection)
   {
-    *err = g_strdup_printf("module '%s' has no introspection", m->op);
+    *err = _ERRF(API_E_UNAVAILABLE, NULL, "module '%s' has no introspection", m->op);
     return FALSE;
   }
   json_builder_set_member_name(b, "operation");
@@ -963,13 +1007,13 @@ static gboolean _parse_value_named(const dt_introspection_field_t *f, const char
           *out = e->value;
           return TRUE;
         }
-      *err = g_strdup_printf("'%s': no value '%s'", name, s);
+      *err = _ERRF(API_E_PARAMS, "values", "'%s': no value '%s'", name, s);
       return FALSE;
     }
   }
   if(!JSON_NODE_HOLDS_VALUE(v))
   {
-    *err = g_strdup_printf("'%s': value must be a number%s", name,
+    *err = _ERRF(API_E_PARAMS, "values", "'%s': value must be a number%s", name,
                            f->header.type == DT_INTROSPECTION_TYPE_ENUM ? " or a name" : "");
     return FALSE;
   }
@@ -980,20 +1024,20 @@ static gboolean _parse_value_named(const dt_introspection_field_t *f, const char
     *out = json_node_get_double(v);
   else
   {
-    *err = g_strdup_printf("'%s': value must be a number", name);
+    *err = _ERRF(API_E_PARAMS, "values", "'%s': value must be a number", name);
     return FALSE;
   }
   if(f->header.type == DT_INTROSPECTION_TYPE_ENUM)
   {
     for(const dt_introspection_type_enum_tuple_t *e = f->Enum.values; e && e->name; e++)
       if(e->value == (int)*out) return TRUE;
-    *err = g_strdup_printf("'%s': no value %d", name, (int)*out);
+    *err = _ERRF(API_E_PARAMS, "values", "'%s': no value %d", name, (int)*out);
     return FALSE;
   }
   double lo, hi, def;
   if(_range_checks && _range(f, &lo, &hi, &def) && (*out < lo || *out > hi))
   {
-    *err = g_strdup_printf("'%s': %g is outside %g..%g", name, *out, lo, hi);
+    *err = _ERRF(API_E_PARAMS, "values", "'%s': %g is outside %g..%g", name, *out, lo, hi);
     return FALSE;
   }
   return TRUE;
@@ -1011,7 +1055,7 @@ static gboolean _parse_list(const dt_introspection_field_t *f, const char *name,
   JsonArray *a = JSON_NODE_HOLDS_ARRAY(v) ? json_node_get_array(v) : NULL;
   if(!a || json_array_get_length(a) != f->Array.count)
   {
-    *err = g_strdup_printf("'%s': needs a list of %zu", name, f->Array.count);
+    *err = _ERRF(API_E_PARAMS, "values", "'%s': needs a list of %zu", name, f->Array.count);
     return FALSE;
   }
   for(size_t k = 0; k < f->Array.count; k++)
@@ -1115,7 +1159,7 @@ static gboolean _module_set(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   dt_iop_module_t *m = _find_module(params, err);
@@ -1125,12 +1169,12 @@ static gboolean _module_set(JsonObject *params, JsonBuilder *b, gchar **err)
                          ? json_object_get_object_member(params, "values") : NULL;
   if(!values || !json_object_get_size(values))
   {
-    *err = g_strdup("module_set needs values {field: value}");
+    *err = _ERR(API_E_PARAMS, "values", "module_set needs values {field: value}");
     return FALSE;
   }
   if(!m->so->have_introspection)
   {
-    *err = g_strdup_printf("module '%s' has no introspection", m->op);
+    *err = _ERRF(API_E_UNAVAILABLE, NULL, "module '%s' has no introspection", m->op);
     return FALSE;
   }
 
@@ -1163,7 +1207,7 @@ static gboolean _module_set(JsonObject *params, JsonBuilder *b, gchar **err)
     }
     else
     {
-      *err = g_strdup_printf("module '%s' has no field '%s'", m->op, name);
+      *err = _ERRF(API_E_PARAMS, "values", "module '%s' has no field '%s'", m->op, name);
       ok = FALSE;
     }
   }
@@ -1214,7 +1258,7 @@ static gboolean _module_enable(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   dt_iop_module_t *m = _find_module(params, err);
@@ -1232,7 +1276,7 @@ static gboolean _history_list(JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   json_builder_set_member_name(b, "history_end");
@@ -1269,14 +1313,14 @@ static gboolean _history_end(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   const int n = params ? json_object_get_int_member_with_default(params, "end", -1) : -1;
   const int count = g_list_length(_cur->dev->history);
   if(n < 0 || n > count)
   {
-    *err = g_strdup_printf("end must be 0..%d", count);
+    *err = _ERRF(API_E_PARAMS, "end", "end must be 0..%d", count);
     return FALSE;
   }
   if(_cur->gui)
@@ -1331,7 +1375,7 @@ static gboolean _save(JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   const gint64 t0 = g_get_monotonic_time();
@@ -1354,7 +1398,7 @@ static gboolean _reset(JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   const dt_imgid_t imgid = _cur->dev->image_storage.id;
@@ -1394,7 +1438,7 @@ static gboolean _preset_list(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   dt_iop_module_t *m = _find_module(params, err);
@@ -1445,7 +1489,7 @@ static gboolean _preset_apply(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   dt_iop_module_t *m = _find_module(params, err);
@@ -1453,7 +1497,7 @@ static gboolean _preset_apply(JsonObject *params, JsonBuilder *b, gchar **err)
   const char *want = params ? json_object_get_string_member_with_default(params, "name", NULL) : NULL;
   if(!want || !*want)
   {
-    *err = g_strdup("preset_apply needs name (from preset_list)");
+    *err = _ERR(API_E_PARAMS, "name", "preset_apply needs name (from preset_list)");
     return FALSE;
   }
   sqlite3_stmt *st = NULL;
@@ -1505,7 +1549,7 @@ static gboolean _preset_apply(JsonObject *params, JsonBuilder *b, gchar **err)
   sqlite3_finalize(st);
   if(!found)
   {
-    *err = g_strdup_printf("module '%s' has no preset '%s'", m->op, want);
+    *err = _ERRF(API_E_NOT_FOUND, "name", "module '%s' has no preset '%s'", m->op, want);
     return FALSE;
   }
   if(_cur->gui)
@@ -1664,7 +1708,7 @@ static gboolean _parse_aspect(const char *s, int *d, int *n, double *w, double *
   g_strfreev(p);
   if(!ok)
   {
-    *err = g_strdup_printf("aspect '%s': use free, original, square or W:H such as 3:2", s);
+    *err = _ERRF(API_E_PARAMS, "aspect", "aspect '%s': use free, original, square or W:H such as 3:2", s);
     return FALSE;
   }
   // crop stores integers: 1.91:1 becomes 191:100
@@ -1692,7 +1736,7 @@ static gboolean _geometry_get(JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   dt_iop_module_t *flip = dt_iop_get_module_by_op_priority(_cur->dev->iop, "flip", 0);
@@ -1754,7 +1798,7 @@ static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   dt_iop_module_t *flip = dt_iop_get_module_by_op_priority(_cur->dev->iop, "flip", 0);
@@ -1762,7 +1806,7 @@ static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
   dt_iop_module_t *crop = dt_iop_get_module_by_op_priority(_cur->dev->iop, "crop", 0);
   if(!flip || !ashift || !crop)
   {
-    *err = g_strdup("this darktable lacks the flip, ashift or crop module");
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "this darktable lacks the flip, ashift or crop module");
     return FALSE;
   }
   JsonNode *n_rotate = params ? json_object_get_member(params, "rotate") : NULL;
@@ -1773,7 +1817,7 @@ static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
   JsonNode *n_aspect = params ? json_object_get_member(params, "aspect") : NULL;
   if(!n_rotate && !n_flip && !n_angle && !n_autocrop && !n_crop && !n_aspect)
   {
-    *err = g_strdup("geometry_set needs rotate, flip, angle, autocrop, crop or aspect");
+    *err = _ERR(API_E_PARAMS, NULL, "geometry_set needs rotate, flip, angle, autocrop, crop or aspect");
     return FALSE;
   }
 
@@ -1784,7 +1828,7 @@ static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
     const int deg = JSON_NODE_HOLDS_VALUE(n_rotate) ? json_node_get_int(n_rotate) : 1;
     if(!JSON_NODE_HOLDS_VALUE(n_rotate) || json_node_get_value_type(n_rotate) != G_TYPE_INT64 || deg % 90)
     {
-      *err = g_strdup("rotate: degrees clockwise, a multiple of 90 (-90 turns left)");
+      *err = _ERR(API_E_PARAMS, "rotate", "rotate: degrees clockwise, a multiple of 90 (-90 turns left)");
       return FALSE;
     }
     turns = ((deg / 90) % 4 + 4) % 4;
@@ -1798,7 +1842,7 @@ static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
     else if(!g_ascii_strcasecmp(f, "vertical")) mirror = ORIENTATION_FLIP_VERTICALLY;
     else
     {
-      *err = g_strdup("flip: \"horizontal\" or \"vertical\"");
+      *err = _ERR(API_E_PARAMS, "flip", "flip: \"horizontal\" or \"vertical\"");
       return FALSE;
     }
   }
@@ -1817,7 +1861,7 @@ static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
       if(!v || !JSON_NODE_HOLDS_VALUE(v)
          || (json_node_get_value_type(v) != G_TYPE_DOUBLE && json_node_get_value_type(v) != G_TYPE_INT64))
       {
-        *err = g_strdup("crop: {left, top, right, bottom} as fractions 0..1 of the image, or null for none");
+        *err = _ERR(API_E_PARAMS, "crop", "crop: {left, top, right, bottom} as fractions 0..1 of the image, or null for none");
         return FALSE;
       }
       want[k] = json_node_get_double(v);
@@ -1825,7 +1869,7 @@ static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
     if(want[0] < 0.f || want[1] < 0.f || want[2] > 1.f || want[3] > 1.f
        || want[2] - want[0] < 0.01f || want[3] - want[1] < 0.01f)
     {
-      *err = g_strdup("crop: needs 0 <= left < right <= 1 and 0 <= top < bottom <= 1");
+      *err = _ERR(API_E_PARAMS, "crop", "crop: needs 0 <= left < right <= 1 and 0 <= top < bottom <= 1");
       return FALSE;
     }
   }
@@ -1838,7 +1882,7 @@ static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
     if(!_parse_aspect(a, &ratio_d, &ratio_n, &aw, &ah, err)) return FALSE;
     if(uncrop)
     {
-      *err = g_strdup("crop null removes the crop: no aspect with it");
+      *err = _ERR(API_E_PARAMS, "aspect", "crop null removes the crop: no aspect with it");
       return FALSE;
     }
   }
@@ -1966,7 +2010,7 @@ static gboolean _coords(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   const char *from = params ? json_object_get_string_member_with_default(params, "from", "image") : "image";
@@ -1983,7 +2027,7 @@ static gboolean _coords(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   if(fs < 0 || ts < 0 || !in)
   {
-    *err = g_strdup("coords needs points [[x, y], ...] and from/to: raw, image or uncropped");
+    *err = _ERR(API_E_PARAMS, "points", "coords needs points [[x, y], ...] and from/to: raw, image or uncropped");
     return FALSE;
   }
   const guint n = json_array_get_length(in);
@@ -1995,7 +2039,7 @@ static gboolean _coords(JsonObject *params, JsonBuilder *b, gchar **err)
     if(!p || json_array_get_length(p) != 2)
     {
       g_free(pts);
-      *err = g_strdup_printf("point %u: needs [x, y]", k);
+      *err = _ERRF(API_E_PARAMS, "points", "point %u: needs [x, y]", k);
       return FALSE;
     }
     pts[2 * k] = json_array_get_double_element(p, 0);
@@ -2096,13 +2140,13 @@ static gboolean _retouch_list(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   dt_iop_module_t *m = dt_iop_get_module_by_op_priority(_cur->dev->iop, "retouch", 0);
   if(!m)
   {
-    *err = g_strdup("this darktable has no retouch module");
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "this darktable has no retouch module");
     return FALSE;
   }
   json_builder_set_member_name(b, "enabled");
@@ -2288,7 +2332,7 @@ static gboolean _rt_choice(dt_iop_module_t *m, JsonObject *o, const char *key, c
   // DT_IOP_RETOUCH_NONE is an empty slot, not a tool
   if(*v < 0 || (*v == 0 && !g_strcmp0(key, "algorithm")))
   {
-    *err = g_strdup_printf("%s is one of %s", key, names);
+    *err = _ERRF(API_E_PARAMS, NULL, "%s is one of %s", key, names);
     return FALSE;
   }
   *has = TRUE;
@@ -2301,7 +2345,7 @@ static gboolean _rt_parse(dt_iop_module_t *m, JsonObject *o, _rt_spot_t *s, gcha
   memset(s, 0, sizeof(*s));
   if(!o)
   {
-    *err = g_strdup("a spot is an object");
+    *err = _ERR(API_E_PARAMS, "spots", "a spot is an object");
     return FALSE;
   }
   for(int k = 0; k < 5; k++)
@@ -2310,7 +2354,7 @@ static gboolean _rt_parse(dt_iop_module_t *m, JsonObject *o, _rt_spot_t *s, gcha
     if(!_rt_number(json_object_get_member(o, keys[k]), &s->v[k])
        || (k == RT_R ? !(s->v[k] > 0.f && s->v[k] < 0.5f) : !(s->v[k] >= 0.f && s->v[k] <= 1.f)))
     {
-      *err = g_strdup("x, y, sx, sy are in 0..1 and r in 0..0.5 (raw space, see coords)");
+      *err = _ERR(API_E_PARAMS, "spots", "x, y, sx, sy are in 0..1 and r in 0..0.5 (raw space, see coords)");
       return FALSE;
     }
     s->has[k] = TRUE;
@@ -2327,7 +2371,7 @@ static gboolean _rt_parse(dt_iop_module_t *m, JsonObject *o, _rt_spot_t *s, gcha
     if(!_rt_number(json_object_get_member(o, "blur_radius"), &s->blur_radius)
        || s->blur_radius < 0.1f || s->blur_radius > 200.f)
     {
-      *err = g_strdup("blur_radius is 0.1..200");
+      *err = _ERR(API_E_PARAMS, "spots", "blur_radius is 0.1..200");
       return FALSE;
     }
     s->has[RT_BLUR_RADIUS] = TRUE;
@@ -2337,7 +2381,7 @@ static gboolean _rt_parse(dt_iop_module_t *m, JsonObject *o, _rt_spot_t *s, gcha
     if(!_rt_number(json_object_get_member(o, "fill_brightness"), &s->fill_brightness)
        || fabsf(s->fill_brightness) > 1.f)
     {
-      *err = g_strdup("fill_brightness is -1..1");
+      *err = _ERR(API_E_PARAMS, "spots", "fill_brightness is -1..1");
       return FALSE;
     }
     s->has[RT_FILL_BRIGHTNESS] = TRUE;
@@ -2352,7 +2396,7 @@ static gboolean _rt_parse(dt_iop_module_t *m, JsonObject *o, _rt_spot_t *s, gcha
            && s->fill_color[c] >= 0.f && s->fill_color[c] <= 1.f;
     if(!ok)
     {
-      *err = g_strdup("fill_color is [r, g, b] in 0..1, the module's working RGB");
+      *err = _ERR(API_E_PARAMS, "spots", "fill_color is [r, g, b] in 0..1, the module's working RGB");
       return FALSE;
     }
     s->has[RT_FILL_COLOR] = TRUE;
@@ -2367,11 +2411,11 @@ static gboolean _rt_check(dt_iop_module_t *m, const _rt_spot_t *s, const int alg
   const gboolean blur = algorithm == _rt_enum(m, "algorithm", "DT_IOP_RETOUCH_", "blur");
   const gboolean fill = algorithm == _rt_enum(m, "algorithm", "DT_IOP_RETOUCH_", "fill");
   if(!_rt_cloning(m, algorithm) && (s->has[RT_SX] || s->has[RT_SY]))
-    *err = g_strdup("blur and fill spots have no source (sx, sy)");
+    *err = _ERR(API_E_PARAMS, "spots", "blur and fill spots have no source (sx, sy)");
   else if(!blur && (s->has[RT_BLUR_TYPE] || s->has[RT_BLUR_RADIUS]))
-    *err = g_strdup("blur_type and blur_radius are for blur spots");
+    *err = _ERR(API_E_PARAMS, "spots", "blur_type and blur_radius are for blur spots");
   else if(!fill && (s->has[RT_FILL_MODE] || s->has[RT_FILL_COLOR] || s->has[RT_FILL_BRIGHTNESS]))
-    *err = g_strdup("fill_mode, fill_color and fill_brightness are for fill spots");
+    *err = _ERR(API_E_PARAMS, "spots", "fill_mode, fill_color and fill_brightness are for fill spots");
   return *err == NULL;
 }
 
@@ -2412,11 +2456,11 @@ static dt_iop_module_t *_rt_module(gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return NULL;
   }
   dt_iop_module_t *m = dt_iop_get_module_by_op_priority(_cur->dev->iop, "retouch", 0);
-  if(!m) *err = g_strdup("this darktable has no retouch module");
+  if(!m) *err = _ERR(API_E_UNAVAILABLE, NULL, "this darktable has no retouch module");
   return m;
 }
 
@@ -2464,7 +2508,7 @@ static gboolean _retouch_add(JsonObject *params, const char *algorithm, JsonBuil
   const guint n = spots ? json_array_get_length(spots) : 0;
   if(!n)
   {
-    *err = g_strdup("needs spots [{x, y, r, algorithm, sx, sy, ...}] in raw space (coords)");
+    *err = _ERR(API_E_PARAMS, "spots", "needs spots [{x, y, r, algorithm, sx, sy, ...}] in raw space (coords)");
     return FALSE;
   }
   const int dflt = _rt_enum(m, "algorithm", "DT_IOP_RETOUCH_", algorithm);
@@ -2506,7 +2550,7 @@ static gboolean _retouch_add(JsonObject *params, const char *algorithm, JsonBuil
   if(used + (int)n > count)
   {
     g_free(s);
-    *err = g_strdup_printf("retouch holds at most %d shapes; it has %d", count, used);
+    *err = _ERRF(API_E_PARAMS, "spots", "retouch holds at most %d shapes; it has %d", count, used);
     return FALSE;
   }
 
@@ -2567,7 +2611,7 @@ static dt_masks_form_t *_rt_spot(dt_iop_module_t *m, const dt_mask_id_t formid, 
       dt_masks_form_t *form = dt_masks_get_from_id(_cur->dev, formid);
       if(form) return form;
     }
-  *err = g_strdup_printf("retouch has no spot %d (retouch_list)", formid);
+  *err = _ERRF(API_E_NOT_FOUND, "formid", "retouch has no spot %d (retouch_list)", formid);
   return NULL;
 }
 
@@ -2586,7 +2630,7 @@ static gboolean _retouch_set(JsonObject *params, JsonBuilder *b, gchar **err)
   const int *cur_algo = k >= 0 ? _rt_form_field(m, k, "algorithm", &f) : NULL;
   if(!cur_algo)
   {
-    *err = g_strdup_printf("spot %d isn't listed in retouch's settings", formid);
+    *err = _ERRF(API_E_NOT_FOUND, "formid", "spot %d isn't listed in retouch's settings", formid);
     return FALSE;
   }
   _rt_spot_t s;
@@ -2594,13 +2638,13 @@ static gboolean _retouch_set(JsonObject *params, JsonBuilder *b, gchar **err)
   const int algorithm = s.has[RT_ALGO] ? s.algorithm : *cur_algo;
   if(_rt_cloning(m, algorithm) != _rt_cloning(m, *cur_algo))
   {
-    *err = g_strdup("a clone or heal spot can only become clone or heal, a blur or fill spot blur or fill");
+    *err = _ERR(API_E_PARAMS, NULL, "a clone or heal spot can only become clone or heal, a blur or fill spot blur or fill");
     return FALSE;
   }
   if(!_rt_check(m, &s, algorithm, err)) return FALSE;
   if((s.has[RT_X] || s.has[RT_Y] || s.has[RT_R]) && !((form->type & DT_MASKS_CIRCLE) && form->points))
   {
-    *err = g_strdup("only circle spots can be moved or resized here");
+    *err = _ERR(API_E_PARAMS, NULL, "only circle spots can be moved or resized here");
     return FALSE;
   }
   _rt_begin();
@@ -2632,7 +2676,7 @@ static gboolean _retouch_remove(JsonObject *params, JsonBuilder *b, gchar **err)
   const guint n = a ? json_array_get_length(a) : 0;
   if(!n)
   {
-    *err = g_strdup("needs formids [...] (retouch_list)");
+    *err = _ERR(API_E_PARAMS, "formids", "needs formids [...] (retouch_list)");
     return FALSE;
   }
   for(guint i = 0; i < n; i++)
@@ -2761,14 +2805,14 @@ static dt_iop_module_t *_blend_module(JsonObject *params, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return NULL;
   }
   dt_iop_module_t *m = _find_module(params, err);
   if(!m) return NULL;
   if(!(m->flags() & IOP_FLAGS_SUPPORTS_BLENDING) || !m->blend_params || !_channels_of(m->blend_params))
   {
-    *err = g_strdup_printf("module '%s' has no blending", m->op);
+    *err = _ERRF(API_E_UNAVAILABLE, NULL, "module '%s' has no blending", m->op);
     return NULL;
   }
   return m;
@@ -2882,7 +2926,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
                          ? json_object_get_object_member(params, "values") : NULL;
   if(!values || !json_object_get_size(values))
   {
-    *err = g_strdup("blend_set needs values {setting: value}");
+    *err = _ERR(API_E_PARAMS, "values", "blend_set needs values {setting: value}");
     return FALSE;
   }
   dt_develop_blend_params_t bp = *m->blend_params;
@@ -2903,7 +2947,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
       const double x = is_num ? json_node_get_double(v) : NAN;
       if(!(x >= _blend_floats[f].lo && x <= _blend_floats[f].hi))
       {
-        *err = g_strdup_printf("'%s': a number in %g..%g", name, _blend_floats[f].lo, _blend_floats[f].hi);
+        *err = _ERRF(API_E_PARAMS, "values", "'%s': a number in %g..%g", name, _blend_floats[f].lo, _blend_floats[f].hi);
         ok = FALSE;
       }
       else
@@ -2915,7 +2959,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
       while(_mask_modes[k].name && !(is_str && !g_ascii_strcasecmp(json_node_get_string(v), _mask_modes[k].name))) k++;
       if(!_mask_modes[k].name)
       {
-        *err = g_strdup("'masks': off, uniform, drawn, parametric, drawn & parametric or raster");
+        *err = _ERR(API_E_PARAMS, "values", "'masks': off, uniform, drawn, parametric, drawn & parametric or raster");
         ok = FALSE;
       }
       else
@@ -2926,7 +2970,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
     {
       if(!(is_str && _enum_parse(dt_develop_blend_mode_names, json_node_get_string(v), &e)))
       {
-        *err = g_strdup("'blend_mode': a blend mode name, e.g. normal, multiply, lighten, darken");
+        *err = _ERR(API_E_PARAMS, "values", "'blend_mode': a blend mode name, e.g. normal, multiply, lighten, darken");
         ok = FALSE;
       }
       else
@@ -2936,7 +2980,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
     {
       if(!(JSON_NODE_HOLDS_VALUE(v) && json_node_get_value_type(v) == G_TYPE_BOOLEAN))
       {
-        *err = g_strdup("'reverse': true or false");
+        *err = _ERR(API_E_PARAMS, "values", "'reverse': true or false");
         ok = FALSE;
       }
       else
@@ -2947,7 +2991,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
     {
       if(!(is_str && _enum_parse(dt_develop_combine_masks_names, json_node_get_string(v), &e)))
       {
-        *err = g_strdup("'combine': exclusive, inclusive, exclusive & inverted or inclusive & inverted");
+        *err = _ERR(API_E_PARAMS, "values", "'combine': exclusive, inclusive, exclusive & inverted or inclusive & inverted");
         ok = FALSE;
       }
       else
@@ -2957,7 +3001,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
     {
       if(!(is_str && _enum_parse(dt_develop_feathering_guide_names, json_node_get_string(v), &e)))
       {
-        *err = g_strdup("'feathering_guide': output before blur, input before blur, output after blur"
+        *err = _ERR(API_E_PARAMS, "values", "'feathering_guide': output before blur, input before blur, output after blur"
                         " or input after blur");
         ok = FALSE;
       }
@@ -2982,7 +3026,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
           GString *list = g_string_new(NULL);
           for(const _channel_t *t = _channels_of(&bp); t->name; t++)
             g_string_append_printf(list, "%s%s_in, %s_out", list->len ? ", " : "", t->name, t->name);
-          *err = g_strdup_printf("parametric: no channel '%s' in this module (%s)", key, list->str);
+          *err = _ERRF(API_E_PARAMS, "values", "parametric: no channel '%s' in this module (%s)", key, list->str);
           g_string_free(list, TRUE);
           ok = FALSE;
           break;
@@ -2999,14 +3043,14 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
         {
           if(!c->boost)
           {
-            *err = g_strdup_printf("parametric '%s': this channel has no boost", key);
+            *err = _ERRF(API_E_PARAMS, "values", "parametric '%s': this channel has no boost", key);
             ok = FALSE;
             break;
           }
           const double boost = json_object_get_double_member(co, "boost");
           if(!(boost >= 0.0 && boost <= 18.0))
           {
-            *err = g_strdup_printf("parametric '%s': boost is 0..18 EV", key);
+            *err = _ERRF(API_E_PARAMS, "values", "parametric '%s': boost is 0..18 EV", key);
             ok = FALSE;
             break;
           }
@@ -3017,7 +3061,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
                              ? json_object_get_array_member(co, "range") : NULL;
         if(co && json_object_has_member(co, "range") && (!range || json_array_get_length(range) != 4))
         {
-          *err = g_strdup_printf("parametric '%s': range is 4 numbers, in the darkroom's units", key);
+          *err = _ERRF(API_E_PARAMS, "values", "parametric '%s': range is 4 numbers, in the darkroom's units", key);
           ok = FALSE;
           break;
         }
@@ -3029,7 +3073,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
             r[k] = CLAMP(_from_display(c, json_array_get_double_element(range, k), boostf), 0.0, 1.0);
           if(r[0] > r[1] || r[1] > r[2] || r[2] > r[3])
           {
-            *err = g_strdup_printf("parametric '%s': range must not decrease", key);
+            *err = _ERRF(API_E_PARAMS, "values", "parametric '%s': range must not decrease", key);
             ok = FALSE;
             break;
           }
@@ -3037,7 +3081,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
         }
         if(!co)
         {
-          *err = g_strdup_printf("parametric '%s': {range, inverted, boost} or null", key);
+          *err = _ERRF(API_E_PARAMS, "values", "parametric '%s': {range, inverted, boost} or null", key);
           ok = FALSE;
           break;
         }
@@ -3073,7 +3117,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
                     && !(src->blend_params->mask_mode & DEVELOP_MASK_RASTER))
                    || (src->flags() & IOP_FLAGS_WRITE_RASTER)))
       {
-        *err = g_strdup("'raster_source': {operation, instance} of a module before this one that has a mask,"
+        *err = _ERR(API_E_PARAMS, "values", "'raster_source': {operation, instance} of a module before this one that has a mask,"
                         " or null");
         ok = FALSE;
       }
@@ -3089,7 +3133,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
     {
       if(!(JSON_NODE_HOLDS_VALUE(v) && json_node_get_value_type(v) == G_TYPE_BOOLEAN))
       {
-        *err = g_strdup("'raster_inverted': true or false");
+        *err = _ERR(API_E_PARAMS, "values", "'raster_inverted': true or false");
         ok = FALSE;
       }
       else
@@ -3097,7 +3141,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
     }
     else
     {
-      *err = g_strdup_printf("blend_set: no setting '%s' (masks, blend_mode, reverse, opacity,"
+      *err = _ERRF(API_E_PARAMS, "values", "blend_set: no setting '%s' (masks, blend_mode, reverse, opacity,"
                              " blend_parameter, feathering_radius, blur_radius, brightness, contrast, details,"
                              " combine, feathering_guide, parametric, raster_source, raster_inverted)", name);
       ok = FALSE;
@@ -3303,7 +3347,7 @@ static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err
                        ? json_object_get_array_member(sh, "members") : NULL;
     if(!mem || !json_array_get_length(mem) || depth > 4)
     {
-      *err = g_strdup("group: members [{shape, combine, inverted, opacity}, ...]");
+      *err = _ERR(API_E_PARAMS, "shape", "group: members [{shape, combine, inverted, opacity}, ...]");
       return NULL;
     }
     dt_masks_form_t *grp = dt_masks_create(DT_MASKS_GROUP);
@@ -3421,7 +3465,7 @@ static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err
     if(!ok)
     {
       g_free(pt);
-      *err = g_strdup(brush ? "brush: points (2 or more, raw space): [x, y] or {corner, ctrl1, ctrl2, border,"
+      *err = _ERR(API_E_PARAMS, "shape", brush ? "brush: points (2 or more, raw space): [x, y] or {corner, ctrl1, ctrl2, border,"
                               " hardness, density, smooth}; width 0..1 (relative to the shorter side), hardness"
                               " and density 0..1"
                             : "path: points (3 or more, raw space; closed): [x, y] or {corner, ctrl1, ctrl2,"
@@ -3476,7 +3520,7 @@ static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err
   const double x = sh ? _NUM(sh, "x", -1) : -1, y = sh ? _NUM(sh, "y", -1) : -1;
   if(!(x >= 0.0 && x <= 1.0 && y >= 0.0 && y <= 1.0))
   {
-    *err = g_strdup("shape needs type (circle, ellipse, gradient, path, brush) and x, y in 0..1"
+    *err = _ERR(API_E_PARAMS, "shape", "shape needs type (circle, ellipse, gradient, path, brush) and x, y in 0..1"
                     " (raw space, coords)");
     return NULL;
   }
@@ -3486,7 +3530,7 @@ static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err
     const double border = _NUM(sh, "border", dt_conf_get_float("plugins/darkroom/masks/circle/border"));
     if(!(r > 0.0 && r <= 1.0 && border >= 0.0 && border <= 1.0))
     {
-      *err = g_strdup("circle: r in 0..1 and border in 0..1 (relative to the shorter side)");
+      *err = _ERR(API_E_PARAMS, "shape", "circle: r in 0..1 and border in 0..1 (relative to the shorter side)");
       return NULL;
     }
     form = dt_masks_create(DT_MASKS_CIRCLE);
@@ -3503,7 +3547,7 @@ static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err
     const double border = _NUM(sh, "border", dt_conf_get_float("plugins/darkroom/masks/ellipse/border"));
     if(!(ra > 0.0 && ra <= 1.0 && rb > 0.0 && rb <= 1.0 && border >= 0.0 && border <= 1.0))
     {
-      *err = g_strdup("ellipse: ra, rb in 0..1, border in 0..1, rotation in degrees");
+      *err = _ERR(API_E_PARAMS, "shape", "ellipse: ra, rb in 0..1, border in 0..1, rotation in degrees");
       return NULL;
     }
     form = dt_masks_create(DT_MASKS_ELLIPSE);
@@ -3524,7 +3568,7 @@ static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err
     const double steep = _NUM(sh, "steepness", 0), curv = _NUM(sh, "curvature", 0);
     if(!(comp >= 0.0 && comp <= 1.0 && steep >= 0.0 && steep <= 1.0 && curv >= -2.0 && curv <= 2.0))
     {
-      *err = g_strdup("gradient: rotation in degrees, compression 0..1, steepness 0..1, curvature -2..2");
+      *err = _ERR(API_E_PARAMS, "shape", "gradient: rotation in degrees, compression 0..1, steepness 0..1, curvature -2..2");
       return NULL;
     }
     form = dt_masks_create(DT_MASKS_GRADIENT);
@@ -3541,7 +3585,7 @@ static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err
   }
   else
   {
-    *err = g_strdup("shape type: circle, ellipse, gradient, path or brush");
+    *err = _ERR(API_E_PARAMS, "shape", "shape type: circle, ellipse, gradient, path or brush");
     return NULL;
   }
 #undef _NUM
@@ -3554,7 +3598,7 @@ static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
   if(!m) return FALSE;
   if(m->flags() & IOP_FLAGS_NO_MASKS)
   {
-    *err = g_strdup_printf("module '%s' takes no drawn masks (retouch: retouch_heal)", m->op);
+    *err = _ERRF(API_E_UNAVAILABLE, NULL, "module '%s' takes no drawn masks (retouch: retouch_heal)", m->op);
     return FALSE;
   }
   JsonObject *sh = params && json_object_has_member(params, "shape")
@@ -3570,13 +3614,13 @@ static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
     if(!g_ascii_strcasecmp(combine, ops[k].name)) op = ops[k].state;
   if(op < 0)
   {
-    *err = g_strdup("combine: union, intersection, difference or exclusion");
+    *err = _ERR(API_E_PARAMS, "combine", "combine: union, intersection, difference or exclusion");
     return FALSE;
   }
   const float opacity = params ? json_object_get_double_member_with_default(params, "opacity", -1.0) : -1.0;
   if(opacity > 1.0f)
   {
-    *err = g_strdup("opacity: 0..1");
+    *err = _ERR(API_E_PARAMS, "opacity", "opacity: 0..1");
     return FALSE;
   }
   dt_masks_form_t *form = _shape_form(sh, 0, err);
@@ -3725,7 +3769,7 @@ static gboolean _mask_remove(JsonObject *params, JsonBuilder *b, gchar **err)
     if(((dt_masks_point_group_t *)l->data)->formid == formid) hit = l;
   if(!hit)
   {
-    *err = g_strdup_printf("module '%s' has no shape %d (mask_list)", m->op, formid);
+    *err = _ERRF(API_E_NOT_FOUND, "formid", "module '%s' has no shape %d (mask_list)", m->op, formid);
     return FALSE;
   }
   if(_cur->gui)
@@ -3811,14 +3855,14 @@ static gboolean _module_add(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   dt_iop_module_t *base = _find_module(params, err);
   if(!base) return FALSE;
   if(base->flags() & IOP_FLAGS_ONE_INSTANCE)
   {
-    *err = g_strdup_printf("module '%s' can only have one instance", base->op);
+    *err = _ERRF(API_E_UNAVAILABLE, "operation", "module '%s' can only have one instance", base->op);
     return FALSE;
   }
   const gboolean copy = params ? json_object_get_boolean_member_with_default(params, "copy", FALSE) : FALSE;
@@ -3891,7 +3935,7 @@ static gboolean _module_remove(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   dt_iop_module_t *m = _find_module(params, err);
@@ -3985,7 +4029,7 @@ static gboolean _module_rename(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   dt_iop_module_t *m = _find_module(params, err);
@@ -3993,7 +4037,7 @@ static gboolean _module_rename(JsonObject *params, JsonBuilder *b, gchar **err)
   const char *name = params ? json_object_get_string_member_with_default(params, "name", NULL) : NULL;
   if(!name || strlen(name) >= sizeof(m->multi_name))
   {
-    *err = g_strdup_printf("module_rename needs name (at most %zu bytes; \"\" for darktable's label)",
+    *err = _ERRF(API_E_PARAMS, "name", "module_rename needs name (at most %zu bytes; \"\" for darktable's label)",
                            sizeof(m->multi_name) - 1);
     return FALSE;
   }
@@ -4027,7 +4071,7 @@ static gboolean _history_compress(JsonObject *params, JsonBuilder *b, gchar **er
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   const gboolean truncate = params ? json_object_get_boolean_member_with_default(params, "truncate", FALSE) : FALSE;
@@ -4086,7 +4130,7 @@ static gboolean _module_move(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   dt_iop_module_t *m = _find_module(params, err);
@@ -4104,14 +4148,14 @@ static gboolean _module_move(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   if(!ref)
   {
-    *err = g_strdup("module_move needs before or after: {operation, instance}");
+    *err = _ERR(API_E_PARAMS, NULL, "module_move needs before or after: {operation, instance}");
     return FALSE;
   }
   dt_iop_module_t *target = _find_module(ref, err);
   if(!target) return FALSE;
   if(target == m)
   {
-    *err = g_strdup("a module can't move relative to itself");
+    *err = _ERR(API_E_PARAMS, NULL, "a module can't move relative to itself");
     return FALSE;
   }
   dt_develop_t *dev = _cur->dev;
@@ -4206,7 +4250,7 @@ static const _curve_mod_t *_curve_mod(const dt_iop_module_t *m, gchar **err)
 {
   for(const _curve_mod_t *c = _curve_mods; c->op; c++)
     if(!g_strcmp0(c->op, m->op)) return c;
-  *err = g_strdup_printf("'%s' has no curves (rgbcurve, tonecurve, colorzones, basecurve)", m->op);
+  *err = _ERRF(API_E_UNAVAILABLE, NULL, "'%s' has no curves (rgbcurve, tonecurve, colorzones, basecurve)", m->op);
   return NULL;
 }
 
@@ -4246,7 +4290,7 @@ static gboolean _curve_get(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   dt_iop_module_t *m = _find_module(params, err);
@@ -4264,7 +4308,7 @@ static gboolean _curve_set(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   dt_iop_module_t *m = _find_module(params, err);
@@ -4280,7 +4324,7 @@ static gboolean _curve_set(JsonObject *params, JsonBuilder *b, gchar **err)
   {
     GString *list = g_string_new(NULL);
     for(int k = 0; c->channels[k]; k++) g_string_append_printf(list, "%s%s", k ? ", " : "", c->channels[k]);
-    *err = g_strdup_printf("'%s' has no channel '%s' (%s)", m->op, chname, list->str);
+    *err = _ERRF(API_E_PARAMS, "channel", "'%s' has no channel '%s' (%s)", m->op, chname, list->str);
     g_string_free(list, TRUE);
     return FALSE;
   }
@@ -4299,7 +4343,7 @@ static gboolean _curve_set(JsonObject *params, JsonBuilder *b, gchar **err)
       if(!g_ascii_strcasecmp(tname, _curve_types[k])) type = k;
     if(type < 0)
     {
-      *err = g_strdup("type: cubic spline, centripetal spline or monotonic spline");
+      *err = _ERR(API_E_PARAMS, NULL, "type: cubic spline, centripetal spline or monotonic spline");
       return FALSE;
     }
   }
@@ -4309,7 +4353,7 @@ static gboolean _curve_set(JsonObject *params, JsonBuilder *b, gchar **err)
   const guint n = pts ? json_array_get_length(pts) : 0;
   if(n < 2 || n > (guint)p.max_nodes)
   {
-    *err = g_strdup_printf("points: 2..%d points [[x, y], ...]", p.max_nodes);
+    *err = _ERRF(API_E_PARAMS, "points", "points: 2..%d points [[x, y], ...]", p.max_nodes);
     return FALSE;
   }
   float (*xy)[2] = g_malloc0_n(n, sizeof(*xy));
@@ -4322,7 +4366,7 @@ static gboolean _curve_set(JsonObject *params, JsonBuilder *b, gchar **err)
     if(!ok || xy[k][0] < 0 || xy[k][0] > 1 || xy[k][1] < 0 || xy[k][1] > 1 || (k && xy[k][0] <= xy[k - 1][0]))
     {
       g_free(xy);
-      *err = g_strdup_printf("point %u: [x, y] in 0..1, x increasing", k);
+      *err = _ERRF(API_E_PARAMS, "points", "point %u: [x, y] in 0..1, x increasing", k);
       return FALSE;
     }
   }
@@ -4355,7 +4399,7 @@ static gboolean _image_duplicate(JsonObject *params, const dt_imgid_t current, g
     ? json_object_get_int_member(params, "imgid") : current;
   if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
   {
-    *err = g_strdup_printf("no image with id %d", imgid);
+    *err = _ERRF(API_E_NOT_FOUND, "imgid", "no image with id %d", imgid);
     return FALSE;
   }
   const gboolean virgin = params ? json_object_get_boolean_member_with_default(params, "virgin", FALSE) : FALSE;
@@ -4368,7 +4412,7 @@ static gboolean _image_duplicate(JsonObject *params, const dt_imgid_t current, g
   {
     if(!save)
     {
-      *err = g_strdup("the photo has unsaved changes, and the duplicate gets the saved edit: save first,"
+      *err = _ERR(API_E_UNSAVED, NULL, "the photo has unsaved changes, and the duplicate gets the saved edit: save first,"
                       " or pass save: true");
       return FALSE;
     }
@@ -4408,7 +4452,7 @@ static gboolean _image_remove(JsonObject *params, GList **removed, JsonBuilder *
     ? json_object_get_array_member(params, "imgids") : NULL;
   if(!ids || !json_array_get_length(ids))
   {
-    *err = g_strdup("imgids: a list of image ids to remove");
+    *err = _ERR(API_E_PARAMS, "imgids", "imgids: a list of image ids to remove");
     return FALSE;
   }
   const guint n = json_array_get_length(ids);
@@ -4416,9 +4460,9 @@ static gboolean _image_remove(JsonObject *params, GList **removed, JsonBuilder *
   {
     const dt_imgid_t imgid = json_array_get_int_element(ids, i);
     if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
-      *err = g_strdup_printf("no image with id %d", imgid);
+      *err = _ERRF(API_E_NOT_FOUND, "imgids", "no image with id %d", imgid);
     else if(imgid == _darkroom_image())
-      *err = g_strdup_printf("image %d is open in darktable's darkroom: open another photo there first", imgid);
+      *err = _ERRF(API_E_BUSY, "imgids", "image %d is open in darktable's darkroom: open another photo there first", imgid);
     else
     {
       const _session_t *s = _session_find_listed(imgid);
@@ -4431,7 +4475,7 @@ static gboolean _image_remove(JsonObject *params, GList **removed, JsonBuilder *
         if(dt_image_exists(GPOINTER_TO_INT(l->data))) in_use++;
       g_list_free(users);
       if(s && s->dirty)
-        *err = g_strdup_printf("image %d has unsaved changes: save or discard them first", imgid);
+        *err = _ERRF(API_E_UNSAVED, NULL, "image %d has unsaved changes: save or discard them first", imgid);
       else if(local_copy)
         *err = g_strdup_printf("image %d is a local copy: reset it in darktable first", imgid);
       else if(in_use)
@@ -4567,17 +4611,17 @@ static GArray *_targets(JsonObject *params, const dt_imgid_t current, const dt_i
   else if(dt_is_valid_imgid(current))
     g_array_append_val(ids, current);
   const gboolean save = params ? json_object_get_boolean_member_with_default(params, "save", FALSE) : FALSE;
-  if(!ids->len) *err = g_strdup("no image: pass imgids, or open one first");
+  if(!ids->len) *err = _ERR(API_E_PARAMS, "imgids", "no image: pass imgids, or open one first");
   for(guint i = 0; i < ids->len && !*err; i++)
   {
     const dt_imgid_t id = g_array_index(ids, dt_imgid_t, i);
     const _session_t *s = _session_find(id);
     if(!dt_is_valid_imgid(id) || !_image_exists(id))
-      *err = g_strdup_printf("no image with id %d", id);
+      *err = _ERRF(API_E_NOT_FOUND, "imgids", "no image with id %d", id);
     else if(id == source)
-      *err = g_strdup_printf("image %d is the source", id);
+      *err = _ERRF(API_E_PARAMS, "imgids", "image %d is the source", id);
     else if(s && !s->gui && s->dirty && !save)
-      *err = g_strdup_printf("image %d has unsaved changes, which this saves: save first, or pass save: true", id);
+      *err = _ERRF(API_E_UNSAVED, NULL, "image %d has unsaved changes, which this saves: save first, or pass save: true", id);
   }
   if(*err)
   {
@@ -4704,7 +4748,7 @@ static gboolean _style_apply(JsonObject *params, const dt_imgid_t current, GArra
   const char *name = params ? json_object_get_string_member_with_default(params, "name", NULL) : NULL;
   if(!name || !dt_styles_exists(name))
   {
-    *err = g_strdup_printf("no style named '%s' (style_list)", name ? name : "");
+    *err = _ERRF(API_E_NOT_FOUND, "name", "no style named '%s' (style_list)", name ? name : "");
     return FALSE;
   }
   GArray *ids = _targets(params, current, NO_IMGID, err);
@@ -4723,17 +4767,17 @@ static gboolean _style_create(JsonObject *params, const dt_imgid_t current, Json
     ? json_object_get_int_member(params, "imgid") : current;
   if(!name || !*name)
   {
-    *err = g_strdup("needs a name");
+    *err = _ERR(API_E_PARAMS, "name", "needs a name");
     return FALSE;
   }
   if(dt_styles_exists(name))
   {
-    *err = g_strdup_printf("a style named '%s' exists", name);
+    *err = _ERRF(API_E_PARAMS, "name", "a style named '%s' exists", name);
     return FALSE;
   }
   if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
   {
-    *err = g_strdup_printf("no image with id %d", imgid);
+    *err = _ERRF(API_E_NOT_FOUND, "imgid", "no image with id %d", imgid);
     return FALSE;
   }
   const _session_t *s = _session_find(imgid);
@@ -4741,7 +4785,7 @@ static gboolean _style_create(JsonObject *params, const dt_imgid_t current, Json
     dt_dev_write_history(s->dev);
   else if(s && s->dirty)
   {
-    *err = g_strdup_printf("image %d has unsaved changes and a style takes the saved edit: save first", imgid);
+    *err = _ERRF(API_E_UNSAVED, NULL, "image %d has unsaved changes and a style takes the saved edit: save first", imgid);
     return FALSE;
   }
   JsonArray *modules = params && json_object_has_member(params, "modules")
@@ -4787,7 +4831,7 @@ static gboolean _style_delete(JsonObject *params, JsonBuilder *b, gchar **err)
   const char *name = params ? json_object_get_string_member_with_default(params, "name", NULL) : NULL;
   if(!name || !dt_styles_exists(name))
   {
-    *err = g_strdup_printf("no style named '%s' (style_list)", name ? name : "");
+    *err = _ERRF(API_E_NOT_FOUND, "name", "no style named '%s' (style_list)", name ? name : "");
     return FALSE;
   }
   dt_styles_delete_by_name(name);
@@ -4826,13 +4870,13 @@ static gboolean _history_paste(JsonObject *params, const dt_imgid_t current, GAr
   const _session_t *s = _session_find(from);
   if(s && !s->gui && s->dirty)
   {
-    *err = g_strdup_printf("image %d has unsaved changes and pasting takes the saved edit: save first", from);
+    *err = _ERRF(API_E_UNSAVED, NULL, "image %d has unsaved changes and pasting takes the saved edit: save first", from);
     return FALSE;
   }
   const char *mode = json_object_get_string_member_with_default(params, "mode", "append");
   if(g_strcmp0(mode, "append") && g_strcmp0(mode, "overwrite"))
   {
-    *err = g_strdup("mode is append or overwrite");
+    *err = _ERR(API_E_PARAMS, "mode", "mode is append or overwrite");
     return FALSE;
   }
   _paste_t p = { from, !g_strcmp0(mode, "append"),
@@ -4908,7 +4952,7 @@ static gchar *_export_target(const dt_imgid_t imgid, const char *pattern_in, con
   if(!base || !*base)
   {
     g_free(base);
-    *err = g_strdup_printf("the path pattern '%s' expands to nothing", pattern_in);
+    *err = _ERRF(API_E_PARAMS, "path", "the path pattern '%s' expands to nothing", pattern_in);
     return NULL;
   }
 
@@ -5021,7 +5065,7 @@ static _export_t *_export_prepare(JsonObject *params, const dt_imgid_t current, 
     ? json_object_get_int_member(params, "imgid") : current;
   if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
   {
-    *err = g_strdup_printf("no image with id %d", imgid);
+    *err = _ERRF(API_E_NOT_FOUND, "imgid", "no image with id %d", imgid);
     return NULL;
   }
   const gchar *fmt_name = params ? json_object_get_string_member_with_default(params, "format", NULL) : NULL;
@@ -5047,12 +5091,12 @@ static _export_t *_export_prepare(JsonObject *params, const dt_imgid_t current, 
     if(!g_strcmp0(conflict, conflicts[k])) conflict_action = k;
   if(conflict && conflict_action < 0)
   {
-    *err = g_strdup("on_conflict: unique, overwrite, overwrite_if_changed or skip");
+    *err = _ERR(API_E_PARAMS, "on_conflict", "on_conflict: unique, overwrite, overwrite_if_changed or skip");
     return NULL;
   }
   if(max_w < -1 || max_h < -1)
   {
-    *err = g_strdup("max_width/max_height: pixels, 0 for no limit");
+    *err = _ERR(API_E_PARAMS, "max_width", "max_width/max_height: pixels, 0 for no limit");
     return NULL;
   }
 
@@ -5070,7 +5114,7 @@ static _export_t *_export_prepare(JsonObject *params, const dt_imgid_t current, 
   }
   if(style && *style && !dt_styles_exists(style))
   {
-    *err = g_strdup_printf("no style '%s'", style);
+    *err = _ERRF(API_E_NOT_FOUND, "style", "no style '%s'", style);
     return NULL;
   }
 
@@ -5084,7 +5128,7 @@ static _export_t *_export_prepare(JsonObject *params, const dt_imgid_t current, 
   {
     if(!save)
     {
-      *err = g_strdup("the image has unsaved changes, and export uses the saved edit: save first,"
+      *err = _ERR(API_E_UNSAVED, NULL, "the image has unsaved changes, and export uses the saved edit: save first,"
                       " or pass save: true");
       return NULL;
     }
@@ -5407,7 +5451,7 @@ static gboolean _library_release(JsonBuilder *b, gchar **err)
 {
   if(_released)
   {
-    *err = g_strdup("the library is already released");
+    *err = _ERR(API_E_RELEASED, NULL, "the library is already released");
     return FALSE;
   }
   const gint64 t0 = g_get_monotonic_time();
@@ -5515,7 +5559,7 @@ static gboolean _library_acquire(JsonBuilder *b, gchar **err)
   g_free(data);
   if(pid)
   {
-    *err = g_strdup_printf("the library is held by process %d", pid);
+    *err = _ERRF(API_E_RELEASED, NULL, "the library is held by process %d", pid);
     return FALSE;
   }
   const gint64 t0 = g_get_monotonic_time();
@@ -5786,7 +5830,7 @@ static gboolean _image_info(JsonObject *params, JsonBuilder *b, gchar **err)
   const dt_imgid_t imgid = params ? json_object_get_int_member_with_default(params, "imgid", -1) : -1;
   if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
   {
-    *err = g_strdup_printf("no image with id %d", imgid);
+    *err = _ERRF(API_E_NOT_FOUND, "imgid", "no image with id %d", imgid);
     return FALSE;
   }
   sqlite3_stmt *st = NULL;
@@ -5927,12 +5971,12 @@ static gboolean _darkroom_open(JsonObject *params, JsonBuilder *b, gchar **err)
   const dt_imgid_t imgid = params ? json_object_get_int_member_with_default(params, "imgid", NO_IMGID) : NO_IMGID;
   if(!_in_gui)
   {
-    *err = g_strdup("darkroom_open needs darktable's window serving the API");
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "darkroom_open needs darktable's window serving the API");
     return FALSE;
   }
   if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
   {
-    *err = g_strdup_printf("no image with id %d", imgid);
+    *err = _ERRF(API_E_NOT_FOUND, "imgid", "no image with id %d", imgid);
     return FALSE;
   }
   if(_darkroom_image() == imgid)
@@ -5967,19 +6011,19 @@ static gboolean _darkroom_snapshot(JsonObject *params, JsonBuilder *b, gchar **e
   const dt_imgid_t imgid = _darkroom_image();
   if(!dt_is_valid_imgid(imgid))
   {
-    *err = g_strdup("darkroom_snapshot needs darktable's window serving the API, with a photo in the darkroom");
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "darkroom_snapshot needs darktable's window serving the API, with a photo in the darkroom");
     return FALSE;
   }
   if(params && json_object_has_member(params, "imgid") && json_object_get_int_member(params, "imgid") != imgid)
   {
-    *err = g_strdup_printf("the darkroom has image %d open", imgid);
+    *err = _ERRF(API_E_UNAVAILABLE, "imgid", "the darkroom has image %d open", imgid);
     return FALSE;
   }
   const int items = g_list_length(darktable.develop->history);
   const int end = params ? json_object_get_int_member_with_default(params, "history_end", 0) : 0;
   if(end < 0 || end > items)
   {
-    *err = g_strdup_printf("history_end must be 0..%d", items);
+    *err = _ERRF(API_E_PARAMS, "history_end", "history_end must be 0..%d", items);
     return FALSE;
   }
   int (*take_at)(dt_lib_module_t *, int, gboolean) = NULL;
@@ -5991,14 +6035,14 @@ static gboolean _darkroom_snapshot(JsonObject *params, JsonBuilder *b, gchar **e
   }
   if(!lib || !lib->module || !g_module_symbol(lib->module, "dt_lib_snapshots_take_at", (gpointer *)&take_at))
   {
-    *err = g_strdup("this darktable's snapshots module can't take a snapshot for the API");
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "this darktable's snapshots module can't take a snapshot for the API");
     return FALSE;
   }
   const gboolean show = params ? json_object_get_boolean_member_with_default(params, "show", TRUE) : TRUE;
   const int slot = take_at(lib, end, show);
   if(slot < 0)
   {
-    *err = g_strdup("every snapshot slot is in use: remove one in the snapshots module first");
+    *err = _ERR(API_E_BUSY, NULL, "every snapshot slot is in use: remove one in the snapshots module first");
     return FALSE;
   }
   json_builder_set_member_name(b, "imgid");
@@ -6022,12 +6066,12 @@ static gboolean _thumbnail(JsonObject *params, JsonBuilder *b, gchar **err)
   const gchar *path = params ? json_object_get_string_member_with_default(params, "path", NULL) : NULL;
   if(!path || size <= 0)
   {
-    *err = g_strdup("thumbnail needs path and size > 0");
+    *err = _ERR(API_E_PARAMS, "path", "thumbnail needs path and size > 0");
     return FALSE;
   }
   if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
   {
-    *err = g_strdup_printf("no image with id %d", imgid);
+    *err = _ERRF(API_E_NOT_FOUND, "imgid", "no image with id %d", imgid);
     return FALSE;
   }
   const gint64 t0 = g_get_monotonic_time();
@@ -6064,7 +6108,7 @@ static gboolean _thumbnail(JsonObject *params, JsonBuilder *b, gchar **err)
     json_builder_add_int_value(b, (g_get_monotonic_time() - t0) / 1000);
   }
   else
-    *err = g_strdup_printf("no thumbnail for image %d", imgid);
+    *err = _ERRF(API_E_NOT_FOUND, "imgid", "no thumbnail for image %d", imgid);
   dt_mipmap_cache_release(&buf);
   return ok;
 }
@@ -6076,7 +6120,7 @@ static gboolean _set_rating(JsonObject *params, JsonBuilder *b, gchar **err)
   const dt_imgid_t imgid = params ? json_object_get_int_member_with_default(params, "imgid", -1) : -1;
   if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
   {
-    *err = g_strdup_printf("no image with id %d", imgid);
+    *err = _ERRF(API_E_NOT_FOUND, "imgid", "no image with id %d", imgid);
     return FALSE;
   }
   JsonNode *v = params ? json_object_get_member(params, "rating") : NULL;
@@ -6092,7 +6136,7 @@ static gboolean _set_rating(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   if(rating != DT_VIEW_REJECT && (rating < 0 || rating > 5))
   {
-    *err = g_strdup("rating must be 0..5 or \"reject\"");
+    *err = _ERR(API_E_PARAMS, "rating", "rating must be 0..5 or \"reject\"");
     return FALSE;
   }
   // as the lighttable: rejecting keeps the stars, a rating clears the reject
@@ -6113,12 +6157,12 @@ static gboolean _set_label(JsonObject *params, JsonBuilder *b, gchar **err)
   const gboolean on = params ? json_object_get_boolean_member_with_default(params, "on", TRUE) : TRUE;
   if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
   {
-    *err = g_strdup_printf("no image with id %d", imgid);
+    *err = _ERRF(API_E_NOT_FOUND, "imgid", "no image with id %d", imgid);
     return FALSE;
   }
   if(label < 0 || label > 4)
   {
-    *err = g_strdup("label must be 0..4 (red, yellow, green, blue, purple)");
+    *err = _ERR(API_E_PARAMS, "label", "label must be 0..4 (red, yellow, green, blue, purple)");
     return FALSE;
   }
   if(on)
@@ -6153,10 +6197,10 @@ static GList *_imgids(JsonObject *params, const dt_imgid_t current, gchar **err)
       imgs = g_list_append(imgs, GINT_TO_POINTER(json_array_get_int_element(a, i)));
   else if(dt_is_valid_imgid(current))
     imgs = g_list_append(imgs, GINT_TO_POINTER(current));
-  if(!imgs) *err = g_strdup("no image: pass imgids, or open one first");
+  if(!imgs) *err = _ERR(API_E_PARAMS, "imgids", "no image: pass imgids, or open one first");
   for(GList *l = imgs; l && !*err; l = g_list_next(l))
     if(!_image_exists(GPOINTER_TO_INT(l->data)))
-      *err = g_strdup_printf("no image with id %d", GPOINTER_TO_INT(l->data));
+      *err = _ERRF(API_E_NOT_FOUND, "imgids", "no image with id %d", GPOINTER_TO_INT(l->data));
   if(*err)
   {
     g_list_free(imgs);
@@ -6194,7 +6238,7 @@ static gboolean _image_metadata(JsonObject *params, const dt_imgid_t current, Js
     ? json_object_get_int_member(params, "imgid") : current;
   if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
   {
-    *err = g_strdup_printf("no image with id %d", imgid);
+    *err = _ERRF(API_E_NOT_FOUND, "imgid", "no image with id %d", imgid);
     return FALSE;
   }
   json_builder_set_member_name(b, "imgid");
@@ -6252,7 +6296,7 @@ static gboolean _set_tags(JsonObject *params, const dt_imgid_t current, JsonBuil
                         ? json_object_get_array_member(params, "detach") : NULL;
   if(!attach && !detach)
   {
-    *err = g_strdup("needs attach and/or detach: lists of tag names");
+    *err = _ERR(API_E_PARAMS, NULL, "needs attach and/or detach: lists of tag names");
     return FALSE;
   }
   for(int pass = 0; pass < 2; pass++)
@@ -6265,7 +6309,7 @@ static gboolean _set_tags(JsonObject *params, const dt_imgid_t current, JsonBuil
                          ? json_node_get_string(n) : NULL;
       if(!name || !*name || g_str_has_prefix(name, "darktable|"))
       {
-        *err = g_strdup("tag names are non-empty and not darktable's own (darktable|...)");
+        *err = _ERR(API_E_PARAMS, NULL, "tag names are non-empty and not darktable's own (darktable|...)");
         return FALSE;
       }
     }
@@ -6297,14 +6341,14 @@ static gboolean _set_metadata(JsonObject *params, const dt_imgid_t current, Json
                        && JSON_NODE_HOLDS_OBJECT(json_object_get_member(params, "values"))
                          ? json_object_get_object_member(params, "values") : NULL;
   GList *names = values ? json_object_get_members(values) : NULL;
-  if(!names) *err = g_strdup("needs values: {field: text}");
+  if(!names) *err = _ERR(API_E_PARAMS, "values", "needs values: {field: text}");
   for(GList *l = names; l && !*err; l = g_list_next(l))
   {
     JsonNode *v = json_object_get_member(values, l->data);
     if(!_metadata_field(l->data))
-      *err = g_strdup_printf("no metadata field '%s' (image_metadata lists them)", (const char *)l->data);
+      *err = _ERRF(API_E_PARAMS, "values", "no metadata field '%s' (image_metadata lists them)", (const char *)l->data);
     else if(!JSON_NODE_HOLDS_VALUE(v) || json_node_get_value_type(v) != G_TYPE_STRING)
-      *err = g_strdup_printf("'%s' takes text", (const char *)l->data);
+      *err = _ERRF(API_E_PARAMS, "values", "'%s' takes text", (const char *)l->data);
   }
   GList *imgs = *err ? NULL : _imgids(params, current, err);
   if(!imgs)
@@ -6332,7 +6376,7 @@ static gboolean _set_location(JsonObject *params, const dt_imgid_t current, Json
   {
     if(!params || !json_object_has_member(params, "latitude") || !json_object_has_member(params, "longitude"))
     {
-      *err = g_strdup("needs latitude and longitude (degrees; elevation in m optional), or clear: true");
+      *err = _ERR(API_E_PARAMS, NULL, "needs latitude and longitude (degrees; elevation in m optional), or clear: true");
       return FALSE;
     }
     loc.latitude = json_object_get_double_member(params, "latitude");
@@ -6341,7 +6385,7 @@ static gboolean _set_location(JsonObject *params, const dt_imgid_t current, Json
       loc.elevation = json_object_get_double_member(params, "elevation");
     if(fabs(loc.latitude) > 90.0 || fabs(loc.longitude) > 180.0)
     {
-      *err = g_strdup("latitude is -90..90 and longitude -180..180");
+      *err = _ERR(API_E_PARAMS, NULL, "latitude is -90..90 and longitude -180..180");
       return FALSE;
     }
   }
@@ -6412,7 +6456,7 @@ static gboolean _variant_step(const char *method, JsonObject *params, gchar **er
     GString *names = g_string_new(NULL);
     for(int k = 0; _variant_methods[k]; k++)
       g_string_append_printf(names, "%s%s", k ? ", " : "", _variant_methods[k]);
-    *err = g_strdup_printf("a variant step can't be '%s' (one of: %s)", method, names->str);
+    *err = _ERRF(API_E_PARAMS, "variants", "a variant step can't be '%s' (one of: %s)", method, names->str);
     g_string_free(names, TRUE);
     ok = FALSE;
   }
@@ -6425,7 +6469,7 @@ static gboolean _render_variants(JsonObject *params, JsonBuilder *b, gchar **err
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   JsonArray *variants = params && json_object_has_member(params, "variants")
@@ -6434,7 +6478,7 @@ static gboolean _render_variants(JsonObject *params, JsonBuilder *b, gchar **err
   const guint n = variants ? json_array_get_length(variants) : 0;
   if(!n || n > 12)
   {
-    *err = g_strdup("render_variants needs variants: 1 to 12 of {label, path, steps: [{method, params}]}");
+    *err = _ERR(API_E_PARAMS, "variants", "render_variants needs variants: 1 to 12 of {label, path, steps: [{method, params}]}");
     return FALSE;
   }
   for(guint i = 0; i < n; i++)
@@ -6444,7 +6488,7 @@ static gboolean _render_variants(JsonObject *params, JsonBuilder *b, gchar **err
     if(!v || !json_object_get_string_member_with_default(v, "path", NULL)
        || (json_object_has_member(v, "steps") && !JSON_NODE_HOLDS_ARRAY(json_object_get_member(v, "steps"))))
     {
-      *err = g_strdup_printf("variant %u needs a path, and steps as a list", i);
+      *err = _ERRF(API_E_PARAMS, "variants", "variant %u needs a path, and steps as a list", i);
       return FALSE;
     }
   }
@@ -6571,7 +6615,7 @@ static gboolean _process_view(JsonObject *params, const int max_w, const int max
   const int end_view = params ? json_object_get_int_member_with_default(params, "history_end", end_now) : end_now;
   if(end_view < 0 || end_view > (int)g_list_length(_cur->dev->history))
   {
-    *err = g_strdup_printf("history_end must be 0..%d", g_list_length(_cur->dev->history));
+    *err = _ERRF(API_E_PARAMS, "history_end", "history_end must be 0..%d", g_list_length(_cur->dev->history));
     return FALSE;
   }
   if(end_view != end_now)
@@ -6672,7 +6716,7 @@ static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   const int max_w = params ? json_object_get_int_member_with_default(params, "width", 1200) : 1200;
@@ -6681,7 +6725,7 @@ static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
   const gchar *path = params ? json_object_get_string_member_with_default(params, "path", NULL) : NULL;
   if(!path || max_w <= 0 || max_h <= 0)
   {
-    *err = g_strdup("render needs path, width > 0 and height > 0");
+    *err = _ERR(API_E_PARAMS, NULL, "render needs path, width > 0 and height > 0");
     return FALSE;
   }
   _view_t v;
@@ -6784,7 +6828,7 @@ static gboolean _sample_session(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   const int max_w = params ? json_object_get_int_member_with_default(params, "width", 1024) : 1024;
@@ -6793,7 +6837,7 @@ static gboolean _sample_session(JsonObject *params, JsonBuilder *b, gchar **err)
   const int bins = params ? CLAMP(json_object_get_int_member_with_default(params, "bins", 64), 2, 256) : 64;
   if(max_w <= 0 || max_h <= 0)
   {
-    *err = g_strdup("sample needs width > 0 and height > 0");
+    *err = _ERR(API_E_PARAMS, NULL, "sample needs width > 0 and height > 0");
     return FALSE;
   }
   _view_t v;
@@ -6958,7 +7002,7 @@ static gboolean _seg_model(gchar **err)
     _seg = model && _seg_env ? dt_seg_load(_seg_env, model) : NULL;
     g_free(model);
   }
-  if(!_seg) *err = g_strdup("no AI mask model could be loaded (darktable's preferences: AI models)");
+  if(!_seg) *err = _ERR(API_E_UNAVAILABLE, NULL, "no AI mask model could be loaded (darktable's preferences: AI models)");
   return _seg != NULL;
 }
 
@@ -7004,19 +7048,19 @@ static gboolean _seg_input(_session_t **sp, uint8_t **rgb, int *w, int *h, gchar
 static gboolean _mask_ai(JsonObject *params, JsonBuilder *b, gchar **err)
 {
 #ifndef HAVE_AI
-  *err = g_strdup("this darktable was built without AI (USE_AI)");
+  *err = _ERR(API_E_UNAVAILABLE, NULL, "this darktable was built without AI (USE_AI)");
   return FALSE;
 #else
   dt_iop_module_t *m = _blend_module(params, err);
   if(!m) return FALSE;
   if(m->flags() & IOP_FLAGS_NO_MASKS)
   {
-    *err = g_strdup_printf("module '%s' takes no drawn masks", m->op);
+    *err = _ERRF(API_E_UNAVAILABLE, NULL, "module '%s' takes no drawn masks", m->op);
     return FALSE;
   }
   if(!dt_ai_registry_is_enabled())
   {
-    *err = g_strdup("AI features are off in darktable's preferences (plugins/ai/enabled)");
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "AI features are off in darktable's preferences (plugins/ai/enabled)");
     return FALSE;
   }
   JsonArray *pts = params && json_object_has_member(params, "points")
@@ -7035,7 +7079,7 @@ static gboolean _mask_ai(JsonObject *params, JsonBuilder *b, gchar **err)
     if(!(p[k][0] >= 0 && p[k][0] <= 1 && p[k][1] >= 0 && p[k][1] <= 1))
     {
       g_free(p);
-      *err = g_strdup_printf("point %u: x, y as fractions 0..1 of the photo as rendered", k);
+      *err = _ERRF(API_E_PARAMS, "points", "point %u: x, y as fractions 0..1 of the photo as rendered", k);
       return FALSE;
     }
     if(p[k][2] > 0 && seed < 0) seed = k;
@@ -7043,7 +7087,7 @@ static gboolean _mask_ai(JsonObject *params, JsonBuilder *b, gchar **err)
   if(seed < 0)
   {
     g_free(p);
-    *err = g_strdup("mask_ai needs points [{x, y, include}] with at least one include point on the object");
+    *err = _ERR(API_E_PARAMS, "points", "mask_ai needs points [{x, y, include}] with at least one include point on the object");
     return FALSE;
   }
   const char *combine = params ? json_object_get_string_member_with_default(params, "combine", "union") : "union";
@@ -7056,7 +7100,7 @@ static gboolean _mask_ai(JsonObject *params, JsonBuilder *b, gchar **err)
   if(op < 0)
   {
     g_free(p);
-    *err = g_strdup("combine: union, intersection, difference or exclusion");
+    *err = _ERR(API_E_PARAMS, "combine", "combine: union, intersection, difference or exclusion");
     return FALSE;
   }
   const gboolean inverted = params ? json_object_get_boolean_member_with_default(params, "inverted", FALSE) : FALSE;
@@ -7065,7 +7109,7 @@ static gboolean _mask_ai(JsonObject *params, JsonBuilder *b, gchar **err)
   if(_seg_job)
   {
     g_free(p);
-    *err = g_strdup_printf("the photo is being encoded for AI masks (job %d): wait for it", _seg_job);
+    *err = _ERRF(API_E_BUSY, NULL, "the photo is being encoded for AI masks (job %d): wait for it", _seg_job);
     return FALSE;
   }
   if(!_seg_model(err))
@@ -7334,7 +7378,7 @@ static _job_t *_job_find(JsonObject *params, gchar **err)
   const int id = params ? json_object_get_int_member_with_default(params, "job", 0) : 0;
   for(GList *l = _jobs; l; l = g_list_next(l))
     if(((_job_t *)l->data)->id == id) return l->data;
-  *err = g_strdup_printf("no job %d (job_list)", id);
+  *err = _ERRF(API_E_NOT_FOUND, "job", "no job %d (job_list)", id);
   return NULL;
 }
 
@@ -7584,19 +7628,19 @@ static gpointer _ai_denoise_run(gpointer data)
 static gboolean _ai_denoise(JsonObject *params, const dt_imgid_t current, JsonBuilder *b, gchar **err)
 {
 #ifndef HAVE_AI
-  *err = g_strdup("this darktable was built without AI (USE_AI)");
+  *err = _ERR(API_E_UNAVAILABLE, NULL, "this darktable was built without AI (USE_AI)");
   return FALSE;
 #else
   const dt_imgid_t imgid = params && json_object_has_member(params, "imgid")
     ? json_object_get_int_member(params, "imgid") : current;
   if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
   {
-    *err = g_strdup_printf("no image with id %d", imgid);
+    *err = _ERRF(API_E_NOT_FOUND, "imgid", "no image with id %d", imgid);
     return FALSE;
   }
   if(!dt_ai_registry_is_enabled())
   {
-    *err = g_strdup("AI features are off in darktable's preferences (plugins/ai/enabled)");
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "AI features are off in darktable's preferences (plugins/ai/enabled)");
     return FALSE;
   }
   const double strength = params && json_object_has_member(params, "strength")
@@ -7605,7 +7649,7 @@ static gboolean _ai_denoise(JsonObject *params, const dt_imgid_t current, JsonBu
          ? dt_conf_get_float("plugins/lighttable/neural_restore/raw_strength") : 1.0);
   if(!(strength >= 0.0 && strength <= 1.0))
   {
-    *err = g_strdup("strength: 0..1 (blend of the original and the denoised raw)");
+    *err = _ERR(API_E_PARAMS, "strength", "strength: 0..1 (blend of the original and the denoised raw)");
     return FALSE;
   }
   // the raw loaded, so its sensor layout is known (neural_restore.c does the same)
@@ -7618,7 +7662,7 @@ static gboolean _ai_denoise(JsonObject *params, const dt_imgid_t current, JsonBu
   dt_image_cache_read_release(ci);
   if(!loaded || cls == DT_RESTORE_SENSOR_CLASS_UNSUPPORTED)
   {
-    *err = g_strdup("AI raw denoise needs a raw photo darktable can read (Bayer, X-Trans or linear)");
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "AI raw denoise needs a raw photo darktable can read (Bayer, X-Trans or linear)");
     return FALSE;
   }
   dt_restore_env_t *env = dt_restore_env_init();
@@ -7626,7 +7670,7 @@ static gboolean _ai_denoise(JsonObject *params, const dt_imgid_t current, JsonBu
   if(env) dt_restore_env_destroy(env);
   if(!available)
   {
-    *err = g_strdup("no AI raw denoise model is installed (darktable's preferences: AI models)");
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "no AI raw denoise model is installed (darktable's preferences: AI models)");
     return FALSE;
   }
 
@@ -7866,14 +7910,14 @@ static gboolean _thumbnails(JsonObject *params, JsonBuilder *b, gchar **err)
     const _job_t *o = l->data;
     if(o->state == _JOB_RUNNING && !g_strcmp0(o->type, "thumbnails"))
     {
-      *err = g_strdup_printf("thumbnails are being made already (job %d)", o->id);
+      *err = _ERRF(API_E_BUSY, NULL, "thumbnails are being made already (job %d)", o->id);
       return FALSE;
     }
   }
   const int size = params ? json_object_get_int_member_with_default(params, "size", 720) : 720;
   if(size < 1 || size > 8192)
   {
-    *err = g_strdup("size: 1..8192 (pixels; the thumbnail levels up to the one that holds it are made)");
+    *err = _ERR(API_E_PARAMS, "size", "size: 1..8192 (pixels; the thumbnail levels up to the one that holds it are made)");
     return FALSE;
   }
   GList *imgs = NULL;
@@ -7969,22 +8013,22 @@ static gpointer _seg_job_run(gpointer data)
 static gboolean _mask_ai_encode(JsonObject *params, JsonBuilder *b, gchar **err)
 {
 #ifndef HAVE_AI
-  *err = g_strdup("this darktable was built without AI (USE_AI)");
+  *err = _ERR(API_E_UNAVAILABLE, NULL, "this darktable was built without AI (USE_AI)");
   return FALSE;
 #else
   if(!_cur)
   {
-    *err = g_strdup("no open session");
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
   if(!dt_ai_registry_is_enabled())
   {
-    *err = g_strdup("AI features are off in darktable's preferences (plugins/ai/enabled)");
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "AI features are off in darktable's preferences (plugins/ai/enabled)");
     return FALSE;
   }
   if(_seg_job)
   {
-    *err = g_strdup_printf("a photo is being encoded already (job %d)", _seg_job);
+    *err = _ERRF(API_E_BUSY, NULL, "a photo is being encoded already (job %d)", _seg_job);
     return FALSE;
   }
   if(!_seg_model(err)) return FALSE;
@@ -8138,7 +8182,7 @@ static dt_iop_module_t *_darkroom_module(JsonObject *params, gchar **err)
 {
   if(!_cur || !_cur->gui)
   {
-    *err = g_strdup("pickers and auto buttons work on the photo in darktable's darkroom, with darktable's window"
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "pickers and auto buttons work on the photo in darktable's darkroom, with darktable's window"
                     " serving the API (library_status: darkroom_imgid)");
     return NULL;
   }
@@ -8505,7 +8549,7 @@ static gboolean _parse_area(JsonObject *params, float box[4], gboolean *point, g
             && box[0] < box[2] && box[1] < box[3];
   }
   if(!ok)
-    *err = g_strdup("point is [x, y] and box {left, top, right, bottom}, in 0..1 of the image as rendered");
+    *err = _ERR(API_E_PARAMS, NULL, "point is [x, y] and box {left, top, right, bottom}, in 0..1 of the image as rendered");
   return ok;
 }
 
@@ -8522,7 +8566,7 @@ static gboolean _picker_apply(JsonObject *params, JsonBuilder *b, gchar **err)
   if(!c)
   {
     g_list_free_full(list, _control_free);
-    *err = g_strdup_printf("module '%s' has no picker or button '%s' (picker_list)", m->op, name ? name : "");
+    *err = _ERRF(API_E_NOT_FOUND, "name", "module '%s' has no picker or button '%s' (picker_list)", m->op, name ? name : "");
     return FALSE;
   }
   float area[4] = { 0.f };
@@ -8535,7 +8579,7 @@ static gboolean _picker_apply(JsonObject *params, JsonBuilder *b, gchar **err)
   if(_pick_job(m))
   {
     g_list_free_full(list, _control_free);
-    *err = g_strdup_printf("a picker of '%s' is already at work (job_list)", m->op);
+    *err = _ERRF(API_E_BUSY, NULL, "a picker of '%s' is already at work (job_list)", m->op);
     return FALSE;
   }
   _job_t *j = g_new0(_job_t, 1);
@@ -8644,6 +8688,8 @@ static void _send_node(_client_t *c, JsonNode *root)
 
 static void _reply(_client_t *c, JsonNode *id, JsonNode *result, const gchar *err)
 {
+  const _api_error_t code = err && err == _err_msg ? _err_code : API_E_FAILED;
+  const char *param = err && err == _err_msg ? _err_param : NULL;
   JsonBuilder *b = json_builder_new();
   json_builder_begin_object(b);
   json_builder_set_member_name(b, "jsonrpc");
@@ -8655,9 +8701,25 @@ static void _reply(_client_t *c, JsonNode *id, JsonNode *result, const gchar *er
     json_builder_set_member_name(b, "error");
     json_builder_begin_object(b);
     json_builder_set_member_name(b, "code");
-    json_builder_add_int_value(b, -32000);
+    json_builder_add_int_value(b, code);
     json_builder_set_member_name(b, "message");
     json_builder_add_string_value(b, err);
+    json_builder_set_member_name(b, "data");
+    json_builder_begin_object(b);
+    for(int k = 0; k < G_N_ELEMENTS(_error_names); k++)
+      if(_error_names[k].code == code)
+      {
+        json_builder_set_member_name(b, "name");
+        json_builder_add_string_value(b, _error_names[k].name);
+        json_builder_set_member_name(b, "retry");
+        json_builder_add_boolean_value(b, _error_names[k].retry);
+      }
+    if(param)
+    {
+      json_builder_set_member_name(b, "param");
+      json_builder_add_string_value(b, param);
+    }
+    json_builder_end_object(b);
     json_builder_end_object(b);
     if(result) json_node_unref(result);
   }
@@ -8799,7 +8861,8 @@ static const char *_methods[] = {
   "history_paste", "collection", "darkroom_open", "image_info.exif", "image_metadata", "tag_list", "set_tags",
   "set_metadata", "set_location", "picker_list", "picker_apply", "module_remove", "module_rename", "history_compress",
   "render.history_end", "render_variants", "darkroom_snapshot", "share", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
-  "library_status", "library_release", "library_acquire", "handover", "shutdown", "shutdown.quit_window", NULL };
+  "library_status", "library_release", "library_acquire", "handover", "shutdown", "shutdown.quit_window",
+  "errors.codes", NULL };
 
 // methods that work on an edit session, and the event each one sends
 static const struct { const char *method; const char *event; } _session_methods[] = {
@@ -8848,7 +8911,7 @@ static gboolean _handle(_client_t *c, const gchar *line)
   if(!json_parser_load_from_data(p, line, -1, NULL)
      || !JSON_NODE_HOLDS_OBJECT(json_parser_get_root(p)))
   {
-    _reply(c, NULL, NULL, "parse error");
+    _reply(c, NULL, NULL, _ERR(API_E_PARSE, NULL, "parse error"));
     g_object_unref(p);
     return TRUE;
   }
@@ -8862,6 +8925,7 @@ static gboolean _handle(_client_t *c, const gchar *line)
   JsonBuilder *b = json_builder_new();
   json_builder_begin_object(b);
   gchar *err = NULL;
+  _err_msg = NULL;
   gboolean go_on = TRUE;
   const char *event = NULL;
   dt_imgid_t event_img = NO_IMGID;
@@ -8886,7 +8950,7 @@ static gboolean _handle(_client_t *c, const gchar *line)
       if(_cur->gui) _gui_settle();
     }
     else if(dt_is_valid_imgid(imgid))
-      err = g_strdup_printf("image %d is not open: call session_open first", imgid);
+      err = _ERRF(API_E_NOT_OPEN, "imgid", "image %d is not open: call session_open first", imgid);
     event_img = imgid;
   }
 
@@ -8894,11 +8958,11 @@ static gboolean _handle(_client_t *c, const gchar *line)
     ;
   else if(_jobs_running() && (!g_strcmp0(method, "library_release") || !g_strcmp0(method, "handover")
                                || !g_strcmp0(method, "shutdown") || !g_strcmp0(method, "image_remove")))
-    err = g_strdup("a background job is running (job_list): wait for it, or job_cancel it, first");
+    err = _ERR(API_E_BUSY, NULL, "a background job is running (job_list): wait for it, or job_cancel it, first");
   else if(_released && g_strcmp0(method, "ping") && g_strcmp0(method, "library_status")
      && g_strcmp0(method, "library_acquire") && g_strcmp0(method, "shutdown")
      && g_strcmp0(method, "handover"))
-    err = g_strdup("the library is released: call library_acquire first");
+    err = _ERR(API_E_RELEASED, NULL, "the library is released: call library_acquire first");
   else if(!g_strcmp0(method, "ping"))
   {
     json_builder_set_member_name(b, "version");
@@ -9137,7 +9201,7 @@ static gboolean _handle(_client_t *c, const gchar *line)
   }
   else if(_opt.in_gui && (!g_strcmp0(method, "library_release") || !g_strcmp0(method, "library_acquire")
                           || !g_strcmp0(method, "handover")))
-    err = g_strdup("darktable's window has the library; quit darktable to hand it to the engine");
+    err = _ERR(API_E_UNAVAILABLE, NULL, "darktable's window has the library; quit darktable to hand it to the engine");
   else if(!g_strcmp0(method, "library_release") || !g_strcmp0(method, "library_acquire"))
   {
     if(!g_strcmp0(method, "library_release") ? _library_release(b, &err) : _library_acquire(b, &err))
@@ -9154,15 +9218,15 @@ static gboolean _handle(_client_t *c, const gchar *line)
     if(!_opt.in_gui)
       go_on = FALSE;
     else if(!(params && json_object_get_boolean_member_with_default(params, "quit_window", FALSE)))
-      err = g_strdup("darktable's window serves the library: shutdown {quit_window: true} quits darktable");
+      err = _ERR(API_E_UNAVAILABLE, "quit_window", "darktable's window serves the library: shutdown {quit_window: true} quits darktable");
     else if(_modal_open())
-      err = g_strdup("a dialog is open in darktable's window: darktable doesn't quit under it");
+      err = _ERR(API_E_BUSY, NULL, "a dialog is open in darktable's window: darktable doesn't quit under it");
     else
       // after the reply has gone out
       g_idle_add(_quit_window, NULL);
   }
   else
-    err = g_strdup_printf("unknown method '%s'", method);
+    err = _ERRF(API_E_METHOD, NULL, "unknown method '%s'", method);
 
   json_builder_end_object(b);
   // notifications (no id) get no reply

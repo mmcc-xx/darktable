@@ -127,8 +127,24 @@ JSON-RPC 2.0, one request per line on stdin, one reply per line on stdout:
 
 Session methods (`module_*`, `history_*`, `save`, `reset`, `render`,
 `session_close`) take an optional `imgid`; without it they work on the image
-the client last opened. Errors are JSON-RPC errors (code -32000) with a
-message.
+the client last opened. Errors are JSON-RPC errors with a readable
+`message`, a `code` and `data` {`name`, `retry`, `param`}: `retry` says the
+same request can work later, `param` names the parameter concerned when
+there is one (capability `errors.codes`; older servers send -32000 and a
+message only):
+
+| code | name | means |
+|---|---|---|
+| -32700 | `parse_error` | the request isn't JSON |
+| -32601 | `unknown_method` | no such method |
+| -32602 | `invalid_params` | a parameter is missing, of the wrong type, out of range, or an unknown setting or value |
+| -32000 | `failed` | the operation failed (rendering, writing a file, the database, ...) |
+| -32001 | `not_found` | no such image, module, instance, shape, spot, preset, style, picker or job |
+| -32002 | `not_open` | a session method on an image no session has open: `session_open` first |
+| -32003 | `released` | the library is released or held by another process (`retry`: after `library_acquire`) |
+| -32004 | `busy` | a job, a dialog in darktable's window or another task is in the way (`retry`) |
+| -32005 | `unavailable` | not possible on this server: headless vs darktable's window, a build without AI, a module without that feature |
+| -32006 | `unsaved_changes` | the image has unsaved changes the method would lose or ignore: save first (or the method's `save` option) |
 
 | method | does |
 |---|---|

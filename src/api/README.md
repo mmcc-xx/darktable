@@ -33,7 +33,12 @@ neither exists (a build folder configured before the option existed
 needs `cmake -B build -DUSE_API=ON` once). The AI methods (`mask_ai`,
 `ai_denoise`) need `-DUSE_AI=ON`:
 
-    cmake --build build --target darktable-api
+    cmake --build build
+
+Build all targets, not just `--target darktable-api`: the engine also
+needs darktable's data files (rawspeed's `cameras.xml`, the default
+`darktablerc`), which only the full build puts in `build/share`.
+Without them a fresh build hangs on its first raw import.
 
 `src/api` builds against darktable master and against releases from 5.6.2
 on: branch `darktable-api` is darktable master, `darktable-api-5.6` is

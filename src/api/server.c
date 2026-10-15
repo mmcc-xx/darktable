@@ -7941,13 +7941,18 @@ static gboolean _write_float_tiff(const char *path, const float *rgba, const int
   return ok;
 }
 
-#define _FILL_SIZE 512
+#define _FILL_SIZE 512               // the model's working size unless asked (size)
+// shapes longer than this (pixels at full size) fill as a soft smear, not
+// texture: the model makes texture at the scale it was trained on, and a
+// larger working size does not help (photo 315: a 770 px tail fills well,
+// the whole 2770 px animal does not, at 512 or 2048)
+#define _FILL_LARGE (5 * _FILL_SIZE / 2)
 #define _OVERLAY_NATIVE 2            // overlay.c: DT_OVERLAY_COMPOSITE_NATIVE
 #define _OVERLAY_SCALE_ON_HEIGHT 3   // overlay.c: DT_SCALE_MAINMENU_MARKERHEIGHT
 #define _FILL_GAMMA 2.2f
 
 // fills the hole (mask > 0) of a square side x side buffer in place, with the
-// model at 512 x 512: encoded for display (normalized, gamma), resampled, filled,
+// model at S x S (512, or more for a model without fixed sizes): encoded for display (normalized, gamma), resampled, filled,
 // resampled back, its missing grain added, decoded
 // a raw's camera RGB (white balanced, before the input profile, where the
 // composite works) <-> linear sRGB, as dcraw does: camera from sRGB =
@@ -7985,7 +7990,7 @@ static inline void _mul3(const float m[9], const float *in, float *out)
   for(int r = 0; r < 3; r++) out[r] = m[3 * r] * in[0] + m[3 * r + 1] * in[1] + m[3 * r + 2] * in[2];
 }
 
-static gboolean _inpaint(dt_ai_context_t *ctx, float *buf, const float *mask, const int side,
+static gboolean _inpaint(dt_ai_context_t *ctx, float *buf, const float *mask, const int side, const int S,
                          const float to_srgb[9], const float to_cam[9], const uint64_t seed, gchar **err)
 {
   const size_t np = (size_t)side * side;
@@ -8016,7 +8021,6 @@ static gboolean _inpaint(dt_ai_context_t *ctx, float *buf, const float *mask, co
   g_free(v);
   if(!(norm > 1e-6f)) norm = 1.0f;
 
-  const int S = _FILL_SIZE;
   float *enc = dt_alloc_align_float(4 * np);
   float *small = dt_alloc_align_float((size_t)4 * S * S);
   float *back = dt_alloc_align_float(4 * np);
@@ -8036,7 +8040,7 @@ static gboolean _inpaint(dt_ai_context_t *ctx, float *buf, const float *mask, co
     const dt_iop_roi_t rbig = { 0, 0, side, side, 1.0f };
     const dt_iop_roi_t rsmall = { 0, 0, S, S, (float)S / side };
     dt_interpolation_resample(itor, small, &rsmall, enc, &rbig);
-    // the hole at 512: any of the pixels a model pixel covers
+    // the hole at S: any of the pixels a model pixel covers
     const double f = (double)side / S;
     for(int y = 0; y < S; y++)
       for(int x = 0; x < S; x++)
@@ -8138,6 +8142,12 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
   if(!(context >= 0.25 && context <= 4.0))
   {
     *err = _ERR(API_E_PARAMS, "context", "context: 0.25..4 (the margin around the shape the model sees, in shape sizes)");
+    return FALSE;
+  }
+  const int size = json_object_get_int_member_with_default(params, "size", _FILL_SIZE);
+  if(size < 256 || size > 4096 || size % 8)
+  {
+    *err = _ERR(API_E_PARAMS, "size", "size: 256..4096, a multiple of 8 (the model's working size)");
     return FALSE;
   }
   const char *name = json_object_get_string_member_with_default(params, "name", "fill");
@@ -8279,7 +8289,7 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   float to_srgb[9], to_cam[9];
   _cam_srgb_matrices(&dev->image_storage, to_srgb, to_cam);
-  if(!_inpaint(ctx, buf, mask, side, to_srgb, to_cam, ((uint64_t)rx << 32) ^ (uint64_t)ry ^ ((uint64_t)host << 48), err))
+  if(!_inpaint(ctx, buf, mask, side, size, to_srgb, to_cam, ((uint64_t)rx << 32) ^ (uint64_t)ry ^ ((uint64_t)host << 48), err))
   {
     if(!*err) *err = g_strdup("out of memory");
     goto done;
@@ -8411,6 +8421,8 @@ done:
     json_builder_add_int_value(b, ry);
     json_builder_set_member_name(b, "size");
     json_builder_add_int_value(b, side);
+    json_builder_set_member_name(b, "model_size");
+    json_builder_add_int_value(b, size);
     json_builder_set_member_name(b, "box");
     _add_box(b, (float[4]){ (float)rx / W, (float)ry / H, (float)(rx + side) / W, (float)(ry + side) / H });
     json_builder_end_object(b);
@@ -8418,6 +8430,18 @@ done:
     json_builder_add_int_value(b, dev->history_end);
     json_builder_set_member_name(b, "process_ms");
     json_builder_add_int_value(b, (g_get_monotonic_time() - t0) / 1000);
+    const int shape_px = MAX(box[2], box[3]);
+    json_builder_set_member_name(b, "shape_px");
+    json_builder_add_int_value(b, shape_px);
+    if(shape_px > _FILL_LARGE)
+    {
+      gchar *w = g_strdup_printf("the shape is large (%d px across; fills look right up to about %d px):"
+                                 " the fill is likely a soft smear rather than texture; check it at 100%%",
+                                 shape_px, _FILL_LARGE);
+      json_builder_set_member_name(b, "warning");
+      json_builder_add_string_value(b, w);
+      g_free(w);
+    }
   }
   g_free(file);
   g_free(model);

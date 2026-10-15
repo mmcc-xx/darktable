@@ -24,3 +24,10 @@ dt_api_header_has(HAVE_DT_EXIF_XMP_WRITE_NEURAL_RESTORE "common/exif.h"
 # dt_pipe_processing (else the pipe's processing flag)
 dt_api_header_has(HAVE_DT_PIPE_PROCESSING "develop/pixelpipe_hb.h"
                   "dt_pipe_processing\\(")
+# composite's high-precision compositing (the overlay in float; since 5.8),
+# which ai_fill needs, and the fork's "native" mode on it (the overlay at its
+# own size, exact; else high precision places the patch to within a level)
+dt_api_header_has(HAVE_OVERLAY_COMPOSITE_HQ "iop/overlay.c"
+                  "DT_OVERLAY_COMPOSITE_HQ")
+dt_api_header_has(HAVE_OVERLAY_COMPOSITE_NATIVE "iop/overlay.c"
+                  "DT_OVERLAY_COMPOSITE_NATIVE")

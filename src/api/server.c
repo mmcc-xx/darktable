@@ -247,6 +247,7 @@
 #include "common/database.h"
 #include "common/file_location.h"
 #include "common/history.h"
+#include "common/import_session.h"
 #include "common/image.h"
 #include "common/image_cache.h"
 #include "common/iop_order.h"
@@ -7321,6 +7322,7 @@ typedef struct _job_t
   gboolean outdated_only;
   gint done, total;
   int generated, skipped, failed;
+  struct _import_t *import;
 } _job_t;
 
 static GList *_jobs = NULL;
@@ -7959,6 +7961,387 @@ static gboolean _thumbnails(JsonObject *params, JsonBuilder *b, gchar **err)
   _add_job(b, j);
   json_builder_set_member_name(b, "images");
   json_builder_add_int_value(b, j->total);
+  json_builder_set_member_name(b, "note");
+  json_builder_add_string_value(b, "runs in the background: job_status, or wait for the \"job\" event");
+  return TRUE;
+}
+
+// ---- import ------------------------------------------------------------------
+// darktable's import (control_jobs.c: _control_import_job_run) as a job:
+// files added where they are ("add to library"), or copied into the folders
+// darktable's import settings name and added there ("copy & import",
+// _control_import_image_copy). photos already in the library are skipped:
+// found by file name and modification time as darktable's import dialog
+// does (import.c), or by file name and capture time, which still holds
+// when a file's modification time was lost on the way (an upload)
+
+typedef struct _import_t
+{
+  GPtrArray *files;                  // the sources, sorted
+  gboolean copy, skip_existing;
+  struct dt_import_session_t *session; // copy only
+  JsonArray *imported, *skipped, *failed;
+  GList *films;                      // film rolls imported into, in order
+} _import_t;
+
+static void _import_note(JsonArray *a, const char *source, const dt_imgid_t imgid, const char *key,
+                         const char *value)
+{
+  JsonObject *o = json_object_new();
+  json_object_set_string_member(o, "source", source);
+  if(dt_is_valid_imgid(imgid)) json_object_set_int_member(o, "imgid", imgid);
+  if(key) json_object_set_string_member(o, key, value);
+  json_array_add_object_element(a, o);
+}
+
+// the photo of the library this file already is, or NO_IMGID
+static dt_imgid_t _import_existing(const char *src, const char *name, const char *mtime, const GTimeSpan taken)
+{
+  dt_imgid_t id = dt_image_get_id_full_path(src);
+  if(dt_is_valid_imgid(id)) return id;
+  sqlite3 *db = dt_database_get(darktable.db);
+  sqlite3_stmt *stmt;
+  // the id copy & import stores, which darktable's import dialog checks
+  // (metadata.c: dt_metadata_already_imported)
+  gchar *dtid = g_strconcat(name, "-", mtime, NULL);
+  DT_DEBUG_SQLITE3_PREPARE_V2(db, "SELECT id FROM main.meta_data WHERE key = ?1 AND value = ?2 LIMIT 1", -1,
+                              &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, dt_metadata_get_keyid("Xmp.darktable.image_id"));
+  DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 2, dtid, -1, SQLITE_TRANSIENT);
+  if(sqlite3_step(stmt) == SQLITE_ROW) id = sqlite3_column_int(stmt, 0);
+  sqlite3_finalize(stmt);
+  g_free(dtid);
+  if(dt_is_valid_imgid(id) || taken <= 0) return id;
+  // the same file name (as imported, or kept from before a rename) taken
+  // at the same moment
+  DT_DEBUG_SQLITE3_PREPARE_V2(db,
+                              "SELECT i.id FROM main.images AS i"
+                              " WHERE i.datetime_taken = ?2"
+                              "   AND (i.filename = ?1"
+                              "        OR EXISTS (SELECT 1 FROM main.meta_data AS m"
+                              "                   WHERE m.id = i.id AND m.key = ?3 AND m.value = ?1))"
+                              " ORDER BY i.id LIMIT 1",
+                              -1, &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 1, name, -1, SQLITE_TRANSIENT);
+  DT_DEBUG_SQLITE3_BIND_INT64(stmt, 2, taken);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 3, dt_metadata_get_keyid("Xmp.xmpMM.PreservedFileName"));
+  if(sqlite3_step(stmt) == SQLITE_ROW) id = sqlite3_column_int(stmt, 0);
+  sqlite3_finalize(stmt);
+  return id;
+}
+
+static gboolean _import_finish(gpointer data)
+{
+  _job_t *j = data;
+  _import_t *im = j->import;
+  g_thread_join(j->thread);
+  j->thread = NULL;
+  j->finished = g_get_monotonic_time();
+  const guint imported = json_array_get_length(im->imported);
+  const guint failed = json_array_get_length(im->failed);
+  const gboolean cancelled = g_atomic_int_get(&j->cancel)
+                             || (j->handle && dt_control_job_get_state(j->handle) == DT_JOB_STATE_CANCELLED);
+  j->state = cancelled ? _JOB_CANCELLED : failed && !imported ? _JOB_FAILED : _JOB_DONE;
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "files");
+  json_builder_add_int_value(b, im->files->len);
+  json_builder_set_member_name(b, "copy");
+  json_builder_add_boolean_value(b, im->copy);
+  json_builder_set_member_name(b, "film_ids");
+  json_builder_begin_array(b);
+  for(GList *l = im->films; l; l = g_list_next(l)) json_builder_add_int_value(b, GPOINTER_TO_INT(l->data));
+  json_builder_end_array(b);
+  json_builder_set_member_name(b, "imported");
+  json_builder_add_value(b, json_node_init_array(json_node_alloc(), im->imported));
+  json_builder_set_member_name(b, "skipped");
+  json_builder_add_value(b, json_node_init_array(json_node_alloc(), im->skipped));
+  json_builder_set_member_name(b, "failed");
+  json_builder_add_value(b, json_node_init_array(json_node_alloc(), im->failed));
+  json_builder_end_object(b);
+  j->result = json_builder_get_root(b);
+  g_object_unref(b);
+  if(j->state == _JOB_FAILED) j->error = g_strdup("no file could be imported (failed lists why)");
+  if(im->session)
+  {
+    // a film roll the session made and left empty goes, with its folder
+    // (import_session.c); destroy only frees after a ref
+    dt_import_session_ref(im->session);
+    dt_import_session_destroy(im->session);
+  }
+  if(imported && _in_gui)
+  {
+    dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD, DT_COLLECTION_PROP_UNDEF,
+                               NULL);
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_FILMROLLS_CHANGED);
+  }
+  if(j->handle)
+  {
+    dt_control_job_dispose(j->handle);
+    j->handle = NULL;
+  }
+  json_array_unref(im->imported);
+  json_array_unref(im->skipped);
+  json_array_unref(im->failed);
+  g_ptr_array_free(im->files, TRUE);
+  g_list_free(im->films);
+  g_free(im);
+  j->import = NULL;
+  _notify_job(j);
+  return G_SOURCE_REMOVE;
+}
+
+static gpointer _import_run(gpointer data)
+{
+  _job_t *j = data;
+  _import_t *im = j->import;
+  gchar *prev_src = NULL, *prev_out = NULL;
+  for(guint k = 0; k < im->files->len; k++)
+  {
+    if(g_atomic_int_get(&j->cancel)
+       || (j->handle && dt_control_job_get_state(j->handle) == DT_JOB_STATE_CANCELLED))
+      break;
+    const char *src = g_ptr_array_index(im->files, k);
+    gchar *name = g_path_get_basename(src);
+    gchar *buf = NULL;
+    gsize size = 0;
+    GError *error = NULL;
+    GStatBuf st;
+    if(g_stat(src, &st) || !g_file_get_contents(src, &buf, &size, &error))
+    {
+      _import_note(im->failed, src, NO_IMGID, "error", error ? error->message : "can't read it");
+      g_clear_error(&error);
+      g_free(name);
+      g_atomic_int_inc(&j->done);
+      continue;
+    }
+    dt_image_basic_exif_t exif = { 0 };
+    dt_exif_get_basic_data((uint8_t *)buf, size, &exif);
+    char mtime[DT_DATETIME_EXIF_LENGTH] = { 0 };
+    const time_t secs = st.st_mtime;
+    dt_datetime_unix_to_exif(mtime, sizeof(mtime), &secs);
+    const GTimeSpan taken = exif.datetime[0] ? dt_datetime_exif_to_gtimespan(exif.datetime) : 0;
+    const dt_imgid_t existing = im->skip_existing ? _import_existing(src, name, mtime, taken) : NO_IMGID;
+    dt_imgid_t imgid = NO_IMGID;
+    gchar *file = NULL;
+    if(dt_is_valid_imgid(existing))
+      _import_note(im->skipped, src, existing, "reason", "already in the library");
+    else if(!im->copy)
+    {
+      dt_film_t film;
+      dt_film_init(&film);
+      gchar *dir = g_path_get_dirname(src);
+      const dt_filmid_t filmid = dt_film_new(&film, dir);
+      g_free(dir);
+      if(dt_is_valid_filmid(filmid))
+        imgid = dt_image_import(filmid, src, FALSE, FALSE);
+      dt_film_cleanup(&film);
+      file = g_strdup(src);
+    }
+    else
+    {
+      // as _control_import_image_copy: a raw's JPEG twin keeps its output
+      // name, so the two stay a group
+      if(prev_out && dt_has_same_path_basename(src, prev_src))
+        file = dt_copy_filename_extension(prev_out, src);
+      else
+      {
+        if(!exif.datetime[0]) g_strlcpy(exif.datetime, mtime, sizeof(exif.datetime));
+        dt_import_session_set_exif_basic_info(im->session, &exif);
+        dt_import_session_set_filename(im->session, name);
+        const char *dir = dt_import_session_path(im->session, FALSE);
+        const char *fname = dir ? dt_import_session_filename(im->session, dt_conf_get_bool("session/use_filename"))
+                                : NULL;
+        if(dir && fname) file = g_build_filename(dir, fname, NULL);
+      }
+      if(!file)
+        _import_note(im->failed, src, NO_IMGID, "error",
+                     "no folder to copy it to (darktable's import settings: session/base_directory_pattern)");
+      else if(!g_file_set_contents(file, buf, size, &error))
+      {
+        _import_note(im->failed, src, NO_IMGID, "error", error->message);
+        g_clear_error(&error);
+        g_clear_pointer(&file, g_free);
+      }
+      else
+      {
+        // the copy keeps the original's modification time, as darktable's does
+        GFile *gf = g_file_new_for_path(file);
+        g_file_set_attribute_uint64(gf, G_FILE_ATTRIBUTE_TIME_MODIFIED, st.st_mtime, G_FILE_QUERY_INFO_NONE,
+                                    NULL, NULL);
+        g_object_unref(gf);
+        imgid = dt_image_import(dt_import_session_film_id(im->session), file, FALSE, FALSE);
+        if(dt_is_valid_imgid(imgid))
+        {
+          gchar *id = g_strconcat(name, "-", mtime, NULL);
+          dt_metadata_set(imgid, "Xmp.darktable.image_id", id, FALSE);
+          g_free(id);
+          gchar *out_name = g_path_get_basename(file);
+          if(g_strcmp0(out_name, name)) dt_metadata_set(imgid, "Xmp.xmpMM.PreservedFileName", name, FALSE);
+          g_free(out_name);
+        }
+        else
+          g_unlink(file);
+      }
+    }
+    if(file && !dt_is_valid_imgid(imgid))
+      _import_note(im->failed, src, NO_IMGID, "error",
+                   "darktable couldn't import it (not a photo it reads, or non-raws are ignored)");
+    else if(dt_is_valid_imgid(imgid))
+    {
+      JsonObject *o = json_object_new();
+      json_object_set_string_member(o, "source", src);
+      json_object_set_int_member(o, "imgid", imgid);
+      json_object_set_string_member(o, "file", file);
+      json_array_add_object_element(im->imported, o);
+      const dt_image_t *img = dt_image_cache_get(imgid, 'r');
+      const dt_filmid_t filmid = img ? img->film_id : -1;
+      dt_image_cache_read_release(img);
+      if(filmid > 0 && !g_list_find(im->films, GINT_TO_POINTER(filmid)))
+        im->films = g_list_append(im->films, GINT_TO_POINTER(filmid));
+    }
+    if(im->copy && file && dt_is_valid_imgid(imgid))
+    {
+      g_free(prev_out);
+      prev_out = g_strdup(file);
+      prev_src = (gchar *)src;
+    }
+    g_free(file);
+    g_free(buf);
+    g_free(name);
+    g_atomic_int_inc(&j->done);
+    if(j->handle) dt_control_job_set_progress(j->handle, (double)g_atomic_int_get(&j->done) / j->total);
+  }
+  g_free(prev_out);
+  g_idle_add(_import_finish, j);
+  return NULL;
+}
+
+static gint _import_sort(gconstpointer a, gconstpointer b)
+{
+  return g_strcmp0(*(const char **)a, *(const char **)b);
+}
+
+// the photos in a folder darktable can import; recursive descends
+static void _import_list(const char *dir, const gboolean recursive, GPtrArray *files)
+{
+  GDir *d = g_dir_open(dir, 0, NULL);
+  if(!d) return;
+  const char *e;
+  while((e = g_dir_read_name(d)))
+  {
+    if(e[0] == '.') continue;
+    gchar *path = g_build_filename(dir, e, NULL);
+    if(g_file_test(path, G_FILE_TEST_IS_DIR))
+    {
+      if(recursive) _import_list(path, recursive, files);
+      g_free(path);
+    }
+    else if(dt_supported_image(e))
+      g_ptr_array_add(files, path);
+    else
+      g_free(path);
+  }
+  g_dir_close(d);
+}
+
+// import {paths, recursive, copy, jobcode, skip_existing}
+static gboolean _import(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  for(GList *l = _jobs; l; l = g_list_next(l))
+  {
+    const _job_t *o = l->data;
+    if(o->state == _JOB_RUNNING && !g_strcmp0(o->type, "import"))
+    {
+      *err = _ERRF(API_E_BUSY, NULL, "an import is running already (job %d)", o->id);
+      return FALSE;
+    }
+  }
+  JsonArray *paths = params && json_object_has_member(params, "paths")
+                     && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "paths"))
+                       ? json_object_get_array_member(params, "paths") : NULL;
+  if(!paths || !json_array_get_length(paths))
+  {
+    *err = _ERR(API_E_PARAMS, "paths", "paths: the files or folders to import");
+    return FALSE;
+  }
+  const gboolean recursive = json_object_get_boolean_member_with_default(params, "recursive", FALSE);
+  const gboolean copy = json_object_get_boolean_member_with_default(params, "copy", FALSE);
+  const gboolean ignore_nonraws = dt_conf_get_bool("ui_last/import_ignore_nonraws");
+  GPtrArray *files = g_ptr_array_new_with_free_func(g_free);
+  JsonArray *skipped = json_array_new();
+  for(guint k = 0; k < json_array_get_length(paths) && !*err; k++)
+  {
+    const char *p = json_array_get_string_element(paths, k);
+    gchar *path = p && *p ? dt_util_normalize_path(p) : NULL;
+    if(!path || !g_file_test(path, G_FILE_TEST_EXISTS))
+      *err = _ERRF(API_E_NOT_FOUND, "paths", "%s: no such file or folder", p ? p : "(not a string)");
+    else if(g_file_test(path, G_FILE_TEST_IS_DIR))
+    {
+      const guint before = files->len;
+      _import_list(path, recursive, files);
+      if(files->len == before)
+        *err = _ERRF(API_E_NOT_FOUND, "paths", "%s: no photos darktable can import%s", path,
+                     recursive ? "" : " (recursive: true looks in its folders)");
+    }
+    else if(!dt_supported_image(path))
+      *err = _ERRF(API_E_PARAMS, "paths", "%s: not a file darktable imports", path);
+    else
+      g_ptr_array_add(files, g_strdup(path));
+    g_free(path);
+  }
+  if(*err)
+  {
+    g_ptr_array_free(files, TRUE);
+    json_array_unref(skipped);
+    return FALSE;
+  }
+  g_ptr_array_sort(files, _import_sort);
+  // one entry per file, though a path came twice or a folder holds another
+  GPtrArray *sources = g_ptr_array_new_with_free_func(g_free);
+  for(guint k = 0; k < files->len; k++)
+  {
+    gchar *f = g_ptr_array_index(files, k);
+    if(sources->len && !g_strcmp0(g_ptr_array_index(sources, sources->len - 1), f)) continue;
+    const char *ext = strrchr(f, '.');
+    // darktable's "ignore non-raws" preference, as its import dialog lists them
+    if(ignore_nonraws && ext && !dt_imageio_is_raw_by_extension(ext + 1) && g_ascii_strcasecmp(ext, ".dng"))
+      _import_note(skipped, f, NO_IMGID, "reason", "not a raw (darktable's import ignores non-raws)");
+    else
+      g_ptr_array_add(sources, g_strdup(f));
+  }
+  g_ptr_array_free(files, TRUE);
+
+  _import_t *im = g_new0(_import_t, 1);
+  im->files = sources;
+  im->copy = copy;
+  im->skip_existing = json_object_get_boolean_member_with_default(params, "skip_existing", TRUE);
+  im->imported = json_array_new();
+  im->skipped = skipped;
+  im->failed = json_array_new();
+  if(copy)
+  {
+    const char *jc = json_object_get_string_member_with_default(params, "jobcode", NULL);
+    gchar *conf = jc ? NULL : dt_conf_get_string("ui_last/import_jobcode");
+    im->session = dt_import_session_new();
+    dt_import_session_set_name(im->session, jc ? jc : conf && *conf ? conf : "noname");
+    g_free(conf);
+  }
+  _job_t *j = g_new0(_job_t, 1);
+  j->id = _next_job++;
+  j->type = "import";
+  j->imgid = NO_IMGID;
+  j->state = _JOB_RUNNING;
+  j->started = g_get_monotonic_time();
+  j->import = im;
+  j->total = sources->len;
+  j->handle = dt_control_job_create(NULL, "api: import");
+  if(j->handle) dt_control_job_add_progress(j->handle, _("import"), TRUE);
+  _jobs = g_list_append(_jobs, j);
+  j->thread = g_thread_new("api-import", _import_run, j);
+  _add_job(b, j);
+  json_builder_set_member_name(b, "files");
+  json_builder_add_int_value(b, sources->len);
   json_builder_set_member_name(b, "note");
   json_builder_add_string_value(b, "runs in the background: job_status, or wait for the \"job\" event");
   return TRUE;
@@ -8852,7 +9235,7 @@ static gboolean _quit_window(gpointer data)
 }
 
 static const char *_methods[] = {
-  "ping", "film_rolls", "images_list", "image_info", "thumbnail", "thumbnails", "set_rating", "set_label",
+  "ping", "film_rolls", "images_list", "image_info", "thumbnail", "thumbnails", "import", "set_rating", "set_label",
   "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
   "module_enable", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
@@ -8988,6 +9371,8 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _thumbnail(params, b, &err);
   else if(!g_strcmp0(method, "thumbnails"))
     _thumbnails(params, b, &err);
+  else if(!g_strcmp0(method, "import"))
+    _import(params, b, &err);
   else if(!g_strcmp0(method, "export"))
   {
     gboolean saved = FALSE;

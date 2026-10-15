@@ -7750,6 +7750,7 @@ static gboolean _ai_denoise(JsonObject *params, const dt_imgid_t current, JsonBu
 // same place, in the same color space: later edits change the fill as they
 // change the rest of the photo
 
+#if defined(HAVE_AI) && defined(HAVE_OVERLAY_COMPOSITE_HQ)
 typedef gboolean (*_handler_t)(JsonObject *params, JsonBuilder *b, gchar **err);
 
 // a handler run for its effect, its reply dropped (as _variant_step does)
@@ -7771,7 +7772,6 @@ static JsonObject *_instance_params(const dt_iop_module_t *m)
   return o;
 }
 
-#ifdef HAVE_AI
 static dt_dev_pixelpipe_iop_t *_piece_of(_session_t *s, const dt_iop_module_t *m)
 {
   for(GList *n = s->pipe.nodes; n; n = g_list_next(n))
@@ -7947,7 +7947,12 @@ static gboolean _write_float_tiff(const char *path, const float *rgba, const int
 // larger working size does not help (photo 315: a 770 px tail fills well,
 // the whole 2770 px animal does not, at 512 or 2048)
 #define _FILL_LARGE (5 * _FILL_SIZE / 2)
-#define _OVERLAY_NATIVE 2            // overlay.c: DT_OVERLAY_COMPOSITE_NATIVE
+// overlay.c: DT_OVERLAY_COMPOSITE_NATIVE (the fork's), else DT_OVERLAY_COMPOSITE_HQ
+#ifdef HAVE_OVERLAY_COMPOSITE_NATIVE
+#define _OVERLAY_COMPOSITING 2
+#else
+#define _OVERLAY_COMPOSITING 0
+#endif
 #define _OVERLAY_SCALE_ON_HEIGHT 3   // overlay.c: DT_SCALE_MAINMENU_MARKERHEIGHT
 #define _FILL_GAMMA 2.2f
 
@@ -8123,8 +8128,12 @@ static gboolean _inpaint(dt_ai_context_t *ctx, float *buf, const float *mask, co
 // with the patch and the shape as its mask (see the section's comment)
 static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
 {
-#ifndef HAVE_AI
+#if !defined(HAVE_AI)
   *err = _ERR(API_E_UNAVAILABLE, NULL, "this darktable was built without AI (USE_AI)");
+  return FALSE;
+#elif !defined(HAVE_OVERLAY_COMPOSITE_HQ)
+  *err = _ERR(API_E_UNAVAILABLE, NULL, "ai_fill needs the composite module's high-precision compositing"
+                                       " (darktable 5.8 or master)");
   return FALSE;
 #else
   if(!_cur)
@@ -8237,7 +8246,7 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
     json_object_set_string_member(rp, "name", name);
     JsonObject *sp = _instance_params(m);
     JsonObject *vals = json_object_new();
-    json_object_set_int_member(vals, "compositing", _OVERLAY_NATIVE);
+    json_object_set_int_member(vals, "compositing", _OVERLAY_COMPOSITING);
     json_object_set_double_member(vals, "opacity", 100.0);
     json_object_set_object_member(sp, "values", vals);
     JsonObject *mp = _instance_params(m);
@@ -9952,7 +9961,11 @@ static const char *_methods[] = {
   "module_enable", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
   "retouch_remove", "blend_get", "blend_set", "mask_add", "mask_list",
-  "mask_remove", "mask_add.path", "mask_ai", "mask_ai_encode", "export.background", "sample", "ai_denoise", "ai_fill", "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "image_remove", "style_list", "style_create", "style_delete", "style_apply",
+  "mask_remove", "mask_add.path", "mask_ai", "mask_ai_encode", "export.background", "sample", "ai_denoise",
+#ifdef HAVE_OVERLAY_COMPOSITE_HQ
+  "ai_fill",
+#endif
+  "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "image_remove", "style_list", "style_create", "style_delete", "style_apply",
   "history_paste", "collection", "darkroom_open", "image_info.exif", "image_metadata", "tag_list", "set_tags",
   "set_metadata", "set_location", "picker_list", "picker_apply", "module_remove", "module_rename", "history_compress",
   "render.history_end", "render_variants", "darkroom_snapshot", "share", "save", "reset", "render", "render.uncropped", "render.zoom", "export",

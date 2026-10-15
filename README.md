@@ -1,3 +1,19 @@
+> **This is darktable-api, a fork of darktable.** It adds an editing API:
+> `darktable-api`, a headless darktable that edits photos in a library on
+> request (JSON-RPC), and `--api-socket`, which lets darktable's own window
+> serve the same API. It is meant for web apps and AI assistants; see
+> [src/api/README.md](src/api/README.md). An MCP server for AI assistants
+> and setup instructions: [darktable-api-mcp](https://github.com/mmcc-xx/darktable-api-mcp).
+>
+> | Branch | What it is |
+> |---|---|
+> | `darktable-api-5.6` | darktable 5.6 with the API. Its edits open in stock darktable 5.6. Most people want this one |
+> | `darktable-api` (default) | darktable master with the API, for development. darktable master is merged in weekly once the tests pass; its edits use module versions darktable 5.6 can't open |
+>
+> darktable's changes come in as merges and the branches are never
+> rewritten, so `git pull` updates a clone. Everything below is
+> darktable's own README.
+
 [![icon](/data/pixmaps/idbutton.png?raw=true)](https://www.darktable.org/) darktable [![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/darktable-org/darktable/ci.yml?branch=master)](https://github.com/darktable-org/darktable/actions/workflows/ci.yml?query=branch%3Amaster+is%3Acompleted+event%3Apush) [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/470/badge)](https://bestpractices.coreinfrastructure.org/projects/470)
 =========
 

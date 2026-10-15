@@ -8210,6 +8210,10 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
   gchar *file = NULL;
   dt_imgid_t patch = NO_IMGID;
   int side = 0, rx = 0, ry = 0, W = 0, H = 0;
+  // the session whose pipe measures and renders: in darktable's window the
+  // darkroom's mirror (_pipe_session), with its own copy of the instance
+  _session_t *owner = _cur, *ps = _cur;
+  dt_iop_module_t *pm = NULL;
 
   // the instance: the first composite if it is unused, else a new one after the last
   dt_iop_module_t *m = dt_iop_get_module_by_op_priority(dev->iop, "overlay", 0);
@@ -8261,13 +8265,29 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
 
   // where the shape is, at the composite's place in the pipe
   // (the pipe has its copy of the shapes only while it runs: one for now)
-  _pipe_sync(_cur);
-  dt_dev_pixelpipe_iop_t *piece = _piece_of(_cur, m);
-  dt_pthread_mutex_lock(&dev->history_mutex);
-  _cur->pipe.forms = dt_masks_dup_forms_deep(dev->forms, NULL);
-  dt_pthread_mutex_unlock(&dev->history_mutex);
+  ps = _pipe_session(err);
+  if(!ps)
+  {
+    ps = owner;
+    goto done;
+  }
+  pm = m;
+  if(ps != owner)
+  {
+    pm = NULL;
+    for(GList *l = ps->dev->iop; l && !pm; l = g_list_next(l))
+    {
+      dt_iop_module_t *o = l->data;
+      if(!g_strcmp0(o->op, "overlay") && o->multi_priority == m->multi_priority) pm = o;
+    }
+  }
+  _pipe_sync(ps);
+  dt_dev_pixelpipe_iop_t *piece = pm ? _piece_of(ps, pm) : NULL;
+  dt_pthread_mutex_lock(&ps->dev->history_mutex);
+  ps->pipe.forms = dt_masks_dup_forms_deep(ps->dev->forms, NULL);
+  dt_pthread_mutex_unlock(&ps->dev->history_mutex);
   int box[4];
-  if(!piece || !_shapes_box(m, piece, box))
+  if(!piece || !_shapes_box(pm, piece, box))
   {
     *err = _ERR(API_E_PARAMS, "shape", "the shape covers nothing of the photo");
     goto done;
@@ -8281,16 +8301,16 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
   ry = CLAMP(box[1] + box[3] / 2 - side / 2, 0, H - side);
 
   mask = dt_alloc_align_float((size_t)side * side);
-  dt_masks_form_t *grp = dt_masks_get_from_id_ext(piece->pipe->forms, m->blend_params->mask_id);
+  dt_masks_form_t *grp = dt_masks_get_from_id_ext(piece->pipe->forms, pm->blend_params->mask_id);
   const dt_iop_roi_t roi = { rx, ry, side, side, 1.0f };
-  if(!mask || !grp || !dt_masks_group_render_roi(m, piece, grp, &roi, mask))
+  if(!mask || !grp || !dt_masks_group_render_roi(pm, piece, grp, &roi, mask))
   {
     *err = g_strdup("could not draw the shape's mask");
     goto done;
   }
-  g_list_free_full(_cur->pipe.forms, (void (*)(void *))dt_masks_free_form);
-  _cur->pipe.forms = NULL;
-  buf = _capture_before(_cur, m, rx, ry, side, side);
+  g_list_free_full(ps->pipe.forms, (void (*)(void *))dt_masks_free_form);
+  ps->pipe.forms = NULL;
+  buf = _capture_before(ps, pm, rx, ry, side, side);
   if(!buf)
   {
     *err = g_strdup("could not render the photo where the composite gets it");
@@ -8395,10 +8415,10 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
   ok = TRUE;
 
 done:
-  if(_cur->pipe.forms)
+  if(ps->pipe.forms)
   {
-    g_list_free_full(_cur->pipe.forms, (void (*)(void *))dt_masks_free_form);
-    _cur->pipe.forms = NULL;
+    g_list_free_full(ps->pipe.forms, (void (*)(void *))dt_masks_free_form);
+    ps->pipe.forms = NULL;
   }
   if(!ok && m && added)
   {

@@ -10817,6 +10817,7 @@ static void _gui_collection_cb(gpointer instance, const dt_collection_change_t q
 }
 
 static void _drafts_load(void);
+static void _drafts_write(const char *file);
 
 gboolean dt_api_handover(const char *path)
 {
@@ -10873,6 +10874,15 @@ gboolean dt_api_handover(const char *path)
   if(took)
     dt_print(DT_DEBUG_ALWAYS, "[api] took the library over from the engine on %s (%d drafts)",
              path, g_list_length(_drafts));
+  // on disk at once, where dt_api_start reads them: darktable can still
+  // crash before then (#78), and the engine that had them is gone
+  if(took && _drafts)
+  {
+    gchar *file = g_strconcat(path, ".drafts.json", NULL);
+    _drafts_write(file);
+    _drafts_free();
+    g_free(file);
+  }
   return took;
 }
 
@@ -10925,27 +10935,30 @@ static gchar *_drafts_file(void)
   return _socket_path ? g_strconcat(_socket_path, ".drafts.json", NULL) : NULL;
 }
 
+static void _drafts_write(const char *file)
+{
+  if(!file || !_drafts) return;
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  _drafts_to_json(b);
+  json_builder_end_object(b);
+  JsonGenerator *g = json_generator_new();
+  JsonNode *root = json_builder_get_root(b);
+  json_generator_set_root(g, root);
+  if(json_generator_to_file(g, file, NULL))
+    dt_print(DT_DEBUG_ALWAYS, "[api] kept %d unsaved edits in %s", g_list_length(_drafts), file);
+  json_node_unref(root);
+  g_object_unref(g);
+  g_object_unref(b);
+}
+
 static void _drafts_save(void)
 {
   gchar *file = _drafts_file();
   _drafts_free();
   for(GList *l = _sessions; l; l = g_list_next(l))
     if(((_session_t *)l->data)->dirty) _draft_add(l->data);
-  if(file && _drafts)
-  {
-    JsonBuilder *b = json_builder_new();
-    json_builder_begin_object(b);
-    _drafts_to_json(b);
-    json_builder_end_object(b);
-    JsonGenerator *g = json_generator_new();
-    JsonNode *root = json_builder_get_root(b);
-    json_generator_set_root(g, root);
-    if(json_generator_to_file(g, file, NULL))
-      dt_print(DT_DEBUG_ALWAYS, "[api] kept %d unsaved edits in %s", g_list_length(_drafts), file);
-    json_node_unref(root);
-    g_object_unref(g);
-    g_object_unref(b);
-  }
+  _drafts_write(file);
   _drafts_free();
   g_free(file);
 }

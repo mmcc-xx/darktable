@@ -3188,6 +3188,33 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
   return TRUE;
 }
 
+// a group form named "group #N", a name no other form has, as darktable's
+// masks panel names its nested groups: a group has no set_form_name, so
+// dt_masks_assign_unique_name would loop forever on a name already taken
+static void _name_group(const dt_develop_t *dev, dt_masks_form_t *form)
+{
+  int nb = 0;
+  for(const GList *l = dev->forms; l; l = g_list_next(l))
+    if(((dt_masks_form_t *)l->data)->type & DT_MASKS_GROUP) nb++;
+  gboolean taken;
+  do
+  {
+    taken = FALSE;
+    snprintf(form->name, sizeof(form->name), _("group #%d"), ++nb);
+    for(const GList *l = dev->forms; l && !taken; l = g_list_next(l))
+      taken = l->data != form && !strcmp(((dt_masks_form_t *)l->data)->name, form->name);
+  } while(taken);
+}
+
+// a group's name is free when no other form has it
+static gboolean _name_free(const dt_develop_t *dev, const dt_masks_form_t *form)
+{
+  if(!form->name[0]) return FALSE;
+  for(const GList *l = dev->forms; l; l = g_list_next(l))
+    if(l->data != form && !strcmp(((dt_masks_form_t *)l->data)->name, form->name)) return FALSE;
+  return TRUE;
+}
+
 #ifdef HAVE_MASKS_FLEXI
 // flexi masks (dev-doc/masks_data_model.md): a group folds its members with
 // one operator, held by its marker, the group's first point; a member has no
@@ -3254,7 +3281,9 @@ static gboolean _flexi_join(dt_develop_t *dev, dt_masks_form_t **grp, dt_masks_p
   }
   if(!g_list_find(dev->forms, *grp)) dev->forms = g_list_append(dev->forms, *grp);
   dt_masks_form_t *g = _flexi_group_new(dev, flexi_op);
+  // the new outer group takes the name; the one inside it gets its own
   g_strlcpy(g->name, (*grp)->name, sizeof(g->name));
+  _name_group(dev, *grp);
   dt_masks_point_group_t *before = _flexi_member((*grp)->formid);
   before->parentid = g->formid;
   g->points = g_list_append(g->points, before);
@@ -3289,6 +3318,7 @@ static gboolean _mask_attach_ext(dt_iop_module_t *m, dt_masks_form_t *form, cons
     _api_editing = TRUE;
     dt_dev_undo_start_record(dev);
   }
+  if((form->type & DT_MASKS_GROUP) && !_name_free(dev, form)) _name_group(dev, form);
   dt_masks_gui_form_save_creation(dev, m, form, NULL);
   // the group entry save_creation added: how it combines, and inverted
   dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
@@ -7979,23 +8009,37 @@ static dt_dev_pixelpipe_iop_t *_piece_of(_session_t *s, const dt_iop_module_t *m
 
 // the box of a module's drawn shapes at its place in the pipe (full size):
 // the union of its shapes' areas (a group has no area of its own)
+// grows x0..y1 by the shapes of group grp and of the groups in it (a group
+// has no get_area of its own)
+static void _group_box(dt_iop_module_t *m, dt_dev_pixelpipe_iop_t *piece, const dt_masks_form_t *grp,
+                       const int depth, int *x0, int *y0, int *x1, int *y1)
+{
+  for(GList *l = grp->points; l && depth < 8; l = g_list_next(l))
+  {
+    const dt_masks_point_group_t *pt = l->data;
+    if(pt->state & (DT_MASKS_STATE_DIFFERENCE | DT_MASKS_STATE_INTERSECTION)) continue;
+    dt_masks_form_t *f = dt_masks_get_from_id_ext(piece->pipe->forms, pt->formid);
+    if(!f) continue;
+    if(f->type & DT_MASKS_GROUP)
+    {
+      _group_box(m, piece, f, depth + 1, x0, y0, x1, y1);
+      continue;
+    }
+    int w = 0, h = 0, px = 0, py = 0;
+    if(!dt_masks_get_area(m, piece, f, &w, &h, &px, &py) || w <= 0 || h <= 0) continue;
+    *x0 = MIN(*x0, px);
+    *y0 = MIN(*y0, py);
+    *x1 = MAX(*x1, px + w);
+    *y1 = MAX(*y1, py + h);
+  }
+}
+
 static gboolean _shapes_box(dt_iop_module_t *m, dt_dev_pixelpipe_iop_t *piece, int box[4])
 {
   dt_masks_form_t *grp = dt_masks_get_from_id_ext(piece->pipe->forms, m->blend_params->mask_id);
   if(!grp) return FALSE;
   int x0 = INT_MAX, y0 = INT_MAX, x1 = INT_MIN, y1 = INT_MIN;
-  for(GList *l = grp->points; l; l = g_list_next(l))
-  {
-    const dt_masks_point_group_t *pt = l->data;
-    if(pt->state & (DT_MASKS_STATE_DIFFERENCE | DT_MASKS_STATE_INTERSECTION)) continue;
-    dt_masks_form_t *f = dt_masks_get_from_id_ext(piece->pipe->forms, pt->formid);
-    int w = 0, h = 0, px = 0, py = 0;
-    if(!f || !dt_masks_get_area(m, piece, f, &w, &h, &px, &py) || w <= 0 || h <= 0) continue;
-    x0 = MIN(x0, px);
-    y0 = MIN(y0, py);
-    x1 = MAX(x1, px + w);
-    y1 = MAX(y1, py + h);
-  }
+  _group_box(m, piece, grp, 0, &x0, &y0, &x1, &y1);
   if(x1 <= x0 || y1 <= y0) return FALSE;
   box[0] = x0;
   box[1] = y0;

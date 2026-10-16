@@ -292,7 +292,10 @@ dt_image_t *dt_image_cache_testget(const dt_imgid_t imgid,
 // drops the read lock on an image struct
 void dt_image_cache_read_release(const dt_image_t *img)
 {
-  if(!img || !dt_is_valid_imgid(img->id)) return;
+  // an image missing from the database (id NO_IMGID) has a locked
+  // cache entry too, even a write-locked one when it was just
+  // allocated: skipping it would block the next get of that id forever
+  if(!img || !img->cache_entry) return;
   // just force the dt_image_t struct to make sure it has been locked before.
   dt_image_cache_t *cache = darktable.image_cache;
   if(cache) dt_cache_release(&cache->cache, img->cache_entry);

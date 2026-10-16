@@ -8317,7 +8317,7 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
   mask = dt_alloc_align_float((size_t)side * side);
   dt_masks_form_t *grp = dt_masks_get_from_id_ext(piece->pipe->forms, pm->blend_params->mask_id);
   const dt_iop_roi_t roi = { rx, ry, side, side, 1.0f };
-  if(!mask || !grp || !dt_masks_group_render_roi(pm, piece, grp, &roi, mask))
+  if(!mask || !grp || !dt_masks_group_render_roi(pm, piece, grp, &roi, mask, NULL))
   {
     *err = g_strdup("could not draw the shape's mask");
     goto done;

@@ -1024,7 +1024,13 @@ void dt_mipmap_cache_get_with_caller(dt_mipmap_buffer_t *buf,
             buffered_image.profile_hsm_val_div = img->profile_hsm_val_div;
             buffered_image.profile_hsm_encoding = img->profile_hsm_encoding;
           }
+          // keep the entry we hold the lock on: buffered_image's may have
+          // been removed from the cache while the file was loading
+          // (dt_image_remove), and releasing that one would leave this
+          // entry write-locked for good
+          struct dt_cache_entry_t *locked_entry = img->cache_entry;
           *img = buffered_image;
+          img->cache_entry = locked_entry;
           img->load_status = DT_IMAGEIO_OK;
           // dt_print(DT_DEBUG_ALWAYS, "[mipmap read get] initializing full buffer img %u with %u %u -> %d %d (%p)",
           // imgid, data[0], data[1], img->width, img->height, data);

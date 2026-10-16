@@ -8465,12 +8465,73 @@ static float *_fill_read(const char *path, const int side, const gboolean upscal
 #endif
 }
 
+// a fill made elsewhere matched to the photo: some models (FLUX Erase)
+// return the whole crop with its colors and contrast shifted, the known
+// pixels too, and their fill shares the shift. Per channel, gain and offset
+// taking the returned known pixels to ours, fitted where the seam is (known
+// pixels within side / 16 of the hole), applied to back. FALSE (back left
+// alone) when too few pixels or a gain outside 0.5..2
+static gboolean _fill_color_match(const float *enc, float *back, const float *mask, const int side,
+                                  float gain[3], float offset[3])
+{
+  const int r = MAX(4, side / 16);
+  const size_t np = (size_t)side * side;
+  // how much hole is within r of each pixel: box sums of the hole, rows then columns
+  float *rows = dt_alloc_align_float(np);
+  float *near = dt_alloc_align_float(np);
+  float *acc = g_try_malloc(sizeof(float) * (side + 1));
+  gboolean ok = rows && near && acc;
+  for(int y = 0; ok && y < side; y++)
+  {
+    acc[0] = 0.0f;
+    for(int x = 0; x < side; x++) acc[x + 1] = acc[x] + (mask[(size_t)y * side + x] > 0.02f);
+    for(int x = 0; x < side; x++) rows[(size_t)y * side + x] = acc[MIN(side, x + r + 1)] - acc[MAX(0, x - r)];
+  }
+  for(int x = 0; ok && x < side; x++)
+  {
+    acc[0] = 0.0f;
+    for(int y = 0; y < side; y++) acc[y + 1] = acc[y] + rows[(size_t)y * side + x];
+    for(int y = 0; y < side; y++) near[(size_t)y * side + x] = acc[MIN(side, y + r + 1)] - acc[MAX(0, y - r)];
+  }
+  double n = 0, sx[3] = { 0 }, sy[3] = { 0 }, sxx[3] = { 0 }, sxy[3] = { 0 };
+  for(size_t k = 0; ok && k < np; k++)
+  {
+    if(mask[k] > 0.02f || near[k] <= 0.0f) continue;
+    n++;
+    for(int c = 0; c < 3; c++)
+    {
+      const double x = back[4 * k + c], y = enc[4 * k + c];
+      sx[c] += x;
+      sy[c] += y;
+      sxx[c] += x * x;
+      sxy[c] += x * y;
+    }
+  }
+  dt_free_align(rows);
+  dt_free_align(near);
+  g_free(acc);
+  if(!ok || n < 1000) return FALSE;
+  for(int c = 0; c < 3; c++)
+  {
+    const double var = sxx[c] / n - (sx[c] / n) * (sx[c] / n);
+    if(!(var > 1e-8)) return FALSE;
+    gain[c] = (sxy[c] / n - (sx[c] / n) * (sy[c] / n)) / var;
+    offset[c] = sy[c] / n - gain[c] * sx[c] / n;
+    if(!(gain[c] >= 0.5f && gain[c] <= 2.0f)) return FALSE;
+  }
+  for(size_t k = 0; k < np; k++)
+    if(mask[k] > 0.0f)
+      for(int c = 0; c < 3; c++) back[4 * k + c] = CLAMP(gain[c] * back[4 * k + c] + offset[c], 0.0f, 1.0f);
+  return TRUE;
+}
+
 // fills the hole of buf: with the model at S x S (ctx), or with a fill made
-// elsewhere (ext: encoded RGBA at side x side, as _fill_read gives it); then
-// the missing grain added and decoded back to camera RGB
+// elsewhere (ext: encoded RGBA at side x side, as _fill_read gives it,
+// color matched when match is given: *matched, gain and offset in match);
+// then the missing grain added and decoded back to camera RGB
 static gboolean _inpaint(dt_ai_context_t *ctx, const float *ext, float *buf, const float *mask, const int side,
                          const int S, const float to_srgb[9], const float to_cam[9], const uint64_t seed,
-                         gchar **err)
+                         float *match, gboolean *matched, gchar **err)
 {
   const size_t np = (size_t)side * side;
   float norm = 1.0f;
@@ -8483,7 +8544,10 @@ static gboolean _inpaint(dt_ai_context_t *ctx, const float *ext, float *buf, con
   gboolean ok = enc && back && (!ctx || (small && in && out && hole));
   const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_LANCZOS3);
   if(ok && !ctx)
+  {
     memcpy(back, ext, sizeof(float) * 4 * np);
+    if(match) *matched = _fill_color_match(enc, back, mask, side, match, match + 3);
+  }
   else if(ok)
   {
     const dt_iop_roi_t rbig = { 0, 0, side, side, 1.0f };
@@ -8666,6 +8730,8 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
   int side = 0, rx = 0, ry = 0, W = 0, H = 0;
   int made_at = size;                       // the size the fill was made at
   int upscaled = 0;                         // the AI upscaler's factor on it
+  float match[6] = { 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f };  // color match: gains, offsets
+  gboolean matched = FALSE;
   // the session whose pipe measures and renders: in darktable's window the
   // darkroom's mirror (_pipe_session), with its own copy of the instance
   _session_t *owner = _cur, *ps = _cur;
@@ -8804,7 +8870,9 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
                                   &made_at, &upscaled, err)))
     goto done;
   if(!_inpaint(ctx, ext, buf, mask, side, size, to_srgb, to_cam,
-               ((uint64_t)rx << 32) ^ (uint64_t)ry ^ ((uint64_t)host << 48), err))
+               ((uint64_t)rx << 32) ^ (uint64_t)ry ^ ((uint64_t)host << 48),
+               filled && json_object_get_boolean_member_with_default(params, "color_match", TRUE) ? match : NULL,
+               &matched, err))
   {
     if(!*err) *err = g_strdup("out of memory");
     goto done;
@@ -8965,6 +9033,21 @@ done:
     {
       json_builder_set_member_name(b, "upscaled");
       json_builder_add_int_value(b, upscaled);
+    }
+    if(matched)
+    {
+      // what the color match undid: the fill's channels times gain plus offset (0..1 encoded)
+      json_builder_set_member_name(b, "color_match");
+      json_builder_begin_object(b);
+      json_builder_set_member_name(b, "gain");
+      json_builder_begin_array(b);
+      for(int c = 0; c < 3; c++) json_builder_add_double_value(b, round(match[c] * 1000) / 1000);
+      json_builder_end_array(b);
+      json_builder_set_member_name(b, "offset");
+      json_builder_begin_array(b);
+      for(int c = 0; c < 3; c++) json_builder_add_double_value(b, round(match[3 + c] * 1000) / 1000);
+      json_builder_end_array(b);
+      json_builder_end_object(b);
     }
     json_builder_set_member_name(b, "box");
     _add_box(b, (float[4]){ (float)rx / W, (float)ry / H, (float)(rx + side) / W, (float)(ry + side) / H });

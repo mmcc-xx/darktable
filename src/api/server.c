@@ -289,6 +289,7 @@
 #ifdef HAVE_AI
 #include "common/ai/segmentation.h"
 #include "common/ai/restore.h"
+#include "common/ai/restore_rgb.h"
 #include "common/ai/restore_raw_bayer.h"
 #include "common/ai/restore_raw_linear.h"
 #include "common/ai_models.h"
@@ -8335,9 +8336,67 @@ static gboolean _fill_export(const float *buf, const float *mask, const int side
 #endif
 }
 
+typedef struct _fill_up_t
+{
+  float *out;
+  int w;
+} _fill_up_t;
+
+static int _fill_up_row(const float *scanline, const int out_w, const int y, void *data)
+{
+  _fill_up_t *u = data;
+  for(int x = 0; x < out_w && x < u->w; x++)
+  {
+    float *o = u->out + 4 * ((size_t)y * u->w + x);
+    for(int c = 0; c < 3; c++) o[c] = powf(CLAMP(scanline[3 * x + c], 0.0f, 1.0f), 1.0f / _FILL_GAMMA);
+    o[3] = 0.0f;
+  }
+  return 0;
+}
+
+// a fill made smaller than the crop, *f at *w x *h (encoded RGBA), made
+// larger by darktable's AI upscaler (2x or 4x, whichever reaches side);
+// left as it is when no upscale model is installed (*upscaled stays 0)
+static void _fill_upscale(float **f, int *w, int *h, const int side, int *upscaled)
+{
+  const int scale = side > 2 * MAX(*w, *h) ? 4 : 2;
+  dt_restore_env_t *env = dt_restore_env_init();
+  dt_restore_context_t *ctx = !env ? NULL
+                              : scale == 4 ? dt_restore_load_upscale_x4(env) : dt_restore_load_upscale_x2(env);
+  const int ow = *w * scale, oh = *h * scale;
+  float *lin = ctx ? dt_alloc_align_float((size_t)4 * *w * *h) : NULL;
+  float *out = lin ? dt_alloc_align_float((size_t)4 * ow * oh) : NULL;
+  if(out)
+  {
+    // the encoding (normalized, gamma) undone: the upscaler takes linear RGB
+    for(size_t k = 0; k < (size_t)*w * *h; k++)
+    {
+      for(int c = 0; c < 3; c++) lin[4 * k + c] = powf((*f)[4 * k + c], _FILL_GAMMA);
+      lin[4 * k + 3] = 1.0f;
+    }
+    _fill_up_t u = { out, ow };
+    if(!dt_restore_process_tiled(ctx, lin, *w, *h, scale, _fill_up_row, &u, NULL))
+    {
+      dt_free_align(*f);
+      *f = out;
+      out = NULL;
+      *w = ow;
+      *h = oh;
+      *upscaled = scale;
+    }
+  }
+  dt_free_align(lin);
+  dt_free_align(out);
+  if(ctx) dt_restore_unref(ctx);
+  if(env) dt_restore_env_destroy(env);
+}
+
 // a fill made elsewhere (filled): a PNG or other image libpng reads, any
-// size, as encoded RGBA at side x side; *made_at: its larger side
-static float *_fill_read(const char *path, const int side, int *made_at, gchar **err)
+// size, as encoded RGBA at side x side; *made_at: its larger side. upscale:
+// a fill much smaller than the crop goes through darktable's AI upscaler
+// first (*upscaled: its factor, 0 if not)
+static float *_fill_read(const char *path, const int side, const gboolean upscale, int *made_at,
+                         int *upscaled, gchar **err)
 {
 #ifndef PNG_SIMPLIFIED_READ_SUPPORTED
   *err = _ERR(API_E_UNAVAILABLE, "filled", "this darktable's libpng cannot read PNG files simply (libpng 1.6)");
@@ -8350,7 +8409,7 @@ static float *_fill_read(const char *path, const int side, int *made_at, gchar *
     return NULL;
   }
   im.format = PNG_FORMAT_RGBA;
-  const int w = im.width, h = im.height;
+  int w = im.width, h = im.height;
   *made_at = MAX(w, h);
   guint8 *px = g_try_malloc(PNG_IMAGE_SIZE(im));
   float *f = dt_alloc_align_float((size_t)4 * w * h);
@@ -8370,6 +8429,7 @@ static float *_fill_read(const char *path, const int side, int *made_at, gchar *
     f[4 * k + 3] = 0.0f;
   }
   g_free(px);
+  if(upscale && side > 5 * MAX(w, h) / 4) _fill_upscale(&f, &w, &h, side, upscaled);
   // to side x side: a fill made at another size or aspect is stretched to the crop
   if(w == side && h == side)
     memcpy(out, f, sizeof(float) * 4 * side * side);
@@ -8605,6 +8665,7 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
   dt_imgid_t patch = NO_IMGID;
   int side = 0, rx = 0, ry = 0, W = 0, H = 0;
   int made_at = size;                       // the size the fill was made at
+  int upscaled = 0;                         // the AI upscaler's factor on it
   // the session whose pipe measures and renders: in darktable's window the
   // darkroom's mirror (_pipe_session), with its own copy of the instance
   _session_t *owner = _cur, *ps = _cur;
@@ -8739,7 +8800,9 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
       ok = _fill_export(buf, mask, side, size, to_srgb, crop_image, crop_mask, err);
     goto done;
   }
-  if(filled && !(ext = _fill_read(filled, side, &made_at, err))) goto done;
+  if(filled && !(ext = _fill_read(filled, side, json_object_get_boolean_member_with_default(params, "upscale", FALSE),
+                                  &made_at, &upscaled, err)))
+    goto done;
   if(!_inpaint(ctx, ext, buf, mask, side, size, to_srgb, to_cam,
                ((uint64_t)rx << 32) ^ (uint64_t)ry ^ ((uint64_t)host << 48), err))
   {
@@ -8898,6 +8961,11 @@ done:
     json_builder_add_int_value(b, side);
     json_builder_set_member_name(b, "model_size");
     json_builder_add_int_value(b, made_at);
+    if(upscaled)
+    {
+      json_builder_set_member_name(b, "upscaled");
+      json_builder_add_int_value(b, upscaled);
+    }
     json_builder_set_member_name(b, "box");
     _add_box(b, (float[4]){ (float)rx / W, (float)ry / H, (float)(rx + side) / W, (float)(ry + side) / H });
     json_builder_end_object(b);

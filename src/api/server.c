@@ -295,6 +295,7 @@
 #include "ai/backend.h"
 #include "common/interpolation.h"
 #include "common/matrices.h"
+#include <png.h>
 #include <tiffio.h>
 #endif
 #include "control/signal.h"
@@ -8234,28 +8235,28 @@ static inline void _mul3(const float m[9], const float *in, float *out)
   for(int r = 0; r < 3; r++) out[r] = m[3 * r] * in[0] + m[3 * r + 1] * in[1] + m[3 * r + 2] * in[2];
 }
 
-static gboolean _inpaint(dt_ai_context_t *ctx, float *buf, const float *mask, const int side, const int S,
-                         const float to_srgb[9], const float to_cam[9], const uint64_t seed, gchar **err)
+// the crop as the model sees it: buf (camera RGB) in linear sRGB,
+// normalized by the 99th percentile of the known pixels' brightest channel
+// and gamma encoded, 0..1. The same buf and mask always give the same
+// encoding, so a fill made elsewhere from crop_to's PNG decodes with it
+static float *_fill_encode(const float *buf, const float *mask, const size_t np, const float to_srgb[9],
+                           float *norm_out)
 {
-  const size_t np = (size_t)side * side;
-  // the model's copy in linear sRGB; buf keeps the camera values
-  float *rgb = dt_alloc_align_float(4 * np);
-  if(!rgb) return FALSE;
-  for(size_t k = 0; k < np; k++)
-  {
-    _mul3(to_srgb, buf + 4 * k, rgb + 4 * k);
-    rgb[4 * k + 3] = 0.0f;
-  }
-  // normalization: the 99th percentile of the known pixels' brightest channel
+  float *enc = dt_alloc_align_float(4 * np);
   float *v = g_try_malloc(sizeof(float) * np);
-  if(!v)
+  if(!enc || !v)
   {
-    dt_free_align(rgb);
-    return FALSE;
+    dt_free_align(enc);
+    g_free(v);
+    return NULL;
   }
   size_t n = 0;
   for(size_t k = 0; k < np; k++)
-    if(mask[k] <= 0.02f) v[n++] = MAX(rgb[4 * k], MAX(rgb[4 * k + 1], rgb[4 * k + 2]));
+  {
+    _mul3(to_srgb, buf + 4 * k, enc + 4 * k);
+    enc[4 * k + 3] = 0.0f;
+    if(mask[k] <= 0.02f) v[n++] = MAX(enc[4 * k], MAX(enc[4 * k + 1], enc[4 * k + 2]));
+  }
   float norm = 1.0f;
   if(n > 16)
   {
@@ -8264,38 +8265,171 @@ static gboolean _inpaint(dt_ai_context_t *ctx, float *buf, const float *mask, co
   }
   g_free(v);
   if(!(norm > 1e-6f)) norm = 1.0f;
+  for(size_t k = 0; k < np; k++)
+    for(int c = 0; c < 3; c++)
+      enc[4 * k + c] = powf(CLAMP(enc[4 * k + c] / norm, 0.0f, 1.0f), 1.0f / _FILL_GAMMA);
+  *norm_out = norm;
+  return enc;
+}
 
-  float *enc = dt_alloc_align_float(4 * np);
+// the hole at S x S from the mask at side x side: any of the pixels a
+// pixel at S covers
+static void _fill_hole_at(const float *mask, const int side, float *hole, const int S)
+{
+  const double f = (double)side / S;
+  for(int y = 0; y < S; y++)
+    for(int x = 0; x < S; x++)
+    {
+      float mx = 0.0f;
+      const int ya = (int)floor(y * f), yb = MIN(side, MAX(ya + 1, (int)ceil((y + 1) * f)));
+      const int xa = (int)floor(x * f), xb = MIN(side, MAX(xa + 1, (int)ceil((x + 1) * f)));
+      for(int yy = ya; yy < yb; yy++)
+        for(int xx = xa; xx < xb; xx++) mx = MAX(mx, mask[(size_t)yy * side + xx]);
+      hole[(size_t)y * S + x] = mx > 0.02f ? 1.0f : 0.0f;
+    }
+}
+
+// crop_to: the crop as the model would see it at S x S, as an 8-bit RGB PNG,
+// and its hole as a gray PNG (white: fill), for a fill made elsewhere
+static gboolean _fill_export(const float *buf, const float *mask, const int side, const int S,
+                             const float to_srgb[9], const char *image_png, const char *mask_png, gchar **err)
+{
+#ifndef PNG_SIMPLIFIED_WRITE_SUPPORTED
+  *err = _ERR(API_E_UNAVAILABLE, "crop_to", "this darktable's libpng cannot write PNG files simply (libpng 1.6)");
+  return FALSE;
+#else
+  float norm = 1.0f;
+  float *enc = _fill_encode(buf, mask, (size_t)side * side, to_srgb, &norm);
   float *small = dt_alloc_align_float((size_t)4 * S * S);
-  float *back = dt_alloc_align_float(4 * np);
-  float *in = dt_alloc_align_float((size_t)4 * S * S);
-  float *out = dt_alloc_align_float((size_t)3 * S * S);
   float *hole = dt_alloc_align_float((size_t)S * S);
-  gboolean ok = enc && small && back && in && out && hole;
+  guint8 *rgb8 = g_try_malloc((size_t)3 * S * S);
+  guint8 *m8 = g_try_malloc((size_t)S * S);
+  gboolean ok = enc && small && hole && rgb8 && m8;
   if(ok)
   {
-    for(size_t k = 0; k < np; k++)
-    {
-      for(int c = 0; c < 3; c++)
-        enc[4 * k + c] = powf(CLAMP(rgb[4 * k + c] / norm, 0.0f, 1.0f), 1.0f / _FILL_GAMMA);
-      enc[4 * k + 3] = 0.0f;
-    }
     const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_LANCZOS3);
     const dt_iop_roi_t rbig = { 0, 0, side, side, 1.0f };
     const dt_iop_roi_t rsmall = { 0, 0, S, S, (float)S / side };
     dt_interpolation_resample(itor, small, &rsmall, enc, &rbig);
-    // the hole at S: any of the pixels a model pixel covers
-    const double f = (double)side / S;
-    for(int y = 0; y < S; y++)
-      for(int x = 0; x < S; x++)
+    _fill_hole_at(mask, side, hole, S);
+    for(size_t k = 0; k < (size_t)S * S; k++)
+    {
+      for(int c = 0; c < 3; c++) rgb8[3 * k + c] = (guint8)lrintf(255.0f * CLAMP(small[4 * k + c], 0.0f, 1.0f));
+      m8[k] = hole[k] > 0.5f ? 255 : 0;
+    }
+    png_image im = { .version = PNG_IMAGE_VERSION, .width = S, .height = S, .format = PNG_FORMAT_RGB };
+    png_image mm = { .version = PNG_IMAGE_VERSION, .width = S, .height = S, .format = PNG_FORMAT_GRAY };
+    if(!png_image_write_to_file(&im, image_png, 0, rgb8, 0, NULL)
+       || !png_image_write_to_file(&mm, mask_png, 0, m8, 0, NULL))
+    {
+      *err = g_strdup_printf("could not write %s or %s", image_png, mask_png);
+      ok = FALSE;
+    }
+  }
+  dt_free_align(enc);
+  dt_free_align(small);
+  dt_free_align(hole);
+  g_free(rgb8);
+  g_free(m8);
+  return ok;
+#endif
+}
+
+// a fill made elsewhere (filled): a PNG or other image libpng reads, any
+// size, as encoded RGBA at side x side; *made_at: its larger side
+static float *_fill_read(const char *path, const int side, int *made_at, gchar **err)
+{
+#ifndef PNG_SIMPLIFIED_READ_SUPPORTED
+  *err = _ERR(API_E_UNAVAILABLE, "filled", "this darktable's libpng cannot read PNG files simply (libpng 1.6)");
+  return NULL;
+#else
+  png_image im = { .version = PNG_IMAGE_VERSION };
+  if(!png_image_begin_read_from_file(&im, path))
+  {
+    *err = _ERRF(API_E_PARAMS, "filled", "filled: %s is not a PNG file that can be read (%s)", path, im.message);
+    return NULL;
+  }
+  im.format = PNG_FORMAT_RGBA;
+  const int w = im.width, h = im.height;
+  *made_at = MAX(w, h);
+  guint8 *px = g_try_malloc(PNG_IMAGE_SIZE(im));
+  float *f = dt_alloc_align_float((size_t)4 * w * h);
+  float *out = dt_alloc_align_float((size_t)4 * side * side);
+  if(!px || !f || !out || !png_image_finish_read(&im, NULL, px, 0, NULL))
+  {
+    if(!px || !f || !out) png_image_free(&im);
+    *err = _ERRF(API_E_PARAMS, "filled", "filled: could not read %s", path);
+    g_free(px);
+    dt_free_align(f);
+    dt_free_align(out);
+    return NULL;
+  }
+  for(size_t k = 0; k < (size_t)w * h; k++)
+  {
+    for(int c = 0; c < 3; c++) f[4 * k + c] = px[4 * k + c] / 255.0f;
+    f[4 * k + 3] = 0.0f;
+  }
+  g_free(px);
+  // to side x side: a fill made at another size or aspect is stretched to the crop
+  if(w == side && h == side)
+    memcpy(out, f, sizeof(float) * 4 * side * side);
+  else
+  {
+    const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_LANCZOS3);
+    const dt_iop_roi_t rin = { 0, 0, w, h, 1.0f };
+    const dt_iop_roi_t rout = { 0, 0, side, side, (float)side / MAX(w, h) };
+    if(w == h)
+      dt_interpolation_resample(itor, out, &rout, f, &rin);
+    else
+    {
+      // a square buffer first: the resampler scales both sides alike
+      const int q = MAX(w, h);
+      float *sq = dt_alloc_align_float((size_t)4 * q * q);
+      if(!sq)
       {
-        float mx = 0.0f;
-        const int ya = (int)floor(y * f), yb = MIN(side, MAX(ya + 1, (int)ceil((y + 1) * f)));
-        const int xa = (int)floor(x * f), xb = MIN(side, MAX(xa + 1, (int)ceil((x + 1) * f)));
-        for(int yy = ya; yy < yb; yy++)
-          for(int xx = xa; xx < xb; xx++) mx = MAX(mx, mask[(size_t)yy * side + xx]);
-        hole[(size_t)y * S + x] = mx > 0.02f ? 1.0f : 0.0f;
+        dt_free_align(f);
+        dt_free_align(out);
+        *err = g_strdup("out of memory");
+        return NULL;
       }
+      for(int y = 0; y < q; y++)
+        for(int x = 0; x < q; x++)
+          memcpy(sq + 4 * ((size_t)y * q + x), f + 4 * ((size_t)(y * h / q) * w + x * w / q), sizeof(float) * 4);
+      const dt_iop_roi_t rsq = { 0, 0, q, q, 1.0f };
+      dt_interpolation_resample(itor, out, &rout, sq, &rsq);
+      dt_free_align(sq);
+    }
+  }
+  dt_free_align(f);
+  return out;
+#endif
+}
+
+// fills the hole of buf: with the model at S x S (ctx), or with a fill made
+// elsewhere (ext: encoded RGBA at side x side, as _fill_read gives it); then
+// the missing grain added and decoded back to camera RGB
+static gboolean _inpaint(dt_ai_context_t *ctx, const float *ext, float *buf, const float *mask, const int side,
+                         const int S, const float to_srgb[9], const float to_cam[9], const uint64_t seed,
+                         gchar **err)
+{
+  const size_t np = (size_t)side * side;
+  float norm = 1.0f;
+  float *enc = _fill_encode(buf, mask, np, to_srgb, &norm);
+  float *small = ctx ? dt_alloc_align_float((size_t)4 * S * S) : NULL;
+  float *back = dt_alloc_align_float(4 * np);
+  float *in = ctx ? dt_alloc_align_float((size_t)4 * S * S) : NULL;
+  float *out = ctx ? dt_alloc_align_float((size_t)3 * S * S) : NULL;
+  float *hole = ctx ? dt_alloc_align_float((size_t)S * S) : NULL;
+  gboolean ok = enc && back && (!ctx || (small && in && out && hole));
+  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_LANCZOS3);
+  if(ok && !ctx)
+    memcpy(back, ext, sizeof(float) * 4 * np);
+  else if(ok)
+  {
+    const dt_iop_roi_t rbig = { 0, 0, side, side, 1.0f };
+    const dt_iop_roi_t rsmall = { 0, 0, S, S, (float)S / side };
+    dt_interpolation_resample(itor, small, &rsmall, enc, &rbig);
+    _fill_hole_at(mask, side, hole, S);
     // two kinds of model, told apart by their inputs (NCHW):
     //  LaMa: the image 0..1 (0 in the hole) and the hole 1/0; out 0..255
     //  MI-GAN: one input, known - 0.5 then the image in -1..1 (0 in the
@@ -8333,26 +8467,28 @@ static gboolean _inpaint(dt_ai_context_t *ctx, float *buf, const float *mask, co
       const dt_iop_roi_t rup = { 0, 0, side, side, (float)side / S };
       const dt_iop_roi_t rs = { 0, 0, S, S, 1.0f };
       dt_interpolation_resample(itor, back, &rup, small, &rs);
-      // the grain the fill lacks: the known pixels' noise less the fill's own
-      float sk[3], sf[3];
-      _noise_sigma(enc, side, side, mask, FALSE, sk);
-      _noise_sigma(back, side, side, mask, TRUE, sf);
-      uint64_t st = seed | 1;
-      for(size_t k = 0; k < np; k++)
-      {
-        if(mask[k] <= 0.0f) continue;
-        float lin[3];
-        for(int c = 0; c < 3; c++)
-        {
-          const float add = sqrtf(MAX(0.0f, sk[c] * sk[c] - sf[c] * sf[c]));
-          const float e = CLAMP(back[4 * k + c] + add * _gauss(&st), 0.0f, 1.0f);
-          lin[c] = powf(e, _FILL_GAMMA) * norm;
-        }
-        _mul3(to_cam, lin, buf + 4 * k);
-      }
     }
   }
-  dt_free_align(rgb);
+  if(ok)
+  {
+    // the grain the fill lacks: the known pixels' noise less the fill's own
+    float sk[3], sf[3];
+    _noise_sigma(enc, side, side, mask, FALSE, sk);
+    _noise_sigma(back, side, side, mask, TRUE, sf);
+    uint64_t st = seed | 1;
+    for(size_t k = 0; k < np; k++)
+    {
+      if(mask[k] <= 0.0f) continue;
+      float lin[3];
+      for(int c = 0; c < 3; c++)
+      {
+        const float add = sqrtf(MAX(0.0f, sk[c] * sk[c] - sf[c] * sf[c]));
+        const float e = CLAMP(back[4 * k + c] + add * _gauss(&st), 0.0f, 1.0f);
+        lin[c] = powf(e, _FILL_GAMMA) * norm;
+      }
+      _mul3(to_cam, lin, buf + 4 * k);
+    }
+  }
   dt_free_align(enc);
   dt_free_align(small);
   dt_free_align(back);
@@ -8380,8 +8516,24 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
     *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
-  if(!params || !json_object_has_member(params, "shape")
-     || !JSON_NODE_HOLDS_OBJECT(json_object_get_member(params, "shape")))
+  // a fill made elsewhere, in two calls: crop_to writes the crop and its hole
+  // as PNG files and leaves the instance set up without a patch; filled
+  // completes that instance from the filled image
+  const char *crop_to = params ? json_object_get_string_member_with_default(params, "crop_to", NULL) : NULL;
+  const char *filled = params ? json_object_get_string_member_with_default(params, "filled", NULL) : NULL;
+  const int reuse = params ? json_object_get_int_member_with_default(params, "instance", -1) : -1;
+  if(crop_to && filled)
+  {
+    *err = _ERR(API_E_PARAMS, "filled", "crop_to and filled are two calls: crop_to first, then filled with its instance");
+    return FALSE;
+  }
+  if(filled && reuse < 0)
+  {
+    *err = _ERR(API_E_PARAMS, "instance", "filled needs instance: the composite instance crop_to replied");
+    return FALSE;
+  }
+  if(!filled && (!params || !json_object_has_member(params, "shape")
+                 || !JSON_NODE_HOLDS_OBJECT(json_object_get_member(params, "shape"))))
   {
     *err = _ERR(API_E_PARAMS, "shape", "ai_fill needs shape: the area to fill, as mask_add's shape");
     return FALSE;
@@ -8404,7 +8556,8 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
     *err = _ERR(API_E_PARAMS, "name", "name: too long");
     return FALSE;
   }
-  if(!dt_ai_registry_is_enabled())
+  const gboolean external = crop_to || filled;
+  if(!external && !dt_ai_registry_is_enabled())
   {
     *err = _ERR(API_E_UNAVAILABLE, NULL, "AI features are off in darktable's preferences (plugins/ai/enabled)");
     return FALSE;
@@ -8413,11 +8566,13 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
   // LaMa (better on fine texture such as grass), else MI-GAN (smaller)
   gchar *active = dt_ai_models_get_active_for_task("inpaint");
   const char *asked = json_object_get_string_member_with_default(params, "model", active);
-  dt_ai_environment_t *env = dt_ai_env_init(NULL);
+  dt_ai_environment_t *env = external ? NULL : dt_ai_env_init(NULL);
   gchar *model = NULL;
   dt_ai_context_t *ctx = NULL;
   static const char *fallback[] = { "inpaint-lama", "inpaint-migan" };
-  if(asked)                                 // a model asked for: that one or nothing
+  if(external)                              // made elsewhere: model only names it
+    model = g_strdup(json_object_get_string_member_with_default(params, "model", "external"));
+  else if(asked)                            // a model asked for: that one or nothing
   {
     model = g_strdup(asked);
     ctx = env ? dt_ai_load_model(env, model, NULL, DT_AI_PROVIDER_CONFIGURED) : NULL;
@@ -8431,7 +8586,7 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
     }
   g_free(active);
   if(!model) model = g_strdup(fallback[0]);
-  if(!ctx)
+  if(!ctx && !external)
   {
     *err = _ERRF(API_E_UNAVAILABLE, "model", "the inpainting model '%s' is not installed or could not be loaded"
                  " (a folder with config.json and model.onnx in darktable's models folder)", model);
@@ -8445,23 +8600,36 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
   const dt_imgid_t host = dev->image_storage.id;
   gboolean ok = FALSE;
   gboolean added = FALSE;
-  float *buf = NULL, *mask = NULL;
-  gchar *file = NULL;
+  float *buf = NULL, *mask = NULL, *ext = NULL;
+  gchar *file = NULL, *crop_image = NULL, *crop_mask = NULL;
   dt_imgid_t patch = NO_IMGID;
   int side = 0, rx = 0, ry = 0, W = 0, H = 0;
+  int made_at = size;                       // the size the fill was made at
   // the session whose pipe measures and renders: in darktable's window the
   // darkroom's mirror (_pipe_session), with its own copy of the instance
   _session_t *owner = _cur, *ps = _cur;
   dt_iop_module_t *pm = NULL;
 
-  // the instance: the first composite if it is unused, else a new one after the last
-  dt_iop_module_t *m = dt_iop_get_module_by_op_priority(dev->iop, "overlay", 0);
+  // the instance: crop_to's for filled; else the first composite if it is
+  // unused, else a new one after the last
+  dt_iop_module_t *m = dt_iop_get_module_by_op_priority(dev->iop, "overlay", filled ? reuse : 0);
   if(!m)
   {
-    *err = _ERR(API_E_UNAVAILABLE, NULL, "no composite (overlay) module in this darktable");
+    *err = filled ? _ERRF(API_E_PARAMS, "instance", "no composite instance %d", reuse)
+                  : _ERR(API_E_UNAVAILABLE, NULL, "no composite (overlay) module in this darktable");
     goto done;
   }
-  if(m->enabled || dt_is_valid_imgid((dt_imgid_t)_param(m, "imgid")))
+  if(filled)
+  {
+    if(dt_is_valid_imgid((dt_imgid_t)_param(m, "imgid")) || !m->blend_params->mask_id)
+    {
+      *err = _ERRF(API_E_PARAMS, "instance", "composite instance %d is not one crop_to set up (it has a patch or no"
+                   " mask)", reuse);
+      m = NULL;
+      goto done;
+    }
+  }
+  else if(m->enabled || dt_is_valid_imgid((dt_imgid_t)_param(m, "imgid")))
   {
     dt_iop_module_t *last = m;
     for(GList *l = dev->iop; l; l = g_list_next(l))
@@ -8484,6 +8652,7 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
     }
     added = TRUE;
   }
+  if(!filled)
   {
     JsonObject *rp = _instance_params(m);
     json_object_set_string_member(rp, "name", name);
@@ -8557,7 +8726,22 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   float to_srgb[9], to_cam[9];
   _cam_srgb_matrices(&dev->image_storage, to_srgb, to_cam);
-  if(!_inpaint(ctx, buf, mask, side, size, to_srgb, to_cam, ((uint64_t)rx << 32) ^ (uint64_t)ry ^ ((uint64_t)host << 48), err))
+  if(crop_to)
+  {
+    crop_image = g_strdup_printf("%s.png", crop_to);
+    crop_mask = g_strdup_printf("%s_mask.png", crop_to);
+    gchar *dir = g_path_get_dirname(crop_image);
+    const gboolean made = !g_mkdir_with_parents(dir, 0755);
+    g_free(dir);
+    if(!made)
+      *err = g_strdup_printf("cannot create the folder of %s", crop_image);
+    else
+      ok = _fill_export(buf, mask, side, size, to_srgb, crop_image, crop_mask, err);
+    goto done;
+  }
+  if(filled && !(ext = _fill_read(filled, side, &made_at, err))) goto done;
+  if(!_inpaint(ctx, ext, buf, mask, side, size, to_srgb, to_cam,
+               ((uint64_t)rx << 32) ^ (uint64_t)ry ^ ((uint64_t)host << 48), err))
   {
     if(!*err) *err = g_strdup("out of memory");
     goto done;
@@ -8669,9 +8853,32 @@ done:
   }
   dt_free_align(buf);
   dt_free_align(mask);
-  dt_ai_unload_model(ctx);
-  dt_ai_env_destroy(env);
-  if(ok)
+  dt_free_align(ext);
+  if(ctx) dt_ai_unload_model(ctx);
+  if(env) dt_ai_env_destroy(env);
+  if(ok && crop_to)
+  {
+    // the instance stays, set up without a patch, for the filled call
+    _add_instance(b, m);
+    json_builder_set_member_name(b, "image");
+    json_builder_add_string_value(b, crop_image);
+    json_builder_set_member_name(b, "mask");
+    json_builder_add_string_value(b, crop_mask);
+    json_builder_set_member_name(b, "size");
+    json_builder_add_int_value(b, size);
+    json_builder_set_member_name(b, "patch");
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "size");
+    json_builder_add_int_value(b, side);
+    json_builder_set_member_name(b, "box");
+    _add_box(b, (float[4]){ (float)rx / W, (float)ry / H, (float)(rx + side) / W, (float)(ry + side) / H });
+    json_builder_end_object(b);
+    json_builder_set_member_name(b, "shape_px");
+    json_builder_add_int_value(b, MAX(box[2], box[3]));
+    json_builder_set_member_name(b, "history_end");
+    json_builder_add_int_value(b, dev->history_end);
+  }
+  else if(ok)
   {
     _add_instance(b, m);
     json_builder_set_member_name(b, "imgid");
@@ -8690,7 +8897,7 @@ done:
     json_builder_set_member_name(b, "size");
     json_builder_add_int_value(b, side);
     json_builder_set_member_name(b, "model_size");
-    json_builder_add_int_value(b, size);
+    json_builder_add_int_value(b, made_at);
     json_builder_set_member_name(b, "box");
     _add_box(b, (float[4]){ (float)rx / W, (float)ry / H, (float)(rx + side) / W, (float)(ry + side) / H });
     json_builder_end_object(b);
@@ -8712,6 +8919,8 @@ done:
     }
   }
   g_free(file);
+  g_free(crop_image);
+  g_free(crop_mask);
   g_free(model);
   return ok;
 #endif
@@ -10223,6 +10432,9 @@ static const char *_methods[] = {
   "mask_remove", "mask_add.path", "mask_ai", "mask_ai_encode", "export.background", "sample", "ai_denoise",
 #ifdef HAVE_OVERLAY_COMPOSITE_HQ
   "ai_fill",
+#if defined(HAVE_AI) && defined(PNG_SIMPLIFIED_READ_SUPPORTED) && defined(PNG_SIMPLIFIED_WRITE_SUPPORTED)
+  "ai_fill.external",
+#endif
 #endif
   "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "image_remove", "style_list", "style_create", "style_delete", "style_apply",
   "history_paste", "collection", "darkroom_open", "image_info.exif", "image_metadata", "tag_list", "set_tags",

@@ -2761,9 +2761,9 @@ static gboolean _enum_parse(const dt_introspection_type_enum_tuple_t *t, const c
 static const struct { const char *name; uint32_t mode; } _mask_modes[] = {
   { "off", DEVELOP_MASK_DISABLED },
   { "uniform", DEVELOP_MASK_ENABLED },
-  { "drawn", DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK },
+  { "drawn", DEVELOP_MASK_ENABLED | DT_API_MASK_DRAWN },
   { "parametric", DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL },
-  { "drawn & parametric", DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK | DEVELOP_MASK_CONDITIONAL },
+  { "drawn & parametric", DEVELOP_MASK_ENABLED | DT_API_MASK_DRAWN | DEVELOP_MASK_CONDITIONAL },
   { "raster", DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER },
   { NULL, 0 } };
 
@@ -2845,7 +2845,7 @@ static void _add_blend(JsonBuilder *b, const dt_iop_module_t *m)
   json_builder_set_member_name(b, "masks");
   const char *mode = "other";
   for(int k = 0; _mask_modes[k].name; k++)
-    if(_mask_modes[k].mode == (bp->mask_mode & (DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK
+    if(_mask_modes[k].mode == (bp->mask_mode & (DEVELOP_MASK_ENABLED | DT_API_MASK_DRAWN
                                                 | DEVELOP_MASK_CONDITIONAL | DEVELOP_MASK_RASTER)))
       mode = _mask_modes[k].name;
   json_builder_add_string_value(b, mode);
@@ -2868,7 +2868,10 @@ static void _add_blend(JsonBuilder *b, const dt_iop_module_t *m)
   json_builder_add_string_value(b, fg ? fg : "other");
   json_builder_set_member_name(b, "drawn_shapes");
   dt_masks_form_t *grp = dt_masks_get_from_id(_cur->dev, bp->mask_id);
-  json_builder_add_int_value(b, grp && (grp->type & DT_MASKS_GROUP) ? g_list_length(grp->points) : 0);
+  int shapes = 0;
+  for(GList *l = grp && (grp->type & DT_MASKS_GROUP) ? grp->points : NULL; l; l = g_list_next(l))
+    if(dt_masks_get_from_id(_cur->dev, ((dt_masks_point_group_t *)l->data)->formid)) shapes++;   // not a marker
+  json_builder_add_int_value(b, shapes);
 
   // parametric ranges: [low end, low full, high full, high end] per channel
   // in the darkroom's units, for the module's input ("_in") and output
@@ -2982,7 +2985,8 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
         ok = FALSE;
       }
       else
-        bp.mask_mode = (bp.mask_mode & ~(DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK | DEVELOP_MASK_CONDITIONAL
+        bp.mask_mode = (bp.mask_mode & ~(DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK | DT_API_MASK_DRAWN
+                                         | DEVELOP_MASK_CONDITIONAL
                                          | DEVELOP_MASK_RASTER)) | _mask_modes[k].mode;
     }
     else if(!g_strcmp0(name, "blend_mode"))
@@ -3170,7 +3174,7 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
   if(!ok) return FALSE;
   // ranges set: the parametric tab is on, keeping drawn shapes if any
   if(parametric && !(bp.mask_mode & DEVELOP_MASK_CONDITIONAL))
-    bp.mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL | (bp.mask_mode & DEVELOP_MASK_MASK);
+    bp.mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL | (bp.mask_mode & DT_API_MASK_DRAWN);
   // a source set: the raster tab on (raster masks don't combine with the
   // others, develop/blend.c)
   if(raster) bp.mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER;
@@ -3183,6 +3187,83 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
   _add_blend(b, m);
   return TRUE;
 }
+
+#ifdef HAVE_MASKS_FLEXI
+// flexi masks (dev-doc/masks_data_model.md): a group folds its members with
+// one operator, held by its marker, the group's first point; a member has no
+// operator of its own. Classic's combine, per shape, becomes a group's
+// operator; where it changes along the shapes, what came before becomes the
+// first member of a new group (classic's left fold, as the migration splits
+// classic runs)
+static dt_masks_state_t _flexi_op(const int op)
+{
+  return op & DT_MASKS_STATE_INTERSECTION ? DT_MASKS_STATE_FLEXI_MINIMUM
+         : op & DT_MASKS_STATE_DIFFERENCE ? DT_MASKS_STATE_FLEXI_DIFFERENCE
+         : op & DT_MASKS_STATE_EXCLUSION ? DT_MASKS_STATE_FLEXI_EXCLUSION
+         : 0;                                       // union: maximum
+}
+
+// a flexi group's operator as the API names it (mask_list's combine)
+static const char *_flexi_op_name(const dt_masks_state_t state)
+{
+  const dt_masks_state_t op = state & DT_MASKS_STATE_FLEXI_OP;
+  return op == DT_MASKS_STATE_FLEXI_MINIMUM ? "intersection"
+         : op == DT_MASKS_STATE_FLEXI_DIFFERENCE ? "difference"
+         : op == DT_MASKS_STATE_FLEXI_EXCLUSION ? "exclusion"
+         : op == DT_MASKS_STATE_FLEXI_SCREEN ? "screen"
+         : op == DT_MASKS_STATE_FLEXI_PRODUCT ? "product"
+         : op == DT_MASKS_STATE_FLEXI_SUM ? "sum"
+         : "union";
+}
+
+// a member referring to form formid, as dt_masks_group_insert_point makes one
+static dt_masks_point_group_t *_flexi_member(const dt_mask_id_t formid)
+{
+  dt_masks_point_group_t *pt = calloc(1, sizeof(dt_masks_point_group_t));
+  pt->formid = formid;
+  pt->state = DT_MASKS_STATE_SHOW | DT_MASKS_STATE_USE;
+  pt->opacity = 1.0f;
+  pt->group_opacity = 1.0f;
+  return pt;
+}
+
+// a group holding nothing but its marker, with an id no form or marker has
+static dt_masks_form_t *_flexi_group_new(dt_develop_t *dev, const dt_masks_state_t flexi_op)
+{
+  dt_masks_form_t *grp = dt_masks_create(DT_MASKS_GROUP);
+  grp->formid = dt_masks_new_marker_id(dev->forms);
+  grp->points = g_list_append(NULL, dt_masks_marker_new(dev->forms, grp, flexi_op));
+  return grp;
+}
+
+// join member pt to the flexi group *grp with operator flexi_op. A group of
+// one member takes the operator; a group of more, folding otherwise, becomes
+// the first member of a new group (in dev->forms, as *grp is made to be),
+// which replaces *grp. TRUE if it did
+static gboolean _flexi_join(dt_develop_t *dev, dt_masks_form_t **grp, dt_masks_point_group_t *pt,
+                            const dt_masks_state_t flexi_op)
+{
+  dt_masks_point_group_t *marker = dt_masks_group_marker(*grp);
+  const int members = g_list_length((*grp)->points) - (marker ? 1 : 0);
+  if(marker && (members < 2 || (marker->state & DT_MASKS_STATE_FLEXI_OP) == flexi_op))
+  {
+    if(members < 2) marker->state = (marker->state & ~DT_MASKS_STATE_FLEXI_OP) | flexi_op;
+    pt->parentid = (*grp)->formid;
+    (*grp)->points = g_list_append((*grp)->points, pt);
+    return FALSE;
+  }
+  if(!g_list_find(dev->forms, *grp)) dev->forms = g_list_append(dev->forms, *grp);
+  dt_masks_form_t *g = _flexi_group_new(dev, flexi_op);
+  g_strlcpy(g->name, (*grp)->name, sizeof(g->name));
+  dt_masks_point_group_t *before = _flexi_member((*grp)->formid);
+  before->parentid = g->formid;
+  g->points = g_list_append(g->points, before);
+  pt->parentid = g->formid;
+  g->points = g_list_append(g->points, pt);
+  *grp = g;
+  return TRUE;
+}
+#endif
 
 // a new shape on a module's mask, as drawing it in the darkroom does: in
 // the module's group, joined as op (DT_MASKS_STATE_UNION, ...), drawn
@@ -3215,14 +3296,33 @@ static gboolean _mask_attach_ext(dt_iop_module_t *m, dt_masks_form_t *form, cons
   if(last && ((dt_masks_point_group_t *)last->data)->formid == form->formid)
   {
     dt_masks_point_group_t *gp = last->data;
+#ifdef HAVE_MASKS_FLEXI
+    if(inverted) gp->state |= DT_MASKS_STATE_INVERSE;
+    // a group's opacity is its marker's (dt_masks_group_insert_point)
+    dt_masks_point_group_t *own = (form->type & DT_MASKS_GROUP) ? dt_masks_group_marker(form) : NULL;
+    if(opacity >= 0.0f)
+    {
+      if(own) own->group_opacity = opacity;
+      else gp->opacity = opacity;
+    }
+    // how it joins the shapes before it: its group's operator
+    grp->points = g_list_delete_link(grp->points, last);
+    if(_flexi_join(dev, &grp, gp, _flexi_op(op)))
+    {
+      // the new group is the module's mask now
+      dev->forms = g_list_append(dev->forms, grp);
+      m->blend_params->mask_id = grp->formid;
+    }
+#else
     if(last != grp->points)
       gp->state = (gp->state & ~(DT_MASKS_STATE_UNION | DT_MASKS_STATE_INTERSECTION | DT_MASKS_STATE_DIFFERENCE
                                  | DT_MASKS_STATE_EXCLUSION)) | op;
     if(inverted) gp->state |= DT_MASKS_STATE_INVERSE;
     if(opacity >= 0.0f) gp->opacity = opacity;
+#endif
   }
   // the drawn tab on, keeping parametric ranges if on
-  m->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK
+  m->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DT_API_MASK_DRAWN
                                | (m->blend_params->mask_mode & DEVELOP_MASK_CONDITIONAL);
   if(_cur->gui)
   {
@@ -3385,6 +3485,12 @@ static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err
       children = g_list_append(children, f);
     }
     dt_develop_t *dev = _cur->dev;
+#ifdef HAVE_MASKS_FLEXI
+    // a flexi group, joined member by member (_flexi_join); the caller
+    // registers the outermost one, the groups it makes within are already
+    dt_masks_free_form(grp);
+    grp = _flexi_group_new(dev, 0);
+#endif
     guint k = 0;
     for(GList *l = children; l; l = g_list_next(l), k++)
     {
@@ -3404,12 +3510,21 @@ static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err
                   : !g_ascii_strcasecmp(combine, "difference") ? DT_MASKS_STATE_DIFFERENCE
                   : !g_ascii_strcasecmp(combine, "exclusion") ? DT_MASKS_STATE_EXCLUSION
                   : DT_MASKS_STATE_UNION;
+#ifdef HAVE_MASKS_FLEXI
+      free(gp);
+      gp = _flexi_member(f->formid);
+      if(json_object_get_boolean_member_with_default(o, "inverted", FALSE)) gp->state |= DT_MASKS_STATE_INVERSE;
+      gp->opacity = json_object_get_double_member_with_default(o, "opacity",
+                                                               dt_conf_get_float("plugins/darkroom/masks/opacity"));
+      _flexi_join(dev, &grp, gp, k ? _flexi_op(state) : 0);
+#else
       if(!grp->points) state = 0;
       gp->state = DT_MASKS_STATE_SHOW | DT_MASKS_STATE_USE | state
                   | (json_object_get_boolean_member_with_default(o, "inverted", FALSE) ? DT_MASKS_STATE_INVERSE : 0);
       gp->opacity = json_object_get_double_member_with_default(o, "opacity",
                                                                dt_conf_get_float("plugins/darkroom/masks/opacity"));
       grp->points = g_list_append(grp->points, gp);
+#endif
     }
     g_list_free(children);
     return grp;
@@ -3729,11 +3844,17 @@ static void _add_shape_geometry(JsonBuilder *b, const dt_masks_form_t *form)
 static void _add_group_shapes(JsonBuilder *b, const dt_masks_form_t *grp, const int depth)
 {
   json_builder_begin_array(b);
+#ifdef HAVE_MASKS_FLEXI
+  int member = 0;
+#endif
   for(GList *l = grp && (grp->type & DT_MASKS_GROUP) ? grp->points : NULL; l; l = g_list_next(l))
   {
     const dt_masks_point_group_t *gp = l->data;
     const dt_masks_form_t *form = dt_masks_get_from_id(_cur->dev, gp->formid);
-    if(!form) continue;
+    if(!form) continue;     // (a flexi group's marker refers to no form)
+#ifdef HAVE_MASKS_FLEXI
+    member++;
+#endif
     json_builder_begin_object(b);
     json_builder_set_member_name(b, "formid");
     json_builder_add_int_value(b, gp->formid);
@@ -3745,15 +3866,27 @@ static void _add_group_shapes(JsonBuilder *b, const dt_masks_form_t *grp, const 
                                      : form->type & DT_MASKS_PATH ? "path" : form->type & DT_MASKS_BRUSH
                                      ? "brush" : form->type & DT_MASKS_GROUP ? "group" : "other");
     json_builder_set_member_name(b, "combine");
+#ifdef HAVE_MASKS_FLEXI
+    // its group's operator, which joins each member to the ones before it
+    const dt_masks_point_group_t *mk = dt_masks_group_marker(grp);
+    json_builder_add_string_value(b, mk && member > 1 ? _flexi_op_name(mk->state) : "union");
+#else
     json_builder_add_string_value(b, gp->state & DT_MASKS_STATE_INTERSECTION ? "intersection"
                                      : gp->state & DT_MASKS_STATE_DIFFERENCE ? "difference"
                                      : gp->state & DT_MASKS_STATE_EXCLUSION ? "exclusion" : "union");
+#endif
     json_builder_set_member_name(b, "inverted");
     json_builder_add_boolean_value(b, (gp->state & DT_MASKS_STATE_INVERSE) != 0);
     json_builder_set_member_name(b, "active");
     json_builder_add_boolean_value(b, (gp->state & DT_MASKS_STATE_USE) != 0);
     json_builder_set_member_name(b, "opacity");
+#ifdef HAVE_MASKS_FLEXI
+    // a group's own opacity is its marker's
+    const dt_masks_point_group_t *own = (form->type & DT_MASKS_GROUP) ? dt_masks_group_marker(form) : NULL;
+    json_builder_add_double_value(b, own ? own->group_opacity : gp->opacity);
+#else
     json_builder_add_double_value(b, gp->opacity);
+#endif
     _add_shape_geometry(b, form);
     if((form->type & DT_MASKS_GROUP) && depth < 4)
     {
@@ -3803,7 +3936,7 @@ static gboolean _mask_remove(JsonObject *params, JsonBuilder *b, gchar **err)
     free(hit->data);
     grp->points = g_list_delete_link(grp->points, hit);
     if(!grp->points)
-      m->blend_params->mask_mode &= ~DEVELOP_MASK_MASK;
+      m->blend_params->mask_mode &= ~DT_API_MASK_DRAWN;
     dt_dev_add_masks_history_item_ext(dev, m, TRUE, TRUE);
     _cur->pipe_changed = TRUE;
     _cur->dirty = TRUE;
@@ -3852,13 +3985,25 @@ static gboolean _masks_use_same_as(dt_develop_t *dev, dt_iop_module_t *m, const 
   const dt_masks_form_t *src = dt_masks_get_from_id(dev, base->blend_params->mask_id);
   if(!src || src->type != DT_MASKS_GROUP) return FALSE;
   dt_masks_form_t *grp = dt_masks_create(DT_MASKS_GROUP);
+#ifdef HAVE_MASKS_FLEXI
+  grp->formid = dt_masks_new_marker_id(dev->forms);   // free of forms and markers
+#else
   while(dt_masks_get_from_id(dev, grp->formid)) grp->formid++;
+#endif
   gchar *label = dt_history_item_get_name(m);
   snprintf(grp->name, sizeof(grp->name), _("group `%s'"), label);
   g_free(label);
   for(const GList *l = src->points; l; l = g_list_next(l))
   {
     const dt_masks_point_group_t *pt = l->data;
+#ifdef HAVE_MASKS_FLEXI
+    // the operator and group settings: a marker of its own
+    if(dt_masks_point_is_marker(pt))
+    {
+      dt_masks_group_copy_marker(dev->forms, grp, pt);
+      continue;
+    }
+#endif
     if(!dt_masks_get_from_id(dev, pt->formid)) continue;
     dt_masks_point_group_t *grpt = malloc(sizeof(dt_masks_point_group_t));
     *grpt = *pt;
@@ -3916,7 +4061,7 @@ static gboolean _module_add(JsonObject *params, JsonBuilder *b, gchar **err)
             shapes = _masks_use_same_as(dev, m, base);
             if(!shapes)
             {
-              m->blend_params->mask_mode &= ~DEVELOP_MASK_MASK;
+              m->blend_params->mask_mode &= ~DT_API_MASK_DRAWN;
               shapes_copied = FALSE;
             }
           }
@@ -7255,7 +7400,15 @@ static gboolean _mask_ai(JsonObject *params, JsonBuilder *b, gchar **err)
     if(g_str_has_prefix(f->name, _("ai object group"))) groups++;
     else if(g_str_has_prefix(f->name, _("ai object"))) paths++;
   }
+#ifdef HAVE_MASKS_FLEXI
+  // as darktable's "apply as paths" makes a traced object: the union of its
+  // areas, an area with holes a difference group of its outline and holes
+  dt_masks_form_t *grp = _flexi_group_new(dev, 0);
+  dt_masks_form_t *holes = NULL;           // the current area's difference group
+  dt_masks_point_group_t *outline = NULL;  // its outline's member in grp
+#else
   dt_masks_form_t *grp = dt_masks_create(DT_MASKS_GROUP);
+#endif
   int npaths = 0;
   GList *sg = signs;
   for(GList *l = forms; l; l = g_list_next(l), sg = sg ? g_list_next(sg) : NULL)
@@ -7263,9 +7416,37 @@ static gboolean _mask_ai(JsonObject *params, JsonBuilder *b, gchar **err)
     dt_masks_form_t *f = l->data;
     snprintf(f->name, sizeof(f->name), "%s #%d", _("ai object"), ++paths);
     dev->forms = g_list_append(dev->forms, f);
+#ifdef HAVE_MASKS_FLEXI
+    const gboolean hole = sg && GPOINTER_TO_INT(sg->data) == '-';
+    dt_masks_point_group_t *gp = _flexi_member(f->formid);
+    if(!hole || !outline)
+    {
+      gp->parentid = grp->formid;
+      grp->points = g_list_append(grp->points, gp);
+      outline = gp;
+      holes = NULL;
+    }
+    else
+    {
+      if(!holes)
+      {
+        // the outline moves into a new difference group, which takes its place
+        holes = _flexi_group_new(dev, DT_MASKS_STATE_FLEXI_DIFFERENCE);
+        snprintf(holes->name, sizeof(holes->name), "%s #%d", _("ai object area"), paths);
+        dev->forms = g_list_append(dev->forms, holes);
+        dt_masks_point_group_t *o = _flexi_member(outline->formid);
+        o->parentid = holes->formid;
+        holes->points = g_list_append(holes->points, o);
+        outline->formid = holes->formid;
+      }
+      gp->parentid = holes->formid;
+      holes->points = g_list_append(holes->points, gp);
+    }
+#else
     dt_masks_point_group_t *gp = dt_masks_group_add_form(grp, f);
     if(gp && sg && GPOINTER_TO_INT(sg->data) == '-')
       gp->state = (gp->state & ~DT_MASKS_STATE_UNION) | DT_MASKS_STATE_DIFFERENCE;
+#endif
     npaths++;
   }
   g_list_free(forms);

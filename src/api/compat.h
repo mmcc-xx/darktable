@@ -105,6 +105,14 @@ static inline gboolean dt_api_button_has_gesture(GtkWidget *w)
 #endif
 }
 
+// the drawn mask: flexi masks where darktable has them (master, 5.8 on),
+// else the classic group
+#ifdef HAVE_MASKS_FLEXI
+#define DT_API_MASK_DRAWN DEVELOP_MASK_FLEXI
+#else
+#define DT_API_MASK_DRAWN DEVELOP_MASK_MASK
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

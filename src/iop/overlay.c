@@ -134,12 +134,15 @@ typedef struct dt_iop_overlay_global_data_t
   //  - LEGACY: 8-bit Cairo ARGB32 (the original behaviour), kept for backward
   //    compatibility with edits made before the float path existed.
   //  - NATIVE: as HQ, at the overlay image's own size.
-  // cache_mode[] records which mode the slot currently holds, so a mode
-  // change invalidates and re-renders it.
+  // cache_mode[] and cache_imgid[] record which mode and image the slot
+  // currently holds, so a change of either invalidates and re-renders it
+  // (an instance's image can change without the GUI, e.g. by undo or by a
+  // new instance taking a removed one's multi_priority).
   void *cache[MAX_OVERLAY];
   size_t cwidth[MAX_OVERLAY];
   size_t cheight[MAX_OVERLAY];
   dt_iop_overlay_compositing_t cache_mode[MAX_OVERLAY];
+  dt_imgid_t cache_imgid[MAX_OVERLAY];
   dt_pthread_mutex_t overlay_threadsafe;
   int kernel_overlay_blend;        // float RGBA blend (HQ)
   int kernel_overlay_blend_legacy; // 8-bit Cairo ARGB blend (legacy)
@@ -635,15 +638,19 @@ static float *_get_overlay_rgba_f(dt_iop_module_t *self,
   if(!dt_is_valid_imgid(data->imgid))
     _clear_cache_entry(self, index);
 
-  // drop a cached buffer left over from another compositing mode
-  if(use_cache && gd->cache[index] && gd->cache_mode[index] != data->compositing)
+  // drop a cached buffer left over from another compositing mode or image
+  if(use_cache && gd->cache[index]
+     && (gd->cache_mode[index] != data->compositing || gd->cache_imgid[index] != data->imgid))
     _clear_cache_entry(self, index);
 
   if(!*pbuf)
   {
     _setup_overlay(self, piece, data->compositing, pbuf, pwidth, pheight);
     if(use_cache)
+    {
       gd->cache_mode[index] = data->compositing;
+      gd->cache_imgid[index] = data->imgid;
+    }
   }
 
   if(!*pbuf)
@@ -793,15 +800,19 @@ static guint8 *_get_overlay_argb(dt_iop_module_t *self,
   if(!dt_is_valid_imgid(data->imgid))
     _clear_cache_entry(self, index);
 
-  // drop a cached buffer left over from a float mode
-  if(use_cache && gd->cache[index] && gd->cache_mode[index] != DT_OVERLAY_COMPOSITE_LEGACY)
+  // drop a cached buffer left over from a float mode or another image
+  if(use_cache && gd->cache[index]
+     && (gd->cache_mode[index] != DT_OVERLAY_COMPOSITE_LEGACY || gd->cache_imgid[index] != data->imgid))
     _clear_cache_entry(self, index);
 
   if(!*pbuf)
   {
     _setup_overlay(self, piece, DT_OVERLAY_COMPOSITE_LEGACY, pbuf, pwidth, pheight);
     if(use_cache)
+    {
       gd->cache_mode[index] = DT_OVERLAY_COMPOSITE_LEGACY;
+      gd->cache_imgid[index] = data->imgid;
+    }
   }
 
   if(!*pbuf)

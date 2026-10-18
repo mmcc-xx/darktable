@@ -8161,14 +8161,13 @@ static gboolean _shapes_box(dt_iop_module_t *m, dt_dev_pixelpipe_iop_t *piece, i
   return TRUE;
 }
 
-// the pipe's data where module m gets it (its input, at scale), for a box:
-// m and every module after it off but gamma, which hands the float through
-// (working RGB: the pipe's profile where m is)
-static float *_capture_before(_session_t *s, const dt_iop_module_t *m, const int x, const int y,
-                              const int w, const int h, const float scale)
+// pipe's data where module m gets it (its input, at scale), for a box: m
+// and every module after it off but gamma, which hands the float through
+// (working RGB: the pipe's profile where m is). pipe synced; its cache is
+// flushed
+static float *_render_before(dt_develop_t *dev, dt_dev_pixelpipe_t *pipe, const dt_iop_module_t *m, const int x,
+                             const int y, const int w, const int h, const float scale)
 {
-  _pipe_sync(s);
-  dt_dev_pixelpipe_t *pipe = &s->pipe;
   GList *off = NULL;
   for(GList *n = pipe->nodes; n; n = g_list_next(n))
   {
@@ -8182,9 +8181,9 @@ static float *_capture_before(_session_t *s, const dt_iop_module_t *m, const int
   const dt_dev_pixelpipe_type_t type = pipe->type;
   pipe->type |= DT_DEV_PIXELPIPE_IMAGE_FLOAT;
   dt_dev_pixelpipe_cache_flush(pipe);
-  dt_dev_pixelpipe_get_dimensions(pipe, s->dev, pipe->iwidth, pipe->iheight,
+  dt_dev_pixelpipe_get_dimensions(pipe, dev, pipe->iwidth, pipe->iheight,
                                   &pipe->processed_width, &pipe->processed_height);
-  dt_dev_pixelpipe_process(pipe, s->dev, x, y, w, h, scale, DT_DEVICE_NONE);
+  dt_dev_pixelpipe_process(pipe, dev, x, y, w, h, scale, DT_DEVICE_NONE);
   float *out = NULL;
   if(pipe->backbuf && pipe->backbuf_width == w && pipe->backbuf_height == h
      && pipe->backbuf_size == sizeof(float) * 4 * w * h)
@@ -8201,6 +8200,15 @@ static float *_capture_before(_session_t *s, const dt_iop_module_t *m, const int
   pipe->backbuf_size = 0;
   pipe->backbuf_width = pipe->backbuf_height = 0;
   dt_dev_pixelpipe_cache_flush(pipe);
+  return out;
+}
+
+// the session's pipe's data where module m gets it (_render_before)
+static float *_capture_before(_session_t *s, const dt_iop_module_t *m, const int x, const int y,
+                              const int w, const int h, const float scale)
+{
+  _pipe_sync(s);
+  float *out = _render_before(s->dev, &s->pipe, m, x, y, w, h, scale);
   s->pipe_changed = TRUE;
   _pipe_sync(s);
   return out;
@@ -10422,20 +10430,11 @@ static gboolean _parse_area(JsonObject *params, float box[4], gboolean *point, g
 }
 
 // ---- pickers headless (#34) ----
-// a session without darktable's window has no preview pipe to sample: the
-// session's pipe renders the module's input at the preview pipe's size, a
-// picker's sample is taken from it as darktable's pipe takes it
-// (pixelpipe_hb.c, _pixelpipe_picker), and the module's port (pickers.c)
-// applies it
-
-// the preview pipe's size: the image fits in the mipmap it renders
-// (mipmap_cache.c, dt_mipmap_cache_init: DT_MIPMAP_F)
-static float _preview_scale(const dt_dev_pixelpipe_t *pipe)
-{
-  const gboolean high = dt_conf_get_bool("highres_preview_mip");
-  const float w = high ? 1920.0f : 1440.0f, h = high ? 1200.0f : 900.0f;
-  return MIN(1.0f, MIN(w / MAX(1, pipe->iwidth), h / MAX(1, pipe->iheight)));
-}
+// a session without darktable's window has no preview pipe to sample: a
+// preview pipe of the session's edit renders the module's input
+// (_pick_sample), a picker's sample is taken from it as darktable's pipe
+// takes it (pixelpipe_hb.c, _pixelpipe_picker), and the module's port
+// (pickers.c) applies it
 
 // the mean of the two lowest and of the two highest of four values
 // (color_picker.c, _sort_coordinates and dt_color_picker_box)
@@ -10474,19 +10473,50 @@ static JsonNode *_pick_node(const dt_iop_colorspace_type_t cst, const float *mea
   return n;
 }
 
+// m's node in pipe
+static dt_dev_pixelpipe_iop_t *_piece_in(dt_dev_pixelpipe_t *pipe, const dt_iop_module_t *m)
+{
+  for(GList *n = pipe->nodes; n; n = g_list_next(n))
+  {
+    dt_dev_pixelpipe_iop_t *piece = n->data;
+    if(piece->module == m) return piece;
+  }
+  return NULL;
+}
+
 // the sample of module m's picker pk over area (a box, or a point in
 // area[0..1]; fractions of the image as rendered), in the picker's color
-// space (*cst)
+// space (*cst). taken from a preview pipe of the session's edit, as
+// darktable's window takes it from its own: the input is the mipmap the
+// preview renders (DT_MIPMAP_F, the raw binned to fit 1440x900), processed
+// at scale 1 (develop.c, _dev_process_image_job), so the pixels a point or
+// a box's min/max read are those the window reads
 static gboolean _pick_sample(_session_t *s, dt_iop_module_t *m, const dt_api_picker_t *pk, const float area[4],
                              const gboolean point, dt_api_pick_t *pick, dt_iop_colorspace_type_t *cst, gchar **err)
 {
+  // the ports read the session pipe's profiles (exposure's input profile)
   _pipe_sync(s);
-  dt_dev_pixelpipe_t *pipe = &s->pipe;
-  dt_dev_pixelpipe_iop_t *piece = _piece_of(s, m);
-  if(!piece || piece->buf_in.width <= 0 || piece->buf_in.height <= 0 || pipe->iwidth <= 0 || pipe->iheight <= 0)
+  dt_mipmap_buffer_t mb;
+  dt_mipmap_cache_get(&mb, s->dev->image_storage.id, DT_MIPMAP_F, DT_MIPMAP_BLOCKING, 'r');
+  if(!mb.buf || mb.width <= 0 || mb.height <= 0)
+  {
+    dt_mipmap_cache_release(&mb);
+    *err = g_strdup("could not load the image's preview");
+    return FALSE;
+  }
+  dt_dev_pixelpipe_t pp;
+  dt_dev_pixelpipe_init_preview(&pp);
+  dt_dev_pixelpipe_set_input(&pp, s->dev, (float *)mb.buf, mb.width, mb.height, mb.iscale);
+  dt_dev_pixelpipe_create_nodes(&pp, s->dev);
+  dt_dev_pixelpipe_synch_all(&pp, s->dev);
+  dt_dev_pixelpipe_get_dimensions(&pp, s->dev, pp.iwidth, pp.iheight, &pp.processed_width, &pp.processed_height);
+  gboolean ok = FALSE;
+  float *buf = NULL;
+  dt_dev_pixelpipe_iop_t *piece = _piece_in(&pp, m);
+  if(!piece || piece->buf_in.width <= 0 || piece->buf_in.height <= 0 || pp.iwidth <= 0 || pp.iheight <= 0)
   {
     *err = g_strdup_printf("module '%s' gets no image to sample", m->op);
-    return FALSE;
+    goto done;
   }
   // the area in picker space, the pipe's input, as the window keeps it
   // (dt_color_picker_backtransform_box): corners, or the point four times
@@ -10494,33 +10524,32 @@ static gboolean _pick_sample(_session_t *s, dt_iop_module_t *m, const dt_api_pic
   float pts[8];
   for(int i = 0; i < n; i++)
   {
-    pts[2 * i] = pipe->processed_width * area[(i % 3 > 0) * 2];
-    pts[2 * i + 1] = pipe->processed_height * area[(i % 2) * 2 + 1];
+    pts[2 * i] = pp.processed_width * area[(i % 3 > 0) * 2];
+    pts[2 * i + 1] = pp.processed_height * area[(i % 2) * 2 + 1];
   }
-  dt_dev_distort_backtransform_plus(s->dev, pipe, 0, DT_DEV_TRANSFORM_DIR_ALL, pts, n);
+  dt_dev_distort_backtransform_plus(s->dev, &pp, 0, DT_DEV_TRANSFORM_DIR_ALL, pts, n);
   for(int i = 0; i < 4; i++)
   {
     const int k = point ? 0 : i;
-    pts[2 * i] = pipe->iwidth * CLIP(pts[2 * k] / pipe->iwidth);
-    pts[2 * i + 1] = pipe->iheight * CLIP(pts[2 * k + 1] / pipe->iheight);
+    pts[2 * i] = pp.iwidth * CLIP(pts[2 * k] / pp.iwidth);
+    pts[2 * i + 1] = pp.iheight * CLIP(pts[2 * k + 1] / pp.iheight);
   }
   // then where the module gets its input (dt_color_picker_box)
   const gboolean expanded = m->flags() & IOP_FLAGS_EXPAND_ROI_IN;
-  dt_dev_distort_transform_plus(s->dev, pipe, m->iop_order - (expanded ? 1 : 0), DT_DEV_TRANSFORM_DIR_BACK_INCL,
+  dt_dev_distort_transform_plus(s->dev, &pp, m->iop_order - (expanded ? 1 : 0), DT_DEV_TRANSFORM_DIR_BACK_INCL,
                                 pts, 4);
   float fbox[4];
   _pick_edges(pts[0], pts[2], pts[4], pts[6], &fbox[0], &fbox[2]);
   _pick_edges(pts[1], pts[3], pts[5], pts[7], &fbox[1], &fbox[3]);
-  const float sc = _preview_scale(pipe);
-  const int width = MAX(1, (int)(piece->buf_in.width * sc)), height = MAX(1, (int)(piece->buf_in.height * sc));
+  const int width = piece->buf_in.width, height = piece->buf_in.height;
   int box[4];
-  for(int k = 0; k < 4; k++) box[k] = fbox[k] * sc;
+  for(int k = 0; k < 4; k++) box[k] = fbox[k];
   box[2] = MAX(box[2], box[0] + 1);
   box[3] = MAX(box[3], box[1] + 1);
   if(box[0] >= width || box[1] >= height || box[2] < 0 || box[3] < 0)
   {
     *err = _ERR(API_E_PARAMS, NULL, "the area is outside the image the module gets");
-    return FALSE;
+    goto done;
   }
   box[0] = CLAMP(box[0], 0, width - 1);
   box[1] = CLAMP(box[1], 0, height - 1);
@@ -10531,18 +10560,17 @@ static gboolean _pick_sample(_session_t *s, dt_iop_module_t *m, const dt_api_pic
   const int margin = 16;
   const int x = MAX(0, box[0] - margin), y = MAX(0, box[1] - margin);
   const int w = MIN(width, box[2] + margin) - x, h = MIN(height, box[3] + margin) - y;
-  float *buf = _capture_before(s, m, x, y, w, h, sc);
-  piece = _piece_of(s, m);
+  buf = _render_before(s->dev, &pp, m, x, y, w, h, 1.0f);
+  piece = _piece_in(&pp, m);
   if(!buf || !piece)
   {
-    dt_free_align(buf);
     *err = g_strdup("could not render the image where the module gets it");
-    return FALSE;
+    goto done;
   }
   // the capture is in working RGB: in the module's input color space, as
   // the pipe hands it to the module
-  const dt_iop_order_iccprofile_info_t *const profile = dt_ioppr_get_pipe_current_profile_info(m, pipe);
-  const dt_iop_colorspace_type_t cst_in = m->input_colorspace(m, pipe, piece);
+  const dt_iop_order_iccprofile_info_t *const profile = dt_ioppr_get_pipe_current_profile_info(m, &pp);
+  const dt_iop_colorspace_type_t cst_in = m->input_colorspace(m, &pp, piece);
   dt_iop_colorspace_type_t cst_buf = cst_in == IOP_CS_RAW ? IOP_CS_RAW : IOP_CS_RGB;
   if(cst_buf != cst_in)
     dt_ioppr_transform_image_colorspace(m, buf, buf, w, h, cst_buf, cst_in, &cst_buf, profile);
@@ -10551,18 +10579,22 @@ static gboolean _pick_sample(_session_t *s, dt_iop_module_t *m, const dt_api_pic
   dsc.channels = 4;
   dsc.datatype = TYPE_FLOAT;
   dsc.cst = cst_buf;
-  const dt_iop_roi_t roi = { x, y, w, h, sc };
+  const dt_iop_roi_t roi = { x, y, w, h, 1.0f };
   const int inner[4] = { box[0] - x, box[1] - y, box[2] - x, box[3] - y };
   lib_colorpicker_stats stats;
   dt_color_picker_helper(&dsc, buf, &roi, inner, pk->denoise, stats, cst_buf, *cst, profile);
-  dt_free_align(buf);
   for_four_channels(k)
   {
     pick->mean[k] = stats[DT_PICK_MEAN][k];
     pick->min[k] = stats[DT_PICK_MIN][k];
     pick->max[k] = stats[DT_PICK_MAX][k];
   }
-  return TRUE;
+  ok = TRUE;
+done:
+  dt_free_align(buf);
+  dt_dev_pixelpipe_cleanup(&pp);
+  dt_mipmap_cache_release(&mb);
+  return ok;
 }
 
 // a ported picker on a session without darktable's window: sampled and

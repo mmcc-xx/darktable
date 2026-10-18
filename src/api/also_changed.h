@@ -31,3 +31,7 @@ dt_api_also_changed_t dt_api_also_changed_find(const char *op);
 // for the ports, from server.c: ashift's automatic crop fitted to the open
 // session's ashift input, headless; FALSE when it can't be (yet)
 gboolean dt_api_ashift_fit_crop(dt_iop_module_t *ashift);
+
+// for the picker ports (pickers.c): exposure's _exposure_set_white, the
+// slider value that maps white to 1 with black kept below it
+void dt_api_exposure_set_white(dt_iop_module_t *exposure, const float white);

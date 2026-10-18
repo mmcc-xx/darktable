@@ -205,7 +205,7 @@ FILE(GLOB SOURCE_FILES
 # the darktable-api request server, used by the darktable-api engine and by
 # darktable's window (--api-socket)
 if(USE_API)
-  list(APPEND SOURCE_FILES "api/server.c" "api/also_changed.c")
+  list(APPEND SOURCE_FILES "api/server.c" "api/also_changed.c" "api/pickers.c")
   add_definitions(-DHAVE_API)
   include(api/compat.cmake)
 endif()

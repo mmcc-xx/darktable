@@ -105,6 +105,11 @@ static void _exposure_set_black(dt_iop_module_t *m, const float black)
   if(*b >= white) _exposure_set_white(m, *b + 0.01f);
 }
 
+void dt_api_exposure_set_white(dt_iop_module_t *exposure, const float white)
+{
+  if(_P(float, exposure, "exposure") && _P(float, exposure, "black")) _exposure_set_white(exposure, white);
+}
+
 static void _exposure(dt_iop_module_t *m, const char *field, const void *old)
 {
   int *mode = _P(int, m, "mode");

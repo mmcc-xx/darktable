@@ -135,7 +135,8 @@
      picker_list / picker_apply {operation, instance, control, box | point}
                                  -> darktable's window, the darkroom's photo:
                                     a module's pickers and auto buttons,
-                                    pressed as a click does (a job)
+                                    pressed as a click does (a job);
+                                    headless, the pickers ported in pickers.c
      module_remove {operation, instance}
                                  -> deletes an instance (not a module's last)
      module_rename {operation, instance, name}
@@ -243,6 +244,7 @@
 
 #include "api/server.h"
 #include "api/also_changed.h"
+#include "api/pickers.h"
 #include "common/darktable.h"
 #include "common/colorlabels.h"
 #include "common/database.h"
@@ -8159,10 +8161,11 @@ static gboolean _shapes_box(dt_iop_module_t *m, dt_dev_pixelpipe_iop_t *piece, i
   return TRUE;
 }
 
-// the pipe's data where module m gets it (its input, full size), for a box:
+// the pipe's data where module m gets it (its input, at scale), for a box:
 // m and every module after it off but gamma, which hands the float through
+// (working RGB: the pipe's profile where m is)
 static float *_capture_before(_session_t *s, const dt_iop_module_t *m, const int x, const int y,
-                              const int w, const int h)
+                              const int w, const int h, const float scale)
 {
   _pipe_sync(s);
   dt_dev_pixelpipe_t *pipe = &s->pipe;
@@ -8181,7 +8184,7 @@ static float *_capture_before(_session_t *s, const dt_iop_module_t *m, const int
   dt_dev_pixelpipe_cache_flush(pipe);
   dt_dev_pixelpipe_get_dimensions(pipe, s->dev, pipe->iwidth, pipe->iheight,
                                   &pipe->processed_width, &pipe->processed_height);
-  dt_dev_pixelpipe_process(pipe, s->dev, x, y, w, h, 1.0f, DT_DEVICE_NONE);
+  dt_dev_pixelpipe_process(pipe, s->dev, x, y, w, h, scale, DT_DEVICE_NONE);
   float *out = NULL;
   if(pipe->backbuf && pipe->backbuf_width == w && pipe->backbuf_height == h
      && pipe->backbuf_size == sizeof(float) * 4 * w * h)
@@ -8954,7 +8957,7 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   g_list_free_full(ps->pipe.forms, (void (*)(void *))dt_masks_free_form);
   ps->pipe.forms = NULL;
-  buf = _capture_before(ps, pm, rx, ry, side, side);
+  buf = _capture_before(ps, pm, rx, ry, side, side, 1.0f);
   if(!buf)
   {
     *err = g_strdup("could not render the photo where the composite gets it");
@@ -10021,8 +10024,31 @@ static dt_iop_module_t *_darkroom_module(JsonObject *params, gchar **err)
   return _find_module(params, err);
 }
 
+// headless, the pickers ported so far (pickers.c); auto buttons work in
+// darktable's window only
 static gboolean _picker_list(JsonObject *params, JsonBuilder *b, gchar **err)
 {
+  if(_cur && !_cur->gui)
+  {
+    dt_iop_module_t *m = _find_module(params, err);
+    if(!m) return FALSE;
+    json_builder_set_member_name(b, "controls");
+    json_builder_begin_array(b);
+    const dt_api_picker_t *pk;
+    for(int i = 0; (pk = dt_api_picker_nth(m->op, i)); i++)
+    {
+      json_builder_begin_object(b);
+      json_builder_set_member_name(b, "name");
+      json_builder_add_string_value(b, pk->control);
+      json_builder_set_member_name(b, "kind");
+      json_builder_add_string_value(b, "picker");
+      json_builder_set_member_name(b, "active");
+      json_builder_add_boolean_value(b, FALSE);
+      json_builder_end_object(b);
+    }
+    json_builder_end_array(b);
+    return TRUE;
+  }
   dt_iop_module_t *m = _darkroom_module(params, err);
   if(!m) return FALSE;
   GList *controls = _controls(m);
@@ -10169,11 +10195,21 @@ static JsonNode *_changed_settings(const dt_iop_module_t *m, const void *before)
   return n;
 }
 
+static JsonNode *_pick_node(const dt_iop_colorspace_type_t cst, const float *mean, const float *min,
+                            const float *max);
+
 static void _pick_end(_job_t *j, const _job_state_t state, const char *error)
 {
   dt_iop_module_t *m = _job_module(j);
+  // the sample darktable applied, before the picker (and its color space)
+  // is switched off
+  JsonNode *sample = m && j->picker && state == _JOB_DONE
+    ? _pick_node(dt_iop_color_picker_get_active_cst(m), m->picked_color, m->picked_color_min, m->picked_color_max)
+    : NULL;
   if(m && j->picker) dt_iop_color_picker_reset(m, FALSE);
   if(m && state == _JOB_DONE) j->result = _changed_settings(m, j->before);
+  if(sample && j->result) json_object_set_member(json_node_get_object(j->result), "sample", sample);
+  else if(sample) json_node_unref(sample);
   if(j->watch) g_source_remove(j->watch);
   j->watch = 0;
   if(error) j->error = g_strdup(error);
@@ -10385,11 +10421,209 @@ static gboolean _parse_area(JsonObject *params, float box[4], gboolean *point, g
   return ok;
 }
 
+// ---- pickers headless (#34) ----
+// a session without darktable's window has no preview pipe to sample: the
+// session's pipe renders the module's input at the preview pipe's size, a
+// picker's sample is taken from it as darktable's pipe takes it
+// (pixelpipe_hb.c, _pixelpipe_picker), and the module's port (pickers.c)
+// applies it
+
+// the preview pipe's size: the image fits in the mipmap it renders
+// (mipmap_cache.c, dt_mipmap_cache_init: DT_MIPMAP_F)
+static float _preview_scale(const dt_dev_pixelpipe_t *pipe)
+{
+  const gboolean high = dt_conf_get_bool("highres_preview_mip");
+  const float w = high ? 1920.0f : 1440.0f, h = high ? 1200.0f : 900.0f;
+  return MIN(1.0f, MIN(w / MAX(1, pipe->iwidth), h / MAX(1, pipe->iheight)));
+}
+
+// the mean of the two lowest and of the two highest of four values
+// (color_picker.c, _sort_coordinates and dt_color_picker_box)
+static void _pick_edges(const float v0, const float v1, const float v2, const float v3, float *lo, float *hi)
+{
+  float v[4] = { v0, v1, v2, v3 };
+  qsort(v, 4, sizeof(float), _cmp_float);
+  *lo = 0.5f * (v[0] + v[1]);
+  *hi = 0.5f * (v[2] + v[3]);
+}
+
+static void _add_pick(JsonBuilder *b, const char *name, const float *v)
+{
+  json_builder_set_member_name(b, name);
+  json_builder_begin_array(b);
+  for(int k = 0; k < 3; k++) json_builder_add_double_value(b, v[k]);
+  json_builder_end_array(b);
+}
+
+// a sample as picker_apply's result gives it
+static JsonNode *_pick_node(const dt_iop_colorspace_type_t cst, const float *mean, const float *min,
+                            const float *max)
+{
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "colorspace");
+  json_builder_add_string_value(b, cst == IOP_CS_RAW ? "raw" : cst == IOP_CS_LAB ? "Lab" : cst == IOP_CS_RGB ? "RGB"
+                                   : cst == IOP_CS_LCH ? "LCh" : cst == IOP_CS_HSL ? "HSL"
+                                   : cst == IOP_CS_JZCZHZ ? "JzCzhz" : "none");
+  _add_pick(b, "mean", mean);
+  _add_pick(b, "min", min);
+  _add_pick(b, "max", max);
+  json_builder_end_object(b);
+  JsonNode *n = json_builder_get_root(b);
+  g_object_unref(b);
+  return n;
+}
+
+// the sample of module m's picker pk over area (a box, or a point in
+// area[0..1]; fractions of the image as rendered), in the picker's color
+// space (*cst)
+static gboolean _pick_sample(_session_t *s, dt_iop_module_t *m, const dt_api_picker_t *pk, const float area[4],
+                             const gboolean point, dt_api_pick_t *pick, dt_iop_colorspace_type_t *cst, gchar **err)
+{
+  _pipe_sync(s);
+  dt_dev_pixelpipe_t *pipe = &s->pipe;
+  dt_dev_pixelpipe_iop_t *piece = _piece_of(s, m);
+  if(!piece || piece->buf_in.width <= 0 || piece->buf_in.height <= 0 || pipe->iwidth <= 0 || pipe->iheight <= 0)
+  {
+    *err = g_strdup_printf("module '%s' gets no image to sample", m->op);
+    return FALSE;
+  }
+  // the area in picker space, the pipe's input, as the window keeps it
+  // (dt_color_picker_backtransform_box): corners, or the point four times
+  const int n = point ? 1 : 4;
+  float pts[8];
+  for(int i = 0; i < n; i++)
+  {
+    pts[2 * i] = pipe->processed_width * area[(i % 3 > 0) * 2];
+    pts[2 * i + 1] = pipe->processed_height * area[(i % 2) * 2 + 1];
+  }
+  dt_dev_distort_backtransform_plus(s->dev, pipe, 0, DT_DEV_TRANSFORM_DIR_ALL, pts, n);
+  for(int i = 0; i < 4; i++)
+  {
+    const int k = point ? 0 : i;
+    pts[2 * i] = pipe->iwidth * CLIP(pts[2 * k] / pipe->iwidth);
+    pts[2 * i + 1] = pipe->iheight * CLIP(pts[2 * k + 1] / pipe->iheight);
+  }
+  // then where the module gets its input (dt_color_picker_box)
+  const gboolean expanded = m->flags() & IOP_FLAGS_EXPAND_ROI_IN;
+  dt_dev_distort_transform_plus(s->dev, pipe, m->iop_order - (expanded ? 1 : 0), DT_DEV_TRANSFORM_DIR_BACK_INCL,
+                                pts, 4);
+  float fbox[4];
+  _pick_edges(pts[0], pts[2], pts[4], pts[6], &fbox[0], &fbox[2]);
+  _pick_edges(pts[1], pts[3], pts[5], pts[7], &fbox[1], &fbox[3]);
+  const float sc = _preview_scale(pipe);
+  const int width = MAX(1, (int)(piece->buf_in.width * sc)), height = MAX(1, (int)(piece->buf_in.height * sc));
+  int box[4];
+  for(int k = 0; k < 4; k++) box[k] = fbox[k] * sc;
+  box[2] = MAX(box[2], box[0] + 1);
+  box[3] = MAX(box[3], box[1] + 1);
+  if(box[0] >= width || box[1] >= height || box[2] < 0 || box[3] < 0)
+  {
+    *err = _ERR(API_E_PARAMS, NULL, "the area is outside the image the module gets");
+    return FALSE;
+  }
+  box[0] = CLAMP(box[0], 0, width - 1);
+  box[1] = CLAMP(box[1], 0, height - 1);
+  box[2] = CLAMP(box[2], 1, width);
+  box[3] = CLAMP(box[3], 1, height);
+  // rendered with a margin: a region of a few pixels comes out black
+  // (demosaic needs its neighbors)
+  const int margin = 16;
+  const int x = MAX(0, box[0] - margin), y = MAX(0, box[1] - margin);
+  const int w = MIN(width, box[2] + margin) - x, h = MIN(height, box[3] + margin) - y;
+  float *buf = _capture_before(s, m, x, y, w, h, sc);
+  piece = _piece_of(s, m);
+  if(!buf || !piece)
+  {
+    dt_free_align(buf);
+    *err = g_strdup("could not render the image where the module gets it");
+    return FALSE;
+  }
+  // the capture is in working RGB: in the module's input color space, as
+  // the pipe hands it to the module
+  const dt_iop_order_iccprofile_info_t *const profile = dt_ioppr_get_pipe_current_profile_info(m, pipe);
+  const dt_iop_colorspace_type_t cst_in = m->input_colorspace(m, pipe, piece);
+  dt_iop_colorspace_type_t cst_buf = cst_in == IOP_CS_RAW ? IOP_CS_RAW : IOP_CS_RGB;
+  if(cst_buf != cst_in)
+    dt_ioppr_transform_image_colorspace(m, buf, buf, w, h, cst_buf, cst_in, &cst_buf, profile);
+  *cst = pk->cst != IOP_CS_NONE ? pk->cst : m->default_colorspace(m, NULL, NULL);
+  dt_iop_buffer_dsc_t dsc = piece->dsc_in;
+  dsc.channels = 4;
+  dsc.datatype = TYPE_FLOAT;
+  dsc.cst = cst_buf;
+  const dt_iop_roi_t roi = { x, y, w, h, sc };
+  const int inner[4] = { box[0] - x, box[1] - y, box[2] - x, box[3] - y };
+  lib_colorpicker_stats stats;
+  dt_color_picker_helper(&dsc, buf, &roi, inner, pk->denoise, stats, cst_buf, *cst, profile);
+  dt_free_align(buf);
+  for_four_channels(k)
+  {
+    pick->mean[k] = stats[DT_PICK_MEAN][k];
+    pick->min[k] = stats[DT_PICK_MIN][k];
+    pick->max[k] = stats[DT_PICK_MAX][k];
+  }
+  return TRUE;
+}
+
+// a ported picker on a session without darktable's window: sampled and
+// applied at once, a job that has ended when picker_apply replies (as the
+// window's, which ends when darktable applied the sample)
+static gboolean _picker_apply_headless(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_iop_module_t *m = _find_module(params, err);
+  if(!m) return FALSE;
+  const char *name = json_object_get_string_member_with_default(params, "control", NULL);
+  const dt_api_picker_t *pk = dt_api_picker_find(m->op, name);
+  if(!pk)
+  {
+    *err = dt_api_picker_nth(m->op, 0)
+      ? _ERRF(API_E_NOT_FOUND, "control", "module '%s' has no picker '%s' that works headless (picker_list)", m->op,
+              name ? name : "")
+      : _ERRF(API_E_UNAVAILABLE, "control", "the pickers of '%s' work on the photo in darktable's darkroom only,"
+              " with darktable's window serving the API (library_status: darkroom_imgid)", m->op);
+    return FALSE;
+  }
+  float area[4] = { 0.f };
+  gboolean point = FALSE;
+  if(!_parse_area(params, area, &point, err)) return FALSE;
+  dt_api_pick_t pick;
+  dt_iop_colorspace_type_t cst;
+  if(!_pick_sample(_cur, m, pk, area, point, &pick, &cst, err)) return FALSE;
+
+  void *before = g_malloc(m->params_size);
+  memcpy(before, m->params, m->params_size);
+  const gboolean was_on = m->enabled;
+  pk->apply(m, &_cur->pipe, &pick);
+  // pressing a picker switches its module on (color_picker_proxy.c,
+  // _color_picker_callback_button_press)
+  const gboolean changed = !was_on || memcmp(before, m->params, m->params_size);
+  if(changed) _record(m, TRUE);
+
+  _job_t *j = g_new0(_job_t, 1);
+  j->id = _next_job++;
+  j->type = "picker";
+  j->imgid = _cur->dev->image_storage.id;
+  j->started = j->finished = g_get_monotonic_time();
+  j->op = g_strdup(m->op);
+  j->prio = m->multi_priority;
+  j->control = g_strdup(pk->control);
+  j->picker = TRUE;
+  j->state = _JOB_DONE;
+  j->result = _changed_settings(m, before);
+  json_object_set_member(json_node_get_object(j->result), "sample", _pick_node(cst, pick.mean, pick.min, pick.max));
+  g_free(before);
+  _jobs = g_list_append(_jobs, j);
+  _add_job(b, j);
+  if(changed) _notify(NULL, "edit", j->imgid);
+  return TRUE;
+}
+
 // presses a picker or auto button of a module of the darkroom's photo. a
 // picker samples box (or point) in image space; without one, darktable's
 // default area for a fresh picker (nearly the whole image)
 static gboolean _picker_apply(JsonObject *params, JsonBuilder *b, gchar **err)
 {
+  if(_cur && !_cur->gui) return _picker_apply_headless(params, b, err);
   dt_iop_module_t *m = _darkroom_module(params, err);
   if(!m) return FALSE;
   const char *name = json_object_get_string_member_with_default(params, "control", NULL);
@@ -10698,7 +10932,7 @@ static const char *_methods[] = {
 #endif
   "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "image_remove", "style_list", "style_create", "style_delete", "style_apply",
   "history_paste", "collection", "darkroom_open", "image_info.exif", "image_metadata", "tag_list", "set_tags",
-  "set_metadata", "set_location", "picker_list", "picker_apply", "module_remove", "module_rename", "history_compress",
+  "set_metadata", "set_location", "picker_list", "picker_apply", "picker_apply.headless", "module_remove", "module_rename", "history_compress",
   "render.history_end", "render_variants", "darkroom_snapshot", "share", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
   "library_status", "library_release", "library_acquire", "handover", "shutdown", "shutdown.quit_window",
   "errors.codes", NULL };

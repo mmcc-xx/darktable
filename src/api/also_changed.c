@@ -32,6 +32,8 @@
 #include "common/colorspaces_inline_conversions.h"
 #include "common/illuminants.h"
 #include "common/image.h"
+#include "common/iop_profile.h"
+#include "common/noiseprofiles.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
 
@@ -652,6 +654,241 @@ static void _colorharmonizer(dt_iop_module_t *m, const char *field, const void *
   }
 }
 
+// ---- filmic rgb (filmicrgb.c) --------------------------------------------------
+
+// _compute_output_power: the hardness that puts the target middle gray on
+// the identity line, within the range of its slider
+static void _filmicrgb_compute_output_power(dt_iop_module_t *m)
+{
+  float *output_power = _P(float, m, "output_power");
+  const float grey_target = *_P(float, m, "grey_point_target");
+  const float black = *_P(float, m, "black_point_source");
+  const float white = *_P(float, m, "white_point_source");
+  const dt_introspection_field_t *f = m->so->get_f("output_power");
+  if(!f) return;
+  *output_power = CLAMPF(logf(grey_target / 100.0f) / logf(-black / (white - black)), f->Float.Min, f->Float.Max);
+}
+
+static void _filmicrgb(dt_iop_module_t *m, const char *field, const void *old)
+{
+  float *grey = _P(float, m, "grey_point_source");
+  float *black = _P(float, m, "black_point_source");
+  float *white = _P(float, m, "white_point_source");
+  const float *security = _P(float, m, "security_factor");
+  const gboolean *auto_hardness = _P(gboolean, m, "auto_hardness");
+  gboolean *reconstruction = _P(gboolean, m, "enable_highlight_reconstruction");
+  if(!grey || !black || !white || !security || !auto_hardness || !reconstruction || !_P(float, m, "output_power")
+     || !_P(float, m, "grey_point_target"))
+    return;
+  // the source sliders are set inside a gui update, so the values are kept as they are
+  if(_is(field, "security_factor") || _is(field, "grey_point_source"))
+  {
+    if(_is(field, "security_factor"))
+    {
+      const float prev = _OLD(float, m, old, "security_factor");
+      const float ratio = (*security - prev) / (prev + 100.0f);
+      float ev_min = *black;
+      ev_min = ev_min + ratio * ev_min;
+      float ev_max = *white;
+      ev_max = ev_max + ratio * ev_max;
+      *white = ev_max;
+      *black = ev_min;
+    }
+    else
+    {
+      const float grey_var = log2f(_OLD(float, m, old, "grey_point_source") / *grey);
+      *black = *black - grey_var;
+      *white = *white + grey_var;
+    }
+  }
+  // the hardness follows the source range and the target gray, for any
+  // change: the window's gui_update runs gui_changed(NULL) first, whose
+  // auto hardness branch applies to every setting, the hardness itself included
+  if(*auto_hardness) _filmicrgb_compute_output_power(m);
+  // moving the threshold or the transition turns the highlight reconstruction on
+  if(_is(field, "reconstruct_threshold") || _is(field, "reconstruct_feather")) *reconstruction = TRUE;
+}
+
+// ---- rgb curve (rgbcurve.c) ----------------------------------------------------
+
+enum { _RGBCURVE_CHANNELS = 3, _RGBCURVE_MAXNODES = 20, _RGBCURVE_MANUAL_RGB = 1 };
+
+// _is_identity
+static gboolean _rgbcurve_is_identity(const _colorzones_node_t *nodes, const int num_nodes)
+{
+  for(int k = 0; k < num_nodes; k++)
+    if(nodes[k].x != nodes[k].y) return FALSE;
+  return TRUE;
+}
+
+static void _rgbcurve(dt_iop_module_t *m, const char *field, const void *old)
+{
+  _colorzones_node_t *nodes = _P(_colorzones_node_t, m, "curve_nodes");
+  int *num_nodes = _P(int, m, "curve_num_nodes");
+  int *type = _P(int, m, "curve_type");
+  const int *autoscale = _P(int, m, "curve_autoscale");
+  const gboolean *compensate = _P(gboolean, m, "compensate_middle_grey");
+  if(!nodes || !num_nodes || !type || !autoscale || !compensate) return;
+  if(_is(field, "curve_autoscale"))
+  {
+    // switching to manual scale, if G and B are not touched yet, makes them
+    // identical to the global curve (R)
+    if(*autoscale == _RGBCURVE_MANUAL_RGB && _rgbcurve_is_identity(nodes + 1 * _RGBCURVE_MAXNODES, num_nodes[1])
+       && _rgbcurve_is_identity(nodes + 2 * _RGBCURVE_MAXNODES, num_nodes[2]))
+    {
+      for(int k = 0; k < _RGBCURVE_MAXNODES; k++)
+        nodes[1 * _RGBCURVE_MAXNODES + k] = nodes[2 * _RGBCURVE_MAXNODES + k] = nodes[k];
+      num_nodes[1] = num_nodes[2] = num_nodes[0];
+      type[1] = type[2] = type[0];
+    }
+  }
+  else if(_is(field, "compensate_middle_grey"))
+  {
+    const dt_iop_order_iccprofile_info_t *const work_profile = dt_ioppr_get_iop_work_profile_info(m, m->dev->iop);
+    if(work_profile == NULL) return;
+    for(int ch = 0; ch < _RGBCURVE_CHANNELS; ch++)
+      for(int k = 0; k < CLAMP(num_nodes[ch], 0, _RGBCURVE_MAXNODES); k++)
+      {
+        _colorzones_node_t *node = nodes + ch * _RGBCURVE_MAXNODES + k;
+        // the nodes go from the image colorspace to lab, or back
+        if(*compensate)
+        {
+          node->x = dt_ioppr_compensate_middle_grey(node->x, work_profile);
+          node->y = dt_ioppr_compensate_middle_grey(node->y, work_profile);
+        }
+        else
+        {
+          node->x = dt_ioppr_uncompensate_middle_grey(node->x, work_profile);
+          node->y = dt_ioppr_uncompensate_middle_grey(node->y, work_profile);
+        }
+      }
+    m->histogram_middle_grey = *compensate;
+  }
+}
+
+// ---- denoise (profiled) (denoiseprofile.c) -----------------------------------
+
+enum
+{
+  _DENOISEPROFILE_NLMEANS_AUTO = 3,
+  _DENOISEPROFILE_WAVELETS_AUTO = 4,
+  _DENOISEPROFILE_MODE_RGB = 0,
+  _DENOISEPROFILE_MODE_Y0U0V0 = 1
+};
+
+// infer_radius_from_profile, infer_scattering_from_profile,
+// infer_shadows_from_profile, infer_bias_from_profile
+static unsigned _denoiseprofile_infer_radius(const float a)
+{
+  return MIN((unsigned)(1.0f + a * 15000.0f + a * a * 300000.0f), 8);
+}
+
+static float _denoiseprofile_infer_scattering(const float a)
+{
+  return MIN(3000.0f * a, 1.0f);
+}
+
+static float _denoiseprofile_infer_shadows(const float a)
+{
+  return MIN(MAX(0.1f - 0.1 * logf(a), 0.7f), 1.8f);
+}
+
+static float _denoiseprofile_infer_bias(const float a)
+{
+  return -MAX(5 + 0.5 * logf(a), 0.0);
+}
+
+// _get_iso_highlight_preservation_shift
+static int _denoiseprofile_iso_shift(const dt_image_t *img)
+{
+  const int shift = floorf(img->exif_highlight_preservation);
+  return shift <= 0 ? 0 : shift;
+}
+
+// dt_iop_denoiseprofile_get_auto_profile, without the profile's name
+static dt_noiseprofile_t _denoiseprofile_auto_profile(const dt_iop_module_t *m, gboolean *autodetected,
+                                                      const gboolean compensate_hilite_pres)
+{
+  GList *profiles = dt_noiseprofile_get_matching(&m->dev->image_storage);
+  dt_noiseprofile_t interpolated = dt_noiseprofile_generic;
+  *autodetected = FALSE;
+  int iso = m->dev->image_storage.exif_iso;
+  if(compensate_hilite_pres) iso >>= _denoiseprofile_iso_shift(&m->dev->image_storage);
+  dt_noiseprofile_t *last = NULL;
+  for(GList *iter = profiles; iter; iter = g_list_next(iter))
+  {
+    dt_noiseprofile_t *current = iter->data;
+    if(current->iso == iso)
+    {
+      interpolated = *current;
+      *autodetected = TRUE;
+      break;
+    }
+    if(last && last->iso < iso && current->iso > iso)
+    {
+      interpolated.iso = iso;
+      dt_noiseprofile_interpolate(last, current, &interpolated);
+      *autodetected = TRUE;
+      break;
+    }
+    last = current;
+  }
+  g_list_free_full(profiles, dt_noiseprofile_free);
+  return interpolated;
+}
+
+static void _denoiseprofile(dt_iop_module_t *m, const char *field, const void *old)
+{
+  float *a = _P(float, m, "a"), *b = _P(float, m, "b");
+  const int *mode = _P(int, m, "mode");
+  int *wavelet_color_mode = _P(int, m, "wavelet_color_mode");
+  const gboolean *use_new_vst = _P(gboolean, m, "use_new_vst");
+  const gboolean *compensate = _P(gboolean, m, "compensate_hilite_pres");
+  const float *overshooting = _P(float, m, "overshooting");
+  float *radius = _P(float, m, "radius"), *scattering = _P(float, m, "scattering");
+  float *shadows = _P(float, m, "shadows"), *bias = _P(float, m, "bias");
+  if(!a || !b || !mode || !wavelet_color_mode || !use_new_vst || !compensate || !overshooting || !radius
+     || !scattering || !shadows || !bias)
+    return;
+  // gui_update runs gui_changed(NULL) first, so this applies to any change:
+  // without the new transform the Y0U0V0 color mode is not allowed
+  if(!*use_new_vst && *wavelet_color_mode == _DENOISEPROFILE_MODE_Y0U0V0)
+    *wavelet_color_mode = _DENOISEPROFILE_MODE_RGB;
+  if(_is(field, "overshooting") || _is(field, "compensate_hilite_pres"))
+  {
+    float a1 = a[1];
+    if(a[0] == -1.0)
+    {
+      // the profile combobox is set to the automatic entry, whose callback
+      // (profile_callback) stores the profile of reload_defaults (g->interpolated,
+      // marked automatic when detected, with the highlight preservation of the
+      // defaults) in the noise coefficients
+      gboolean detected;
+      dt_noiseprofile_t profile
+        = _denoiseprofile_auto_profile(m, &detected, _denoiseprofile_iso_shift(&m->dev->image_storage) > 0);
+      if(detected) profile.a[0] = -1.0f;
+      for(int k = 0; k < 3; k++)
+      {
+        a[k] = profile.a[k];
+        b[k] = profile.b[k];
+      }
+      profile = _denoiseprofile_auto_profile(m, &detected, *compensate);
+      a1 = profile.a[1];
+    }
+    // the auto modes infer the settings from the noise profile, through
+    // sliders that keep their range and precision (radius 0 digits, the
+    // others 2)
+    if(*mode == _DENOISEPROFILE_NLMEANS_AUTO || *mode == _DENOISEPROFILE_WAVELETS_AUTO)
+    {
+      const float gain = *overshooting;
+      *radius = _slider_value(_denoiseprofile_infer_radius(a1 * gain), 0.0f, 12.0f, 0, 1.0f);
+      *scattering = _slider_value(_denoiseprofile_infer_scattering(a1 * gain), 0.0f, 20.0f, 2, 1.0f);
+      *shadows = _slider_value(_denoiseprofile_infer_shadows(a1 * gain), 0.0f, 1.8f, 2, 1.0f);
+      *bias = _slider_value(_denoiseprofile_infer_bias(a1 * gain), -1000.0f, 100.0f, 2, 1.0f);
+    }
+  }
+}
+
 // -----------------------------------------------------------------------------
 
 static const struct { const char *op; dt_api_also_changed_t fn; } _ports[] = {
@@ -669,6 +906,9 @@ static const struct { const char *op; dt_api_also_changed_t fn; } _ports[] = {
   { "borders", _borders },
   { "demosaic", _demosaic },
   { "negadoctor", _negadoctor },
+  { "filmicrgb", _filmicrgb },
+  { "rgbcurve", _rgbcurve },
+  { "denoiseprofile", _denoiseprofile },
 };
 
 dt_api_also_changed_t dt_api_also_changed_find(const char *op)

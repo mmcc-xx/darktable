@@ -27,3 +27,7 @@ typedef void (*dt_api_also_changed_t)(dt_iop_module_t *m, const char *field, con
 // the function for a module, NULL when its gui_changed adjusts nothing (or
 // isn't ported yet)
 dt_api_also_changed_t dt_api_also_changed_find(const char *op);
+
+// for the ports, from server.c: ashift's automatic crop fitted to the open
+// session's ashift input, headless; FALSE when it can't be (yet)
+gboolean dt_api_ashift_fit_crop(dt_iop_module_t *ashift);

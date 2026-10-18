@@ -1730,6 +1730,38 @@ static void _set_param(dt_iop_module_t *m, const char *name, const double v)
   if(f) _set_num(f, (uint8_t *)m->params + f->header.offset, v);
 }
 
+// ashift's automatic crop fitted to its input (dt_iop_ashift_fit_crop),
+// which doesn't depend on ashift's own settings. FALSE when the fit failed
+// (the automatic crop is then off) or the input isn't known yet
+static gboolean _ashift_fit(_session_t *s, dt_iop_module_t *ashift, const _fit_crop_t fit)
+{
+  _pipe_sync(s);
+  const dt_dev_pixelpipe_iop_t *ap = _piece(s, "ashift");
+  if(!ap || ap->buf_in.width <= 0 || ap->buf_in.height <= 0) return FALSE;
+  const int w = ap->buf_in.width, h = ap->buf_in.height;
+  const double cropmode = _param(ashift, "cropmode");
+  gboolean ok = fit(ashift->params, w, h);
+  if(!ok && MAX(w, h) > 1200)
+  {
+    // again at about the size the darkroom fits it at (its preview):
+    // the fit's break criterion is in pixels, and at full size it can
+    // run out of iterations (a 5492 px wide raw did); the box is in
+    // fractions. A failed fit switched the automatic crop off: back on
+    _set_param(ashift, "cropmode", cropmode);
+    const float sc = 1200.0f / MAX(w, h);
+    ok = fit(ashift->params, MAX(lroundf(w * sc), 1), MAX(lroundf(h * sc), 1));
+  }
+  return ok;
+}
+
+gboolean dt_api_ashift_fit_crop(dt_iop_module_t *ashift)
+{
+  _fit_crop_t fit = NULL;
+  if(!_cur || _cur->gui || !g_module_symbol(ashift->so->module, "dt_iop_ashift_fit_crop", (gpointer *)&fit))
+    return FALSE;
+  return _ashift_fit(_cur, ashift, fit);
+}
+
 // what flip shows: its orientation, the image's own one if "autodetect"
 static dt_image_orientation_t _orientation(const dt_iop_module_t *flip)
 {
@@ -2024,26 +2056,7 @@ static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
     // new rotation. ashift's input doesn't depend on any change above
     _session_t *s = _pipe_session(err);
     if(!s) return FALSE;
-    _pipe_sync(s);
-    const dt_dev_pixelpipe_iop_t *ap = _piece(s, "ashift");
-    if(fit && ap)
-    {
-      const int w = ap->buf_in.width, h = ap->buf_in.height;
-      const double cropmode = _param(ashift, "cropmode");
-      autocropped = fit(ashift->params, w, h);
-      if(!autocropped && MAX(w, h) > 1200)
-      {
-        // again at about the size the darkroom fits it at (its preview):
-        // the fit's break criterion is in pixels, and at full size it can
-        // run out of iterations (a 5492 px wide raw did); the box is in
-        // fractions. A failed fit switched the automatic crop off: back on
-        _set_param(ashift, "cropmode", cropmode);
-        const float sc = 1200.0f / MAX(w, h);
-        autocropped = fit(ashift->params, MAX(lroundf(w * sc), 1), MAX(lroundf(h * sc), 1));
-      }
-    }
-    else
-      autocropped = FALSE;
+    autocropped = fit && _ashift_fit(s, ashift, fit);
     _record(ashift, TRUE);
   }
 

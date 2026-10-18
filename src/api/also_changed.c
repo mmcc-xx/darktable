@@ -889,6 +889,41 @@ static void _denoiseprofile(dt_iop_module_t *m, const char *field, const void *o
   }
 }
 
+// ---- rotate and perspective (ashift.c) --------------------------------------
+
+static void _ashift(dt_iop_module_t *m, const char *field, const void *old)
+{
+  // any of its controls refits the automatic crop to the new correction
+  // (do_crop, at the module's input size; off clears the crop box). the
+  // crop box itself has no control
+  static const char *controls[] = { "rotation", "lensshift_v", "lensshift_h", "shear", "f_length",
+                                    "crop_factor", "orthocorr", "aspect", "mode", "cropmode" };
+  for(size_t k = 0; k < G_N_ELEMENTS(controls); k++)
+    if(_is(field, controls[k]))
+    {
+      dt_api_ashift_fit_crop(m);
+      return;
+    }
+}
+
+// ---- crop (crop.c) ------------------------------------------------------------
+
+static void _crop(dt_iop_module_t *m, const char *field, const void *old)
+{
+  float *cx = _P(float, m, "cx"), *cy = _P(float, m, "cy");
+  float *cw = _P(float, m, "cw"), *ch = _P(float, m, "ch");
+  if(!cx || !cy || !cw || !ch) return;
+  if(!_is(field, "cx") && !_is(field, "cy") && !_is(field, "cw") && !_is(field, "ch")) return;
+  // _commit_box: the box stays in the image and at least 1% wide and high
+  // (MIN_CROP_SIZE). a fixed aspect ratio isn't applied here; geometry_set
+  // with an aspect does that
+  const float min_size = 0.01f;
+  *cx = CLAMPF(*cx, 0.0f, 1.0f - min_size);
+  *cy = CLAMPF(*cy, 0.0f, 1.0f - min_size);
+  *cw = CLAMPF(*cw, min_size, 1.0f);
+  *ch = CLAMPF(*ch, min_size, 1.0f);
+}
+
 // -----------------------------------------------------------------------------
 
 static const struct { const char *op; dt_api_also_changed_t fn; } _ports[] = {
@@ -906,6 +941,8 @@ static const struct { const char *op; dt_api_also_changed_t fn; } _ports[] = {
   { "borders", _borders },
   { "demosaic", _demosaic },
   { "negadoctor", _negadoctor },
+  { "ashift", _ashift },
+  { "crop", _crop },
   { "filmicrgb", _filmicrgb },
   { "rgbcurve", _rgbcurve },
   { "denoiseprofile", _denoiseprofile },

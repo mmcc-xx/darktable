@@ -31,6 +31,10 @@ dt_api_header_has(HAVE_OVERLAY_COMPOSITE_HQ "iop/overlay.c"
                   "DT_OVERLAY_COMPOSITE_HQ")
 dt_api_header_has(HAVE_OVERLAY_COMPOSITE_NATIVE "iop/overlay.c"
                   "DT_OVERLAY_COMPOSITE_NATIVE")
+# the EV a camera's HDR / highlight tone mode withheld, which exposure
+# compensates (master)
+dt_api_header_has(HAVE_EXIF_HIGHLIGHT_PRESERVATION "common/image.h"
+                  "exif_highlight_preservation;")
 # flexi masks (master, 5.8 on): a module's mask is a tree of groups, each
 # with a marker holding its operator (dev-doc/masks_data_model.md)
 dt_api_header_has(HAVE_MASKS_FLEXI "develop/blend.h" "DEVELOP_MASK_FLEXI")

@@ -242,6 +242,7 @@
 */
 
 #include "api/server.h"
+#include "api/also_changed.h"
 #include "common/darktable.h"
 #include "common/colorlabels.h"
 #include "common/database.h"
@@ -1170,34 +1171,71 @@ static gboolean _is_own_units(const dt_iop_module_t *m, const char *field)
 // the same call keep the client's values: gui_changed runs one setting at a
 // time and would otherwise undo them (channelmixerrgb's illuminant restores
 // the last daylight temperature over the one sent with it). in darktable's
-// window only: headless there is no module window code to run
-static void _run_gui_changed(dt_iop_module_t *m, const void *old, GList *names)
+// window, and headless the same adjustments without the controls
+// (also_changed.c)
+// one pass over the settings sent: each changed one's adjustments, then the
+// other sent settings put back. TRUE when putting one back changed it, so
+// what was derived from it may be stale. all: every sent setting, changed
+// or not, against ref as its previous value
+static gboolean _gui_changed_pass(dt_iop_module_t *m, const gboolean gui, const dt_api_also_changed_t port,
+                                  const void *ref, GList *names, uint8_t *wanted, const gboolean all)
 {
-  if(!_cur->gui || !m->gui_changed || !m->gui_data) return;
-  _api_editing = TRUE;
-  // the controls show the new values first, as after a slider move
-  DT_ENTER_GUI_UPDATE();
-  dt_iop_gui_update(m);
-  DT_LEAVE_GUI_UPDATE();
-  uint8_t *wanted = g_malloc(m->params_size);
-  memcpy(wanted, m->params, m->params_size);
+  gboolean put_back = FALSE;
   for(GList *n = names; n; n = g_list_next(n))
   {
     const dt_introspection_field_t *f = _field(m, n->data);
     if(!f) continue;
     const size_t off = f->header.offset;
-    if(!memcmp((const uint8_t *)old + off, (const uint8_t *)m->params + off, f->header.size)) continue;
-    GtkWidget *w = _field_widget(m, f);
-    if(!w) continue;
-    m->gui_changed(m, w, (void *)((const uint8_t *)old + off));
+    if(!all && !memcmp((const uint8_t *)ref + off, (const uint8_t *)m->params + off, f->header.size)) continue;
+    if(gui)
+    {
+      GtkWidget *w = _field_widget(m, f);
+      if(!w) continue;
+      m->gui_changed(m, w, (void *)((const uint8_t *)ref + off));
+    }
+    else
+      port(m, n->data, ref);
     if(!_is_own_units(m, n->data))
       memcpy(wanted + off, (const uint8_t *)m->params + off, f->header.size);
     for(GList *o = names; o; o = g_list_next(o))
     {
       const dt_introspection_field_t *of = _field(m, o->data);
-      if(of && (o != n || _is_own_units(m, o->data)))
-        memcpy((uint8_t *)m->params + of->header.offset, wanted + of->header.offset, of->header.size);
+      if(!of || (o == n && !_is_own_units(m, o->data))) continue;
+      uint8_t *cur = (uint8_t *)m->params + of->header.offset;
+      if(memcmp(cur, wanted + of->header.offset, of->header.size))
+      {
+        memcpy(cur, wanted + of->header.offset, of->header.size);
+        put_back = TRUE;
+      }
     }
+  }
+  return put_back;
+}
+
+static void _run_gui_changed(dt_iop_module_t *m, const void *old, GList *names)
+{
+  const gboolean gui = _cur->gui && m->gui_changed && m->gui_data;
+  const dt_api_also_changed_t port = _cur->gui ? NULL : dt_api_also_changed_find(m->op);
+  if(!gui && !port) return;
+  _api_editing = TRUE;
+  // the controls show the new values first, as after a slider move
+  if(gui)
+  {
+    DT_ENTER_GUI_UPDATE();
+    dt_iop_gui_update(m);
+    DT_LEAVE_GUI_UPDATE();
+  }
+  uint8_t *wanted = g_malloc(m->params_size);
+  memcpy(wanted, m->params, m->params_size);
+  if(_gui_changed_pass(m, gui, port, old, names, wanted, FALSE))
+  {
+    // a setting put back after another's adjustment: once more from where
+    // things are, so that what follows from it does (channelmixerrgb's x, y
+    // from the temperature sent with the illuminant)
+    void *now = g_malloc(m->params_size);
+    memcpy(now, m->params, m->params_size);
+    _gui_changed_pass(m, gui, port, now, names, wanted, TRUE);
+    g_free(now);
   }
   g_free(wanted);
   _api_editing = FALSE;

@@ -646,18 +646,22 @@ void gui_init(dt_iop_module_t *self)
                         dt_iop_levels_scroll, self);
 
   GtkWidget *autobutton = gtk_button_new_with_label(_("auto"));
+  dt_action_define_iop(self, NULL, N_("auto levels"), autobutton, &dt_action_def_button);
   gtk_widget_set_tooltip_text(autobutton, _("apply auto levels"));
   g_signal_connect(G_OBJECT(autobutton), "clicked", G_CALLBACK(dt_iop_levels_autoadjust_callback), self);
 
   g->blackpick = dt_color_picker_new(self, DT_COLOR_PICKER_POINT, NULL);
+  dt_action_define_iop(self, N_("pickers"), N_("black"), g->blackpick, &dt_action_def_color_picker);
   gtk_widget_set_tooltip_text(g->blackpick, _("pick black point from image"));
   gtk_widget_set_name(GTK_WIDGET(g->blackpick), "picker-black");
 
   g->greypick = dt_color_picker_new(self, DT_COLOR_PICKER_POINT, NULL);
+  dt_action_define_iop(self, N_("pickers"), N_("gray"), g->greypick, &dt_action_def_color_picker);
   gtk_widget_set_tooltip_text(g->greypick, _("pick medium gray point from image"));
   gtk_widget_set_name(GTK_WIDGET(g->greypick), "picker-grey");
 
   g->whitepick = dt_color_picker_new(self, DT_COLOR_PICKER_POINT, NULL);
+  dt_action_define_iop(self, N_("pickers"), N_("white"), g->whitepick, &dt_action_def_color_picker);
   gtk_widget_set_tooltip_text(g->whitepick, _("pick white point from image"));
   gtk_widget_set_name(GTK_WIDGET(g->whitepick), "picker-white");
 

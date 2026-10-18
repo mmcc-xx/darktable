@@ -1132,9 +1132,9 @@ static JsonNode *_changed_settings(const dt_iop_module_t *m, const void *before)
 // some modules bind two controls to one setting and show only one of them,
 // e.g. local contrast's highlights and range, one per mode; its gui_changed
 // switches the mode by which control moved, so take the one shown
-static GtkWidget *_field_widget(dt_iop_module_t *m, const dt_introspection_field_t *f)
+static GtkWidget *_field_widget(dt_iop_module_t *m, const size_t offset)
 {
-  const void *field = (const uint8_t *)m->params + f->header.offset;
+  const void *field = (const uint8_t *)m->params + offset;
   GtkWidget *first = NULL;
   for(GSList *l = m->widget_list; l; l = g_slist_next(l))
   {
@@ -1173,6 +1173,22 @@ static gboolean _is_own_units(const dt_iop_module_t *m, const char *field)
 // the last daylight temperature over the one sent with it). in darktable's
 // window, and headless the same adjustments without the controls
 // (also_changed.c)
+// where a setting sent by name is in the params: a scalar, or one element of
+// a list (negadoctor's Dmin[0], which has a control of its own)
+static gboolean _setting_span(const dt_iop_module_t *m, const char *name, size_t *off, size_t *size)
+{
+  const dt_introspection_field_t *f = _field(m, name);
+  if(f)
+  {
+    *off = f->header.offset;
+    *size = f->header.size;
+    return TRUE;
+  }
+  f = _element(m, name, off);
+  if(f) *size = f->header.size;
+  return f != NULL;
+}
+
 // one pass over the settings sent: each changed one's adjustments, then the
 // other sent settings put back. TRUE when putting one back changed it, so
 // what was derived from it may be stale. all: every sent setting, changed
@@ -1183,28 +1199,27 @@ static gboolean _gui_changed_pass(dt_iop_module_t *m, const gboolean gui, const 
   gboolean put_back = FALSE;
   for(GList *n = names; n; n = g_list_next(n))
   {
-    const dt_introspection_field_t *f = _field(m, n->data);
-    if(!f) continue;
-    const size_t off = f->header.offset;
-    if(!all && !memcmp((const uint8_t *)ref + off, (const uint8_t *)m->params + off, f->header.size)) continue;
+    size_t off, size;
+    if(!_setting_span(m, n->data, &off, &size)) continue;
+    if(!all && !memcmp((const uint8_t *)ref + off, (const uint8_t *)m->params + off, size)) continue;
     if(gui)
     {
-      GtkWidget *w = _field_widget(m, f);
+      GtkWidget *w = _field_widget(m, off);
       if(!w) continue;
       m->gui_changed(m, w, (void *)((const uint8_t *)ref + off));
     }
     else
       port(m, n->data, ref);
     if(!_is_own_units(m, n->data))
-      memcpy(wanted + off, (const uint8_t *)m->params + off, f->header.size);
+      memcpy(wanted + off, (const uint8_t *)m->params + off, size);
     for(GList *o = names; o; o = g_list_next(o))
     {
-      const dt_introspection_field_t *of = _field(m, o->data);
-      if(!of || (o == n && !_is_own_units(m, o->data))) continue;
-      uint8_t *cur = (uint8_t *)m->params + of->header.offset;
-      if(memcmp(cur, wanted + of->header.offset, of->header.size))
+      size_t ooff, osize;
+      if(!_setting_span(m, o->data, &ooff, &osize) || (o == n && !_is_own_units(m, o->data))) continue;
+      uint8_t *cur = (uint8_t *)m->params + ooff;
+      if(memcmp(cur, wanted + ooff, osize))
       {
-        memcpy(cur, wanted + of->header.offset, of->header.size);
+        memcpy(cur, wanted + ooff, osize);
         put_back = TRUE;
       }
     }

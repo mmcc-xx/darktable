@@ -817,10 +817,11 @@ static void _add_field_value(JsonBuilder *b, const dt_introspection_field_t *f, 
 }
 
 // a list setting a client can address: an array (of arrays) of floats,
-// bools or enums at the top of the params struct. not arrays of structs
-// (curve nodes) or chars (strings), nor of integers: those are counts and
-// indexes into other lists (rgbcurve's curve_num_nodes), whose declared
-// range doesn't keep them inside the lists they count
+// bools, enums or uint16_t levels (rawprepare's black levels) at the top of
+// the params struct. not arrays of structs (curve nodes) or chars
+// (strings), nor of int: those are counts and indexes into other lists
+// (rgbcurve's curve_num_nodes), whose declared range doesn't keep them
+// inside the lists they count
 static gboolean _settable_list(const dt_introspection_field_t *f)
 {
   if(f->header.type != DT_INTROSPECTION_TYPE_ARRAY || strchr(f->header.name, '[') || strchr(f->header.name, '.'))
@@ -829,7 +830,8 @@ static gboolean _settable_list(const dt_introspection_field_t *f)
   while(e->header.type == DT_INTROSPECTION_TYPE_ARRAY) e = e->Array.field;
   const dt_introspection_type_t t = e->header.type;
   return t == DT_INTROSPECTION_TYPE_FLOAT || t == DT_INTROSPECTION_TYPE_DOUBLE
-         || t == DT_INTROSPECTION_TYPE_BOOL || t == DT_INTROSPECTION_TYPE_ENUM;
+         || t == DT_INTROSPECTION_TYPE_BOOL || t == DT_INTROSPECTION_TYPE_ENUM
+         || t == DT_INTROSPECTION_TYPE_USHORT;
 }
 
 static dt_introspection_field_t *_list_field(const dt_iop_module_t *m, const char *name)

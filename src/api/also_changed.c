@@ -537,6 +537,61 @@ static void _demosaic(dt_iop_module_t *m, const char *field, const void *old)
   *method = use_method;
 }
 
+// ---- raw black/white point (rawprepare.c) ------------------------------------
+
+static void _rawprepare(dt_iop_module_t *m, const char *field, const void *old)
+{
+  uint16_t *black = _P(uint16_t, m, "raw_black_level_separate");
+  if(!black) return;
+  const dt_image_t *img = &m->dev->image_storage;
+  const gboolean is_monochrome = (img->flags & (DT_IMAGE_MONOCHROME | DT_IMAGE_MONOCHROME_BAYER)) != 0;
+  // monochromes show one black level: the first is copied to the others
+  // through their sliders (integers, no rounding), which change nothing more
+  if(is_monochrome && _is(field, "raw_black_level_separate[0]"))
+    for(int i = 1; i < 4; i++) black[i] = black[0];
+  // sRAWs show three: the fourth is their mean. monochromes also have the
+  // sRAW flag set
+  const gboolean is_sraw = (img->flags & DT_IMAGE_S_RAW) != 0;
+  if(is_sraw && !is_monochrome
+     && (_is(field, "raw_black_level_separate[0]") || _is(field, "raw_black_level_separate[1]")
+         || _is(field, "raw_black_level_separate[2]")))
+  {
+    const float sum = (float)black[0] + (float)black[1] + (float)black[2];
+    black[3] = (uint16_t)roundf(sum / 3.0f);
+  }
+}
+
+// ---- highlight reconstruction (highlights.c) -----------------------------------
+
+enum
+{
+  _HIGHLIGHTS_CLIP = 0,
+  _HIGHLIGHTS_LCH = 1,
+  _HIGHLIGHTS_INPAINT = 2,
+  _HIGHLIGHTS_LAPLACIAN = 3,
+  _HIGHLIGHTS_SEGMENTS = 4,
+  _HIGHLIGHTS_OPPOSED = 5
+};
+
+static void _highlights(dt_iop_module_t *m, const char *field, const void *old)
+{
+  int *mode = _P(int, m, "mode");
+  if(!mode) return;
+  const dt_image_t *img = &m->dev->image_storage;
+  // the sensor is known once the image was loaded
+  if(!img->buf_dsc.channels) return;
+  // a method the image can't use is replaced, whatever was changed (gui_update
+  // runs this too)
+  const uint32_t filters = img->buf_dsc.filters;
+  const gboolean bayer = (filters != 0) && (filters != 9u);
+  if(!dt_image_is_rawprepare_supported(img) || (img->flags & DT_IMAGE_4BAYER))
+    *mode = _HIGHLIGHTS_CLIP;
+  if((!bayer && *mode == _HIGHLIGHTS_LAPLACIAN)
+     || (filters == 0
+         && (*mode == _HIGHLIGHTS_LCH || *mode == _HIGHLIGHTS_INPAINT || *mode == _HIGHLIGHTS_SEGMENTS)))
+    *mode = _HIGHLIGHTS_OPPOSED;
+}
+
 // ---- color harmonizer (colorharmonizer.c) ------------------------------------
 
 enum { _HARMONIZER_CUSTOM = 9, _HARMONIZER_MAX_NODES = 4, _HARMONIZER_LUT_STEPS = 720 };
@@ -940,6 +995,8 @@ static const struct { const char *op; dt_api_also_changed_t fn; } _ports[] = {
   { "colorzones", _colorzones },
   { "borders", _borders },
   { "demosaic", _demosaic },
+  { "rawprepare", _rawprepare },
+  { "highlights", _highlights },
   { "negadoctor", _negadoctor },
   { "ashift", _ashift },
   { "crop", _crop },

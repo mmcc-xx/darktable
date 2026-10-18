@@ -1,4 +1,4 @@
-# darktable-api (proof of concept)
+# darktable-api
 
 A long-running, headless darktable that edits photos in a darktable library
 on request: open a photo, change module settings by name, render previews,

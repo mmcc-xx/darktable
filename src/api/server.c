@@ -604,7 +604,17 @@ static gboolean _session_open(const dt_imgid_t imgid, const gboolean fresh,
   }
   const gint64 t0 = g_get_monotonic_time();
   _session_t *s = _session_find(imgid);
-  if(s && fresh && !s->gui)          // the darkroom's edit is reloaded there
+  if(s && fresh && s->gui)
+  {
+    // dt_dev_reload_history_items drops the steps the library doesn't hold
+    // but keeps the module instances they added, and the darkroom writes its
+    // edit there every autosave_interval seconds anyway: refused rather than
+    // reporting a reload that didn't happen
+    *err = _ERR(API_E_UNAVAILABLE, "fresh", "the photo in darktable's darkroom can't be reloaded as saved:"
+                " undo with history_end instead");
+    return FALSE;
+  }
+  if(s && fresh)
   {
     _session_close(s);
     s = NULL;
@@ -1137,11 +1147,30 @@ static GtkWidget *_field_widget(dt_iop_module_t *m, const dt_introspection_field
   return first;
 }
 
+// settings whose gui_changed only converts the control's own units into the
+// stored value: the slider writes EV and gui_changed stores 2^EV
+// (negadoctor.c gui_changed). the API sets the stored value, so the
+// conversion would apply twice
+static const struct { const char *op, *field; } _own_units[] = {
+  { "negadoctor", "exposure" },
+};
+
+static gboolean _is_own_units(const dt_iop_module_t *m, const char *field)
+{
+  for(size_t i = 0; i < G_N_ELEMENTS(_own_units); i++)
+    if(!g_strcmp0(m->op, _own_units[i].op) && !g_strcmp0(field, _own_units[i].field)) return TRUE;
+  return FALSE;
+}
+
 // as moving a control in the darkroom: the module's gui_changed runs for
 // each setting changed that has one, with its previous value, and may
 // adjust other settings (exposure leaves its automatic mode, agx moves its
-// pivot, ...). in darktable's window only: headless there is no module
-// window code to run
+// pivot, ...). a setting's own gui_changed may adjust it (borders snaps its
+// aspect, demosaic fits the method to the sensor), but the other settings of
+// the same call keep the client's values: gui_changed runs one setting at a
+// time and would otherwise undo them (channelmixerrgb's illuminant restores
+// the last daylight temperature over the one sent with it). in darktable's
+// window only: headless there is no module window code to run
 static void _run_gui_changed(dt_iop_module_t *m, const void *old, GList *names)
 {
   if(!_cur->gui || !m->gui_changed || !m->gui_data) return;
@@ -1150,6 +1179,8 @@ static void _run_gui_changed(dt_iop_module_t *m, const void *old, GList *names)
   DT_ENTER_GUI_UPDATE();
   dt_iop_gui_update(m);
   DT_LEAVE_GUI_UPDATE();
+  uint8_t *wanted = g_malloc(m->params_size);
+  memcpy(wanted, m->params, m->params_size);
   for(GList *n = names; n; n = g_list_next(n))
   {
     const dt_introspection_field_t *f = _field(m, n->data);
@@ -1157,8 +1188,18 @@ static void _run_gui_changed(dt_iop_module_t *m, const void *old, GList *names)
     const size_t off = f->header.offset;
     if(!memcmp((const uint8_t *)old + off, (const uint8_t *)m->params + off, f->header.size)) continue;
     GtkWidget *w = _field_widget(m, f);
-    if(w) m->gui_changed(m, w, (void *)((const uint8_t *)old + off));
+    if(!w) continue;
+    m->gui_changed(m, w, (void *)((const uint8_t *)old + off));
+    if(!_is_own_units(m, n->data))
+      memcpy(wanted + off, (const uint8_t *)m->params + off, f->header.size);
+    for(GList *o = names; o; o = g_list_next(o))
+    {
+      const dt_introspection_field_t *of = _field(m, o->data);
+      if(of && (o != n || _is_own_units(m, o->data)))
+        memcpy((uint8_t *)m->params + of->header.offset, wanted + of->header.offset, of->header.size);
+    }
   }
+  g_free(wanted);
   _api_editing = FALSE;
 }
 

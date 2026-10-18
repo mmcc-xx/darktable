@@ -209,6 +209,11 @@ static float _cm_cct(const float x, const float y)
   return t;
 }
 
+float dt_api_cct(const float x, const float y)
+{
+  return _cm_cct(x, y);
+}
+
 static void _cm_from_camera(dt_iop_module_t *m, float *x, float *y, float *temperature, int *adaptation)
 {
   dt_aligned_pixel_t wb;

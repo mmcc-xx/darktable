@@ -10615,6 +10615,12 @@ static gboolean _picker_apply_headless(JsonObject *params, JsonBuilder *b, gchar
               " with darktable's window serving the API (library_status: darkroom_imgid)", m->op);
     return FALSE;
   }
+  const char *why = pk->unavailable ? pk->unavailable(m) : NULL;
+  if(why)
+  {
+    *err = _ERRF(API_E_UNAVAILABLE, "control", "%s: %s", m->op, why);
+    return FALSE;
+  }
   float area[4] = { 0.f };
   gboolean point = FALSE;
   if(!_parse_area(params, area, &point, err)) return FALSE;

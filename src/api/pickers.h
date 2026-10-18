@@ -33,6 +33,9 @@ typedef struct dt_api_pick_t
 typedef void (*dt_api_picker_apply_t)(dt_iop_module_t *m, struct dt_dev_pixelpipe_t *pipe,
                                       const dt_api_pick_t *pick);
 
+// why the picker can't be pressed now (darktable hides it), NULL when it can
+typedef const char *(*dt_api_picker_unavailable_t)(const dt_iop_module_t *m);
+
 typedef struct dt_api_picker_t
 {
   const char *op;
@@ -40,6 +43,7 @@ typedef struct dt_api_picker_t
   dt_iop_colorspace_type_t cst;   // the picker's color space; IOP_CS_NONE: the module's default
   gboolean denoise;               // DT_COLOR_PICKER_DENOISE
   dt_api_picker_apply_t apply;
+  dt_api_picker_unavailable_t unavailable;  // NULL: always shown
 } dt_api_picker_t;
 
 // the module's pickers ported headless, in order: the n-th, NULL past the

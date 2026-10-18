@@ -35,3 +35,7 @@ gboolean dt_api_ashift_fit_crop(dt_iop_module_t *ashift);
 // for the picker ports (pickers.c): exposure's _exposure_set_white, the
 // slider value that maps white to 1 with black kept below it
 void dt_api_exposure_set_white(dt_iop_module_t *exposure, const float white);
+
+// color calibration's correlated color temperature of an illuminant x, y
+// (_check_if_close_to_daylight), as its temperature setting holds it
+float dt_api_cct(const float x, const float y);

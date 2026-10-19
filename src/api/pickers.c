@@ -1027,6 +1027,41 @@ static const char *_colorharmonizer_unavailable(const dt_iop_module_t *m)
   return rule && *rule == 9 ? "the picker is hidden while the harmony rule is \"custom\"" : NULL;
 }
 
+// color_picker_apply, custom hue i: as the anchor hue, into custom_hue[i]
+static void _colorharmonizer_custom(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick, int i)
+{
+  float *custom_hue = _P(float, m, "custom_hue");
+  float hue = 0.0f;
+  if(!custom_hue || !_colorharmonizer_hue(pipe, pick, &hue)) return;
+  custom_hue[i] = hue;
+}
+
+// darktable shows custom hue i only with the custom rule, and for the first
+// num_custom_nodes nodes, clamped to 2-4 (_update_visibility)
+static const char *_colorharmonizer_custom_unavailable(const dt_iop_module_t *m, int i)
+{
+  const int *rule = _P(int, m, "rule");
+  const int *nodes = _P(int, m, "num_custom_nodes");
+  if(!rule || *rule != 9) return "the picker is shown only while the harmony rule is \"custom\"";
+  if(nodes && i >= CLAMP(*nodes, 2, 4)) return "the picker is hidden: its node is beyond the module's \"nodes\" count";
+  return NULL;
+}
+
+#define _COLORHARMONIZER_CUSTOM(i)                                                                           \
+  static void _colorharmonizer_custom##i(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick) \
+  {                                                                                                          \
+    _colorharmonizer_custom(m, pipe, pick, i);                                                               \
+  }                                                                                                          \
+  static const char *_colorharmonizer_custom##i##_unavailable(const dt_iop_module_t *m)                     \
+  {                                                                                                          \
+    return _colorharmonizer_custom_unavailable(m, i);                                                        \
+  }
+_COLORHARMONIZER_CUSTOM(0)
+_COLORHARMONIZER_CUSTOM(1)
+_COLORHARMONIZER_CUSTOM(2)
+_COLORHARMONIZER_CUSTOM(3)
+#undef _COLORHARMONIZER_CUSTOM
+
 // ---- color equalizer (colorequal.c) -----------------------------------------
 
 // color_picker_apply, white level: the luminance Y (D65) of the area's
@@ -1643,6 +1678,10 @@ static const dt_api_picker_t _pickers[] = {
   { "colorbalancergb", "contrast gray fulcrum", IOP_CS_NONE, FALSE, _cbrgb_grey_fulcrum },
   { "colorequal", "white level", IOP_CS_NONE, FALSE, _colorequal_white_level },
   { "colorharmonizer", "anchor hue", IOP_CS_NONE, FALSE, _colorharmonizer_anchor, _colorharmonizer_unavailable },
+  { "colorharmonizer", "custom hue 1", IOP_CS_NONE, FALSE, _colorharmonizer_custom0, _colorharmonizer_custom0_unavailable },
+  { "colorharmonizer", "custom hue 2", IOP_CS_NONE, FALSE, _colorharmonizer_custom1, _colorharmonizer_custom1_unavailable },
+  { "colorharmonizer", "custom hue 3", IOP_CS_NONE, FALSE, _colorharmonizer_custom2, _colorharmonizer_custom2_unavailable },
+  { "colorharmonizer", "custom hue 4", IOP_CS_NONE, FALSE, _colorharmonizer_custom3, _colorharmonizer_custom3_unavailable },
   { "colorize", "hue", IOP_CS_NONE, FALSE, _colorize },
   { "colorzones", "pickers/create curve", IOP_CS_LCH, FALSE, _colorzones_create_curve },
   { "exposure", "exposure", IOP_CS_NONE, FALSE, _exposure },

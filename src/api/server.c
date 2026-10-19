@@ -1197,6 +1197,19 @@ static gboolean _setting_span(const dt_iop_module_t *m, const char *name, size_t
   return f != NULL;
 }
 
+// what is put back after an adjustment: a setting's span, or a whole list
+// sent at once (colorharmonizer's custom_hue with its rule), which has no
+// gui_changed of its own but must not be left to another setting's
+static gboolean _sent_span(const dt_iop_module_t *m, const char *name, size_t *off, size_t *size)
+{
+  if(_setting_span(m, name, off, size)) return TRUE;
+  const dt_introspection_field_t *f = _list_field(m, name);
+  if(!f) return FALSE;
+  *off = f->header.offset;
+  *size = f->header.size;
+  return TRUE;
+}
+
 // one pass over the settings sent: each changed one's adjustments, then the
 // other sent settings put back. TRUE when putting one back changed it, so
 // what was derived from it may be stale. all: every sent setting, changed
@@ -1223,7 +1236,7 @@ static gboolean _gui_changed_pass(dt_iop_module_t *m, const gboolean gui, const 
     for(GList *o = names; o; o = g_list_next(o))
     {
       size_t ooff, osize;
-      if(!_setting_span(m, o->data, &ooff, &osize) || (o == n && !_is_own_units(m, o->data))) continue;
+      if(!_sent_span(m, o->data, &ooff, &osize) || (o == n && !_is_own_units(m, o->data))) continue;
       uint8_t *cur = (uint8_t *)m->params + ooff;
       if(memcmp(cur, wanted + ooff, osize))
       {

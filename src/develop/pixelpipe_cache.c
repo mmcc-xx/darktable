@@ -137,15 +137,20 @@ static dt_hash_t _dev_pixelpipe_cache_basichash(dt_dev_pixelpipe_t *pipe,
     if(!skipped && included)
     {
       hash = dt_hash(hash, &piece->hash, sizeof(piece->hash));
-      if(piece->module->request_color_pick != DT_REQUEST_COLORPICK_OFF && roi)
+      const dt_colorpicker_sample_t *sample =
+        pipe->picker ? (pipe->picker->module == piece->module ? pipe->picker->sample : NULL)
+        : piece->module->request_color_pick != DT_REQUEST_COLORPICK_OFF
+          ? darktable.lib->proxy.colorpicker.primary_sample
+          : NULL;
+      if(sample && roi)
       {
-        if(darktable.lib->proxy.colorpicker.primary_sample->size == DT_LIB_COLORPICKER_SIZE_BOX)
+        if(sample->size == DT_LIB_COLORPICKER_SIZE_BOX)
         {
-          hash = dt_hash(hash, darktable.lib->proxy.colorpicker.primary_sample->box, sizeof(dt_pickerbox_t));
+          hash = dt_hash(hash, sample->box, sizeof(dt_pickerbox_t));
         }
-        else if(darktable.lib->proxy.colorpicker.primary_sample->size == DT_LIB_COLORPICKER_SIZE_POINT)
+        else if(sample->size == DT_LIB_COLORPICKER_SIZE_POINT)
         {
-          hash = dt_hash(hash, darktable.lib->proxy.colorpicker.primary_sample->point, 2 * sizeof(float));
+          hash = dt_hash(hash, sample->point, 2 * sizeof(float));
         }
       }
     }

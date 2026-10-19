@@ -200,6 +200,19 @@ typedef struct dt_dev_detail_mask_t
   size_t size;
 } dt_dev_detail_mask_t;
 
+// a pipe asked to pick for one module without the darkroom's picker:
+// the module's input is sampled, and its output if sample->pick_output,
+// as the preview pipe samples them for the module whose picker is
+// active, into module->picked_color and friends. the area is that of
+// sample, in fractions of this pipe's input, and cst is the picker's
+// color space (dt_iop_color_picker_t.picker_cst)
+typedef struct dt_dev_pixelpipe_picker_t
+{
+  const struct dt_iop_module_t *module;
+  const struct dt_colorpicker_sample_t *sample;
+  dt_iop_colorspace_type_t cst;
+} dt_dev_pixelpipe_picker_t;
+
 /**
  * this encapsulates the pixelpipe.
  * a develop module will need several of these:
@@ -260,6 +273,8 @@ typedef struct dt_dev_pixelpipe_t
 
   // avoid cached data for processed module
   gboolean nocache;
+  // a module picking on this pipe instead of the darkroom's, or NULL
+  const dt_dev_pixelpipe_picker_t *picker;
 
   dt_imgid_t output_imgid;
   /* Testing for shutting down and a running pixelpipe

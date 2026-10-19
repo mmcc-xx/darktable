@@ -392,6 +392,7 @@ void dt_color_picker_transform_box(dt_develop_t *dev,
 
 // calculate box in current module's coordinates for the color picker
 gboolean dt_color_picker_box(dt_iop_module_t *module,
+                             dt_dev_pixelpipe_t *pipe,
                              const dt_iop_roi_t *roi,
                              const dt_colorpicker_sample_t *const sample,
                              dt_pixelpipe_picker_source_t picker_source,
@@ -401,9 +402,8 @@ gboolean dt_color_picker_box(dt_iop_module_t *module,
      && !sample->pick_output)
     return TRUE;
 
-  dt_develop_t *dev = darktable.develop;
-  const float wd = dev->preview_pipe->iwidth;
-  const float ht = dev->preview_pipe->iheight;
+  const float wd = pipe->iwidth;
+  const float ht = pipe->iheight;
 
   const int width = roi->width;
   const int height = roi->height;
@@ -423,7 +423,7 @@ gboolean dt_color_picker_box(dt_iop_module_t *module,
 
   const gboolean expanded = module->flags() & IOP_FLAGS_EXPAND_ROI_IN;
   const gboolean input = picker_source == PIXELPIPE_PICKER_INPUT;
-  dt_dev_distort_transform_plus(dev, dev->preview_pipe,
+  dt_dev_distort_transform_plus(module->dev, pipe,
                                 module->iop_order - (expanded && input ? 1 : 0),
                                 input ? DT_DEV_TRANSFORM_DIR_BACK_INCL : DT_DEV_TRANSFORM_DIR_BACK_EXCL,
                                 fbox, 4);

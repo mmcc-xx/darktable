@@ -22,6 +22,7 @@
 #include "libs/colorpicker.h"
 
 struct dt_iop_buffer_dsc_t;
+struct dt_dev_pixelpipe_t;
 struct dt_iop_roi_t;
 enum dt_iop_colorspace_type_t;
 
@@ -41,6 +42,7 @@ void dt_color_picker_transform_box(dt_develop_t *dev,
                                    float *out,
                                    gboolean scale);
 gboolean dt_color_picker_box(dt_iop_module_t *module,
+                             struct dt_dev_pixelpipe_t *pipe,
                              const dt_iop_roi_t *roi,
                              const dt_colorpicker_sample_t *const sample,
                              dt_pixelpipe_picker_source_t picker_source,

@@ -292,6 +292,7 @@ static gboolean _dev_pixelpipe_init_cached(dt_dev_pixelpipe_t *pipe,
   pipe->backbuf_scale = 0.0f;
   memset(pipe->backbuf_zoom_pos, 0, sizeof(dt_dev_zoom_pos_t));
   pipe->output_imgid = NO_IMGID;
+  pipe->picker = NULL;
 
   memset(&pipe->scharr, 0, sizeof(dt_dev_detail_mask_t));
   pipe->want_detail_mask = FALSE;
@@ -1168,6 +1169,28 @@ static void _histogram_collect_cl(const int devid,
 #endif
 
 
+// the area and color space a module picks with on pipe: those asked
+// for on the pipe, or the darkroom's picker
+static const dt_colorpicker_sample_t *_picker_sample(const dt_dev_pixelpipe_t *pipe)
+{
+  return pipe->picker ? pipe->picker->sample : darktable.lib->proxy.colorpicker.primary_sample;
+}
+
+static dt_iop_colorspace_type_t _picker_cst(const dt_dev_pixelpipe_t *pipe,
+                                            dt_iop_module_t *module)
+{
+  return pipe->picker ? pipe->picker->cst : dt_iop_color_picker_get_active_cst(module);
+}
+
+// the darkroom's picker applies its sample (color_picker_proxy.c); one
+// asked for on the pipe is read by whoever asked, once the pipe has run
+static void _picker_data_ready(dt_iop_module_t *module,
+                               dt_dev_pixelpipe_t *pipe)
+{
+  if(!pipe->picker)
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_PICKERDATA_READY, module, pipe);
+}
+
 // color picking for module
 // FIXME: make called with: lib_colorpicker_sample_statistics pick
 static void _pixelpipe_picker(dt_iop_module_t *module,
@@ -1183,11 +1206,11 @@ static void _pixelpipe_picker(dt_iop_module_t *module,
 {
   int box[4] = { 0 };
   lib_colorpicker_stats pick;
+  dt_dev_pixelpipe_t *pipe = piece->pipe;
+  const dt_colorpicker_sample_t *const sample = _picker_sample(pipe);
 
   const gboolean nobox =
-    dt_color_picker_box(module, roi,
-                        darktable.lib->proxy.colorpicker.primary_sample,
-                        picker_source, box);
+    dt_color_picker_box(module, pipe, roi, sample, picker_source, box);
   if(!nobox)
   {
     dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_PICKER,
@@ -1199,17 +1222,17 @@ static void _pixelpipe_picker(dt_iop_module_t *module,
                   dt_iop_colorspace_to_name(dsc->cst),
                   dsc->temperature.coeffs[0], dsc->temperature.coeffs[1], dsc->temperature.coeffs[2],
                   dt_iop_colorspace_to_name(image_cst),
-                  dt_iop_colorspace_to_name(dt_iop_color_picker_get_active_cst(module)),
-                  darktable.lib->proxy.colorpicker.primary_sample->denoise
+                  dt_iop_colorspace_to_name(_picker_cst(pipe, module)),
+                  sample->denoise
                     ? "denoised "
                     : "",
                   box[0], box[1], box[2], box[3]);
 
     dt_color_picker_helper(dsc, pixel, roi, box,
-                           darktable.lib->proxy.colorpicker.primary_sample->denoise,
+                           sample->denoise,
                            pick, image_cst,
-                           dt_iop_color_picker_get_active_cst(module),
-                           dt_ioppr_get_pipe_current_profile_info(module, piece->pipe));
+                           _picker_cst(pipe, module),
+                           dt_ioppr_get_pipe_current_profile_info(module, pipe));
   }
 
   for_four_channels(k)
@@ -1245,6 +1268,8 @@ static void _pixelpipe_picker_cl(const int devid,
                                  const dt_pixelpipe_picker_source_t picker_source)
 {
   int box[4] = { 0 };
+  dt_dev_pixelpipe_t *pipe = piece->pipe;
+  const dt_colorpicker_sample_t *const sample = _picker_sample(pipe);
 
   // make sure we return safe data in case of errors
   for_four_channels(k)
@@ -1254,9 +1279,7 @@ static void _pixelpipe_picker_cl(const int devid,
     picked_color[k] = 0.0f;
   }
 
-  if(dt_color_picker_box(module, roi,
-                         darktable.lib->proxy.colorpicker.primary_sample,
-                         picker_source, box))
+  if(dt_color_picker_box(module, pipe, roi, sample, picker_source, box))
     return;
 
   const size_t origin[2] = { box[0], box[1] };
@@ -1298,8 +1321,8 @@ static void _pixelpipe_picker_cl(const int devid,
                 dt_iop_colorspace_to_name(dsc->cst),
                 dsc->temperature.coeffs[0], dsc->temperature.coeffs[1], dsc->temperature.coeffs[2],
                 dt_iop_colorspace_to_name(image_cst),
-                dt_iop_colorspace_to_name(dt_iop_color_picker_get_active_cst(module)),
-                darktable.lib->proxy.colorpicker.primary_sample->denoise
+                dt_iop_colorspace_to_name(_picker_cst(pipe, module)),
+                sample->denoise
                   ? "denoised "
                   : "",
                 box[0], box[1], box[2], box[3]);
@@ -1318,10 +1341,10 @@ static void _pixelpipe_picker_cl(const int devid,
   lib_colorpicker_stats pick;
 
   dt_color_picker_helper(dsc, pixel, &roi_copy, box,
-                         darktable.lib->proxy.colorpicker.primary_sample->denoise,
+                         sample->denoise,
                          pick, image_cst,
-                         dt_iop_color_picker_get_active_cst(module),
-                         dt_ioppr_get_pipe_current_profile_info(module, piece->pipe));
+                         _picker_cst(pipe, module),
+                         dt_ioppr_get_pipe_current_profile_info(module, pipe));
 
   for_four_channels(k)
   {
@@ -1365,7 +1388,8 @@ static void _pixelpipe_pick_samples(dt_develop_t *dev,
     int box[4];
     dt_colorpicker_sample_t *sample = samples->data;
     if(!sample->locked &&
-       !dt_color_picker_box(module, roi_in, sample, PIXELPIPE_PICKER_INPUT, box))
+       !dt_color_picker_box(module, dev->preview_pipe, roi_in, sample,
+                            PIXELPIPE_PICKER_INPUT, box))
     {
       // pixel input is in display profile, hence the sample output will be as well
       dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_PICKER,
@@ -1408,6 +1432,10 @@ static gboolean _request_color_pick(const dt_dev_pixelpipe_t *pipe,
                                     const dt_develop_t *dev,
                                     const dt_iop_module_t *module)
 {
+  // a pipe asked to pick for one module picks for none other
+  if(pipe->picker)
+    return module == pipe->picker->module;
+
   // Does the current active module need a picker?
   return
     // pick from preview pipe to get pixels outside the viewport
@@ -1914,7 +1942,7 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
                       module->picked_output_color_max,
                       pipe->dsc.cst, PIXELPIPE_PICKER_OUTPUT);
 
-    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_PICKERDATA_READY, module, pipe);
+    _picker_data_ready(module, pipe);
   }
 
   // blend needs input/output images with default colorspace
@@ -1948,7 +1976,7 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
                         module->picked_output_color_min,
                         module->picked_output_color_max,
                         blend_cst, PIXELPIPE_PICKER_OUTPUT);
-      DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_PICKERDATA_READY, module, pipe);
+      _picker_data_ready(module, pipe);
     }
   }
 
@@ -2908,7 +2936,7 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
                                module->picked_output_color_max,
                                *output, outbufsize, pipe->dsc.cst,
                                PIXELPIPE_PICKER_OUTPUT);
-          DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_PICKERDATA_READY, module, pipe);
+          _picker_data_ready(module, pipe);
         }
 
         // blend needs input/output images with default colorspace
@@ -2950,7 +2978,7 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
                                module->picked_output_color_max,
                                *output, outbufsize, blend_cst,
                                PIXELPIPE_PICKER_OUTPUT);
-            DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_PICKERDATA_READY, module, pipe);
+            _picker_data_ready(module, pipe);
           }
         }
 
@@ -3056,7 +3084,7 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
                             module->picked_output_color_max,
                             pipe->dsc.cst,
                             PIXELPIPE_PICKER_OUTPUT);
-          DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_PICKERDATA_READY, module, pipe);
+          _picker_data_ready(module, pipe);
         }
 
         // blend needs input/output images with default colorspace
@@ -3091,7 +3119,7 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
                               module->picked_output_color_max,
                               blend_cst,
                               PIXELPIPE_PICKER_OUTPUT);
-            DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_PICKERDATA_READY, module, pipe);
+            _picker_data_ready(module, pipe);
           }
         }
 

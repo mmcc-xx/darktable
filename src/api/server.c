@@ -10214,10 +10214,18 @@ static void _pick_end(_job_t *j, const _job_state_t state, const char *error)
   JsonNode *sample = m && j->picker && state == _JOB_DONE
     ? _pick_node(dt_iop_color_picker_get_active_cst(m), m->picked_color, m->picked_color_min, m->picked_color_max)
     : NULL;
+  // and of its output, for a picker that samples it (DT_COLOR_PICKER_IO)
+  const dt_iop_color_picker_t *proxy = darktable.lib->proxy.colorpicker.picker_proxy;
+  JsonNode *output = sample && proxy && proxy->module == m && (proxy->flags & DT_COLOR_PICKER_IO)
+    ? _pick_node(dt_iop_color_picker_get_active_cst(m), m->picked_output_color, m->picked_output_color_min,
+                 m->picked_output_color_max)
+    : NULL;
   if(m && j->picker) dt_iop_color_picker_reset(m, FALSE);
   if(m && state == _JOB_DONE) j->result = _changed_settings(m, j->before);
   if(sample && j->result) json_object_set_member(json_node_get_object(j->result), "sample", sample);
   else if(sample) json_node_unref(sample);
+  if(output && j->result) json_object_set_member(json_node_get_object(j->result), "output_sample", output);
+  else if(output) json_node_unref(output);
   if(j->watch) g_source_remove(j->watch);
   j->watch = 0;
   if(error) j->error = g_strdup(error);
@@ -10436,16 +10444,6 @@ static gboolean _parse_area(JsonObject *params, float box[4], gboolean *point, g
 // takes it (pixelpipe_hb.c, _pixelpipe_picker), and the module's port
 // (pickers.c) applies it
 
-// the mean of the two lowest and of the two highest of four values
-// (color_picker.c, _sort_coordinates and dt_color_picker_box)
-static void _pick_edges(const float v0, const float v1, const float v2, const float v3, float *lo, float *hi)
-{
-  float v[4] = { v0, v1, v2, v3 };
-  qsort(v, 4, sizeof(float), _cmp_float);
-  *lo = 0.5f * (v[0] + v[1]);
-  *hi = 0.5f * (v[2] + v[3]);
-}
-
 static void _add_pick(JsonBuilder *b, const char *name, const float *v)
 {
   json_builder_set_member_name(b, name);
@@ -10486,11 +10484,13 @@ static dt_dev_pixelpipe_iop_t *_piece_in(dt_dev_pixelpipe_t *pipe, const dt_iop_
 
 // the sample of module m's picker pk over area (a box, or a point in
 // area[0..1]; fractions of the image as rendered), in the picker's color
-// space (*cst). taken from a preview pipe of the session's edit, as
-// darktable's window takes it from its own: the input is the mipmap the
-// preview renders (DT_MIPMAP_F, the raw binned to fit 1440x900), processed
-// at scale 1 (develop.c, _dev_process_image_job), so the pixels a point or
-// a box's min/max read are those the window reads
+// space (*cst): its input, and its output when pk->output. taken by a
+// preview pipe of the session's edit as darktable's window takes it from
+// its own (pixelpipe_hb.c, _pixelpipe_picker, asked for through
+// dt_dev_pixelpipe_t.picker): the input is the mipmap the preview renders
+// (DT_MIPMAP_F, the raw binned to fit 1440x900), processed whole at
+// scale 1 (develop.c, _dev_process_image_job), so the pixels a point or a
+// box's min/max read are those the window reads
 static gboolean _pick_sample(_session_t *s, dt_iop_module_t *m, const dt_api_picker_t *pk, const float area[4],
                              const gboolean point, dt_api_pick_t *pick, dt_iop_colorspace_type_t *cst, gchar **err)
 {
@@ -10511,87 +10511,73 @@ static gboolean _pick_sample(_session_t *s, dt_iop_module_t *m, const dt_api_pic
   dt_dev_pixelpipe_synch_all(&pp, s->dev);
   dt_dev_pixelpipe_get_dimensions(&pp, s->dev, pp.iwidth, pp.iheight, &pp.processed_width, &pp.processed_height);
   gboolean ok = FALSE;
-  float *buf = NULL;
   dt_dev_pixelpipe_iop_t *piece = _piece_in(&pp, m);
-  if(!piece || piece->buf_in.width <= 0 || piece->buf_in.height <= 0 || pp.iwidth <= 0 || pp.iheight <= 0)
+  if(!piece || pp.processed_width <= 0 || pp.processed_height <= 0 || pp.iwidth <= 0 || pp.iheight <= 0)
   {
     *err = g_strdup_printf("module '%s' gets no image to sample", m->op);
     goto done;
   }
+  // pressing a picker switches its module on (color_picker_proxy.c)
+  piece->enabled = TRUE;
   // the area in picker space, the pipe's input, as the window keeps it
-  // (dt_color_picker_backtransform_box): corners, or the point four times
+  // (dt_color_picker_backtransform_box): corners, or the point
+  dt_colorpicker_sample_t sample = { 0 };
+  sample.size = point ? DT_LIB_COLORPICKER_SIZE_POINT : DT_LIB_COLORPICKER_SIZE_BOX;
+  sample.denoise = pk->denoise;
+  sample.pick_output = pk->output;
   const int n = point ? 1 : 4;
-  float pts[8];
+  float *pts = point ? sample.point : sample.box;
   for(int i = 0; i < n; i++)
   {
     pts[2 * i] = pp.processed_width * area[(i % 3 > 0) * 2];
     pts[2 * i + 1] = pp.processed_height * area[(i % 2) * 2 + 1];
   }
   dt_dev_distort_backtransform_plus(s->dev, &pp, 0, DT_DEV_TRANSFORM_DIR_ALL, pts, n);
-  for(int i = 0; i < 4; i++)
+  for(int i = 0; i < n; i++)
   {
-    const int k = point ? 0 : i;
-    pts[2 * i] = pp.iwidth * CLIP(pts[2 * k] / pp.iwidth);
-    pts[2 * i + 1] = pp.iheight * CLIP(pts[2 * k + 1] / pp.iheight);
+    pts[2 * i] = CLIP(pts[2 * i] / pp.iwidth);
+    pts[2 * i + 1] = CLIP(pts[2 * i + 1] / pp.iheight);
   }
-  // then where the module gets its input (dt_color_picker_box)
-  const gboolean expanded = m->flags() & IOP_FLAGS_EXPAND_ROI_IN;
-  dt_dev_distort_transform_plus(s->dev, &pp, m->iop_order - (expanded ? 1 : 0), DT_DEV_TRANSFORM_DIR_BACK_INCL,
-                                pts, 4);
-  float fbox[4];
-  _pick_edges(pts[0], pts[2], pts[4], pts[6], &fbox[0], &fbox[2]);
-  _pick_edges(pts[1], pts[3], pts[5], pts[7], &fbox[1], &fbox[3]);
-  const int width = piece->buf_in.width, height = piece->buf_in.height;
-  int box[4];
-  for(int k = 0; k < 4; k++) box[k] = fbox[k];
-  box[2] = MAX(box[2], box[0] + 1);
-  box[3] = MAX(box[3], box[1] + 1);
-  if(box[0] >= width || box[1] >= height || box[2] < 0 || box[3] < 0)
+  // the picker's color space as darktable's picker has it (_init_picker)
+  *cst = pk->cst != IOP_CS_NONE || pk->fixed_cst ? pk->cst : m->default_colorspace(m, NULL, NULL);
+  const dt_dev_pixelpipe_picker_t picker = { m, &sample, *cst };
+  pp.picker = &picker;
+  for_four_channels(k)
   {
-    *err = _ERR(API_E_PARAMS, NULL, "the area is outside the image the module gets");
-    goto done;
+    m->picked_color_min[k] = m->picked_output_color_min[k] = FLT_MAX;
+    m->picked_color_max[k] = m->picked_output_color_max[k] = -FLT_MAX;
   }
-  box[0] = CLAMP(box[0], 0, width - 1);
-  box[1] = CLAMP(box[1], 0, height - 1);
-  box[2] = CLAMP(box[2], 1, width);
-  box[3] = CLAMP(box[3], 1, height);
-  // rendered with a margin: a region of a few pixels comes out black
-  // (demosaic needs its neighbors)
-  const int margin = 16;
-  const int x = MAX(0, box[0] - margin), y = MAX(0, box[1] - margin);
-  const int w = MIN(width, box[2] + margin) - x, h = MIN(height, box[3] + margin) - y;
-  buf = _render_before(s->dev, &pp, m, x, y, w, h, 1.0f);
-  piece = _piece_in(&pp, m);
-  if(!buf || !piece)
+  if(dt_dev_pixelpipe_process(&pp, s->dev, 0, 0, pp.processed_width, pp.processed_height, 1.0f, DT_DEVICE_NONE))
   {
     *err = g_strdup("could not render the image where the module gets it");
     goto done;
   }
-  // the capture is in working RGB: in the module's input color space, as
-  // the pipe hands it to the module
-  const dt_iop_order_iccprofile_info_t *const profile = dt_ioppr_get_pipe_current_profile_info(m, &pp);
-  const dt_iop_colorspace_type_t cst_in = m->input_colorspace(m, &pp, piece);
-  dt_iop_colorspace_type_t cst_buf = cst_in == IOP_CS_RAW ? IOP_CS_RAW : IOP_CS_RGB;
-  if(cst_buf != cst_in)
-    dt_ioppr_transform_image_colorspace(m, buf, buf, w, h, cst_buf, cst_in, &cst_buf, profile);
-  *cst = pk->cst != IOP_CS_NONE ? pk->cst : m->default_colorspace(m, NULL, NULL);
-  dt_iop_buffer_dsc_t dsc = piece->dsc_in;
-  dsc.channels = 4;
-  dsc.datatype = TYPE_FLOAT;
-  dsc.cst = cst_buf;
-  const dt_iop_roi_t roi = { x, y, w, h, 1.0f };
-  const int inner[4] = { box[0] - x, box[1] - y, box[2] - x, box[3] - y };
-  lib_colorpicker_stats stats;
-  dt_color_picker_helper(&dsc, buf, &roi, inner, pk->denoise, stats, cst_buf, *cst, profile);
+  // no channel sampled: no box where the module gets the image
+  // (_pixelpipe_picker). a point on a raw mosaic samples one channel
+  gboolean in = FALSE, out = !pk->output;
+  for(int k = 0; k < 3; k++)
+  {
+    in |= m->picked_color_max[k] >= m->picked_color_min[k];
+    out |= m->picked_output_color_max[k] >= m->picked_output_color_min[k];
+  }
+  if(!in || !out)
+  {
+    *err = _ERR(API_E_PARAMS, NULL, "the area is outside the image the module gets");
+    goto done;
+  }
   for_four_channels(k)
   {
-    pick->mean[k] = stats[DT_PICK_MEAN][k];
-    pick->min[k] = stats[DT_PICK_MIN][k];
-    pick->max[k] = stats[DT_PICK_MAX][k];
+    pick->mean[k] = m->picked_color[k];
+    pick->min[k] = m->picked_color_min[k];
+    pick->max[k] = m->picked_color_max[k];
+    pick->output_mean[k] = m->picked_output_color[k];
+    pick->output_min[k] = m->picked_output_color_min[k];
+    pick->output_max[k] = m->picked_output_color_max[k];
   }
+  // a fixed IOP_CS_NONE takes the pixels as they come (temperature's raw)
+  if(*cst == IOP_CS_NONE) *cst = piece->dsc_in.cst;
   ok = TRUE;
 done:
-  dt_free_align(buf);
   dt_dev_pixelpipe_cleanup(&pp);
   dt_mipmap_cache_release(&mb);
   return ok;
@@ -10649,6 +10635,9 @@ static gboolean _picker_apply_headless(JsonObject *params, JsonBuilder *b, gchar
   j->state = _JOB_DONE;
   j->result = _changed_settings(m, before);
   json_object_set_member(json_node_get_object(j->result), "sample", _pick_node(cst, pick.mean, pick.min, pick.max));
+  if(pk->output)
+    json_object_set_member(json_node_get_object(j->result), "output_sample",
+                           _pick_node(cst, pick.output_mean, pick.output_min, pick.output_max));
   g_free(before);
   _jobs = g_list_append(_jobs, j);
   _add_job(b, j);

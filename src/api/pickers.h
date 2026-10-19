@@ -22,10 +22,12 @@
 
 // a picker's sample of the module's input, in the picker's color space, as
 // the pipe gives it to the module (dt_iop_module_t: picked_color,
-// picked_color_min, picked_color_max)
+// picked_color_min, picked_color_max), and of its output for a picker
+// with DT_COLOR_PICKER_IO (picked_output_color...)
 typedef struct dt_api_pick_t
 {
   dt_aligned_pixel_t mean, min, max;
+  dt_aligned_pixel_t output_mean, output_min, output_max;
 } dt_api_pick_t;
 
 // what a module's color_picker_apply does with a sample, headless: writes
@@ -44,6 +46,8 @@ typedef struct dt_api_picker_t
   gboolean denoise;               // DT_COLOR_PICKER_DENOISE
   dt_api_picker_apply_t apply;
   dt_api_picker_unavailable_t unavailable;  // NULL: always shown
+  gboolean output;                // DT_COLOR_PICKER_IO: samples the output too
+  gboolean fixed_cst;             // dt_color_picker_new_with_cst: cst even when IOP_CS_NONE
 } dt_api_picker_t;
 
 // the module's pickers ported headless, in order: the n-th, NULL past the

@@ -1244,6 +1244,77 @@ static void _rgbcurve_create_curve(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe,
                        curve[1].y + increment + (curve[3].y - curve[1].y) / 2.f);
 }
 
+// ---- white balance (temperature.c) -----------------------------------------
+
+// color_picker_apply: coefficients that make the area's mean neutral,
+// green normalized to 1, then the preset "from image area" (_update_preset,
+// which drops the late correction). the sample is the module's input as the
+// pipe gives it, the raw mosaic for a raw (picker color space IOP_CS_NONE)
+static void _temperature(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick)
+{
+  float *pcoeffs = _P(float, m, "red");
+  int *preset = _P(int, m, "preset");
+  if(!pcoeffs || !preset || !_P(float, m, "various")) return;
+  if(pick->max[0] < pick->min[0]) return;
+  const float *grayrgb = pick->mean;
+
+  // normalize green:
+  const float gnormal = grayrgb[1] > 0.001f ? 1.0f / grayrgb[1] : 1.0f;
+  for_four_channels(c)
+    pcoeffs[c] = fmaxf(0.0f, fminf(8.0f, (grayrgb[c] > 0.001f ? 1.0f / grayrgb[c] : 1.0f) / gnormal));
+  pcoeffs[1] = 1.0f;
+
+  *preset = 1; // DT_IOP_TEMP_SPOT
+  m->dev->chroma.late_correction = FALSE;
+}
+
+// darktable hides the module's controls for a monochrome sensor (gui_update)
+static const char *_temperature_unavailable(const dt_iop_module_t *m)
+{
+  return dt_image_monochrome_flags(&m->dev->image_storage) & DT_IMAGE_MONOCHROME
+    ? "a monochrome sensor has no white balance" : NULL;
+}
+
+// ---- invert (invert.c) ------------------------------------------------------
+
+// color_picker_apply: the area's mean, in the module's input (the raw for a
+// raw), is the film material's color. darktable skips a sample equal to the
+// last one it applied (a static, against its own feedback loop): headless
+// each press applies
+static void _invert(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick)
+{
+  float *color = _P(float, m, "color");
+  if(!color) return;
+  for_four_channels(k) color[k] = pick->mean[k];
+}
+
+// pressing the picker switches the module on, and darktable's invert
+// crashes on an image without a color filter array (a monochrome sensor's
+// raw, an sRAW, a JPEG): its 4-channel branch writes past a buffer the
+// pipe sizes for its raw color space
+static const char *_invert_unavailable(const dt_iop_module_t *m)
+{
+  return m->dev->image_storage.buf_dsc.filters ? NULL
+    : "darktable's invert works on Bayer and X-Trans raws only (it crashes on other images)";
+}
+
+// ---- retouch (retouch.c) ----------------------------------------------------
+
+// color_picker_apply: the mean of the module's output is the fill color. the
+// window also gives it to the selected shape when that one fills; headless
+// no shape is selected (darktable.develop->mask_form_selected_id is the
+// darkroom's)
+static void _retouch_fill(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick)
+{
+  float *fill_color = _P(float, m, "fill_color");
+  if(!fill_color) return;
+  if(fabsf(fill_color[0] - pick->output_mean[0]) < 0.0001f
+     && fabsf(fill_color[1] - pick->output_mean[1]) < 0.0001f
+     && fabsf(fill_color[2] - pick->output_mean[2]) < 0.0001f)
+    return;
+  for(int c = 0; c < 3; c++) fill_color[c] = pick->output_mean[c];
+}
+
 // -----------------------------------------------------------------------------
 
 static const dt_api_picker_t _pickers[] = {
@@ -1276,6 +1347,7 @@ static const dt_api_picker_t _pickers[] = {
   { "filmicrgb", "white relative exposure", IOP_CS_NONE, TRUE, _filmic_white },
   { "filmicrgb", "black relative exposure", IOP_CS_NONE, TRUE, _filmic_black },
   { "graduatednd", "hue", IOP_CS_NONE, FALSE, _graduatednd },
+  { "invert", "pick color of film material from image", IOP_CS_NONE, FALSE, _invert, _invert_unavailable },
   { "levels", "pickers/black", IOP_CS_NONE, FALSE, _levels_black },
   { "levels", "pickers/gray", IOP_CS_NONE, FALSE, _levels_gray },
   { "levels", "pickers/white", IOP_CS_NONE, FALSE, _levels_white },
@@ -1291,12 +1363,15 @@ static const dt_api_picker_t _pickers[] = {
   { "profile_gamma", "middle gray luma", IOP_CS_NONE, FALSE, _profile_gamma_grey },
   { "profile_gamma", "dynamic range", IOP_CS_NONE, FALSE, _profile_gamma_range },
   { "profile_gamma", "black relative exposure", IOP_CS_NONE, FALSE, _profile_gamma_black },
+  { "retouch", "pick fill color", IOP_CS_NONE, FALSE, _retouch_fill, NULL, TRUE },
   { "rgbcurve", "pickers/create curve", IOP_CS_NONE, FALSE, _rgbcurve_create_curve },
   { "rgblevels", "pickers/black", IOP_CS_NONE, FALSE, _rgblevels_black },
   { "rgblevels", "pickers/gray", IOP_CS_NONE, FALSE, _rgblevels_gray },
   { "rgblevels", "pickers/white", IOP_CS_NONE, FALSE, _rgblevels_white },
   { "splittoning", "shadows/hue", IOP_CS_NONE, FALSE, _splittoning_shadows },
   { "splittoning", "highlights/hue", IOP_CS_NONE, FALSE, _splittoning_highlights },
+  { "temperature", "settings/from image area", IOP_CS_NONE, FALSE, _temperature, _temperature_unavailable,
+    FALSE, TRUE },
   { "watermark", "pick color", IOP_CS_NONE, FALSE, _watermark },
 };
 

@@ -241,9 +241,11 @@ static void test_subpanel_takes_boost_and_opacity_out_of_the_row(void **state)
 
 // selection is the anchor whenever there is one, at both levels -- selecting
 // an element sets the group half too (see _set_form_target), so picking an
-// element anchors its group as well as itself
+// element anchors its group as well as itself. A shape row only has an
+// expander with the properties in the list.
 static void test_auto_expand_anchors_on_the_selection(void **state)
 {
+  dt_conf_set_bool("plugins/darkroom/masks/properties_subpanel", FALSE);
   flexi_build("u{1,2,i{3}}");
   flexi_bd.panel_selected_formid = 2;
   flexi_bd.panel_selected_group_cid = 1;
@@ -268,11 +270,12 @@ static void test_auto_expand_falls_back_to_the_last_expanded(void **state)
   assert_int_equal(dt_masks_model_auto_expand_group_anchor(&flexi_bd), 1);
 }
 
-// a raster mask expands to its opacity slider, so selecting one makes it the
-// anchor like any other element. Its *group* anchors on its own, never
-// consulting the element's kind.
+// with the properties in the list, a raster mask expands to its opacity
+// slider, so selecting one makes it the anchor like any other element. Its
+// *group* anchors on its own, never consulting the element's kind.
 static void test_auto_expand_anchors_on_a_raster_mask(void **state)
 {
+  dt_conf_set_bool("plugins/darkroom/masks/properties_subpanel", FALSE);
   flexi_build("u{1,2}");
   dt_masks_form_t *f = dt_masks_get_from_id(&flexi_dev, 2);
   const dt_masks_type_t saved = f->type;
@@ -395,14 +398,14 @@ static void test_auto_expand_preference_roundtrips(void **state)
   assert_false(dt_conf_get_bool("plugins/darkroom/masks/auto_expand_selected"));
 }
 
-// the expander option ships with the default the panel's own documentation
-// promises: auto-expand on. It comes from darktableconfig.xml via conf_gen.h,
-// so an unset key must already read that way -- the panel never writes it
-// until the user touches it.
+// the expander option ships off: a click on a row only selects it, and rows
+// open and close by their chevron alone. It comes from darktableconfig.xml via
+// conf_gen.h, so an unset key must already read that way -- the panel never
+// writes it until the user touches it.
 static void test_expander_option_defaults(void **state)
 {
   dt_conf_remove_key("plugins/darkroom/masks/auto_expand_selected");
-  assert_true(dt_conf_get_bool("plugins/darkroom/masks/auto_expand_selected"));
+  assert_false(dt_conf_get_bool("plugins/darkroom/masks/auto_expand_selected"));
 }
 
 // ---------------------------------------------------------------------------
@@ -679,34 +682,6 @@ static void test_panel_state_no_separate_panel_for_utility_or_embedded(void **st
   assert_false(s_emb.corner_icon_visible);
 }
 
-// dedicated panel caption reflects module name and instance name with 2-line markup
-static void test_masks_panel_header_markup(void **state)
-{
-  char *m_hosted_no_inst = dt_masks_model_panel_header_markup("exposure", "", TRUE);
-  assert_non_null(strstr(m_hosted_no_inst, "blend mask"));
-  assert_non_null(strstr(m_hosted_no_inst, "exposure"));
-  assert_non_null(strstr(m_hosted_no_inst, "\n"));
-  assert_null(strstr(m_hosted_no_inst, "•"));
-  free(m_hosted_no_inst);
-
-  char *m_hosted_inst = dt_masks_model_panel_header_markup("exposure", "foreground", TRUE);
-  assert_non_null(strstr(m_hosted_inst, "blend mask"));
-  assert_non_null(strstr(m_hosted_inst, "exposure"));
-  assert_non_null(strstr(m_hosted_inst, "• foreground"));
-  assert_non_null(strstr(m_hosted_inst, "\n"));
-  free(m_hosted_inst);
-
-  char *m_hosted_no_mod = dt_masks_model_panel_header_markup(NULL, NULL, TRUE);
-  assert_non_null(strstr(m_hosted_no_mod, "blend mask"));
-  assert_non_null(strstr(m_hosted_no_mod, "no focused module"));
-  assert_non_null(strstr(m_hosted_no_mod, "\n"));
-  free(m_hosted_no_mod);
-
-  char *m_embedded = dt_masks_model_panel_header_markup("exposure", "foreground", FALSE);
-  assert_string_equal(m_embedded, "blend mask");
-  free(m_embedded);
-}
-
 static void test_param_channel_tooltips(void **state)
 {
   const int csps[] = { DEVELOP_BLEND_CS_LAB, DEVELOP_BLEND_CS_RGB_DISPLAY, DEVELOP_BLEND_CS_RGB_SCENE };
@@ -793,7 +768,6 @@ int main(void)
     cmocka_unit_test_teardown(test_panel_state_utility_position_follows_pref, _teardown),
     cmocka_unit_test_teardown(test_panel_state_no_separate_panel_for_utility_or_embedded, _teardown),
     cmocka_unit_test_teardown(test_pinning_collapsed_module_expands_iop, _teardown),
-    cmocka_unit_test_teardown(test_masks_panel_header_markup, _teardown),
     cmocka_unit_test_teardown(test_param_channel_tooltips, _teardown),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);

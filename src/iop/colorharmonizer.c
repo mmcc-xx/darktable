@@ -1546,6 +1546,8 @@ void gui_init(dt_iop_module_t *self)
   dt_gui_box_add(self->widget, g->swatches_area);
 
   // Vertical swatch rows — one per harmony node (max 4), shown in custom mode only
+  static const char *custom_hue_label[COLORHARMONIZER_MAX_NODES]
+    = { N_("custom hue 1"), N_("custom hue 2"), N_("custom hue 3"), N_("custom hue 4") };
   for(int i = 0; i < COLORHARMONIZER_MAX_NODES; i++)
   {
     GtkWidget *row = dt_gui_hbox();
@@ -1558,6 +1560,10 @@ void gui_init(dt_iop_module_t *self)
     GtkWidget *slider = dt_bauhaus_slider_new_with_range_and_feedback(
         self, 0.0f, 360.0f, 0.5f, 0.0f, 1, 0);
     dt_bauhaus_slider_set_format(slider, "°");
+    // the label names the slider's and its picker's actions; the swatch
+    // beside it already says which node it is
+    dt_bauhaus_widget_set_label(slider, NULL, custom_hue_label[i]);
+    dt_bauhaus_widget_hide_label(slider);
     g_object_set_data(G_OBJECT(slider), "slider-index", GINT_TO_POINTER(i));
     g_signal_connect(G_OBJECT(slider), "value-changed",
                      G_CALLBACK(_custom_hue_changed), self);

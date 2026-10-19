@@ -28,6 +28,7 @@ typedef struct dt_api_pick_t
 {
   dt_aligned_pixel_t mean, min, max;
   dt_aligned_pixel_t output_mean, output_min, output_max;
+  void *state;  // the picker's state_size bytes the session keeps for the module
 } dt_api_pick_t;
 
 // what a module's color_picker_apply does with a sample, headless: writes
@@ -48,6 +49,7 @@ typedef struct dt_api_picker_t
   dt_api_picker_unavailable_t unavailable;  // NULL: always shown
   gboolean output;                // DT_COLOR_PICKER_IO: samples the output too
   gboolean fixed_cst;             // dt_color_picker_new_with_cst: cst even when IOP_CS_NONE
+  size_t state_size;              // what the module's gui_data keeps between picks, zeroed at first
 } dt_api_picker_t;
 
 // the module's pickers ported headless, in order: the n-th, NULL past the

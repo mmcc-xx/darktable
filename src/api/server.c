@@ -339,6 +339,9 @@ typedef struct _session_t
   gboolean gui;
   struct _session_t *mirror;
   guint64 mirror_gen;
+  // headless, what modules' pickers keep between picks (pickers.c), as
+  // their gui_data does in the window: module -> its state
+  GHashTable *picker_state;
 } _session_t;
 
 static GList *_sessions = NULL;
@@ -466,6 +469,7 @@ static gboolean _image_exists(const dt_imgid_t imgid)
 
 static void _session_free(_session_t *s)
 {
+  if(s->picker_state) g_hash_table_destroy(s->picker_state);
   dt_dev_pixelpipe_cleanup(&s->pipe);
   dt_mipmap_cache_release(&s->buf);
   dt_dev_cleanup(s->dev);
@@ -10613,6 +10617,19 @@ static gboolean _picker_apply_headless(JsonObject *params, JsonBuilder *b, gchar
   dt_api_pick_t pick;
   dt_iop_colorspace_type_t cst;
   if(!_pick_sample(_cur, m, pk, area, point, &pick, &cst, err)) return FALSE;
+  pick.state = NULL;
+  if(pk->state_size)
+  {
+    // removed modules stay in dev->alliop, so a module's address is not
+    // reused while the session lives
+    if(!_cur->picker_state) _cur->picker_state = g_hash_table_new_full(NULL, NULL, NULL, g_free);
+    pick.state = g_hash_table_lookup(_cur->picker_state, m);
+    if(!pick.state)
+    {
+      pick.state = g_malloc0(pk->state_size);
+      g_hash_table_insert(_cur->picker_state, m, pick.state);
+    }
+  }
 
   void *before = g_malloc(m->params_size);
   memcpy(before, m->params, m->params_size);

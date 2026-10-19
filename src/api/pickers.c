@@ -495,6 +495,259 @@ static void _rgblevels_white(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const
   _rgblevels_pick(m, pick, 2);
 }
 
+// ---- color balance (colorbalance.c) -----------------------------------------
+
+// the patches its gui_data keeps between picks (gui_init and gui_reset
+// clear them): the factor pickers save a lightness, the hue pickers a
+// color, and the two optimizers fit to them, picking the ones not saved
+// from their own area and keeping those (AUTO_SELECTED) too
+enum { _CB_LIFT, _CB_GAMMA, _CB_GAIN };
+enum { _CB_INVALID, _CB_USER_SELECTED, _CB_AUTO_SELECTED };
+
+typedef struct _colorbalance_state_t
+{
+  float color_patches[3][3];
+  int color_patches_flags[3];
+  float luma_patches[3];
+  int luma_patches_flags[3];
+} _colorbalance_state_t;
+
+typedef struct _colorbalance_t
+{
+  float *lift, *gamma, *gain, *grey; // [0] the factor, then red, green, blue
+} _colorbalance_t;
+
+static gboolean _cb(dt_iop_module_t *m, _colorbalance_t *p)
+{
+  p->lift = _P(float, m, "lift");
+  p->gamma = _P(float, m, "gamma");
+  p->gain = _P(float, m, "gain");
+  p->grey = _P(float, m, "grey");
+  return p->lift && p->gamma && p->gain && p->grey;
+}
+
+static float _cb_Y(const float *Lab)
+{
+  dt_aligned_pixel_t XYZ = { 0.0f };
+  dt_Lab_to_XYZ(Lab, XYZ);
+  return XYZ[1];
+}
+
+static void _cb_rgb(const float *Lab, dt_aligned_pixel_t RGB, float *Y)
+{
+  dt_aligned_pixel_t XYZ = { 0.0f };
+  dt_Lab_to_XYZ(Lab, XYZ);
+  dt_XYZ_to_prophotorgb(XYZ, RGB);
+  *Y = XYZ[1];
+}
+
+static inline float _cb_CDL(const float x, const float slope, const float offset, const float power)
+{
+  return powf(MAX(slope * x + offset, 0.0f), power);
+}
+
+// apply_autogrey
+static void _cb_grey(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick)
+{
+  _colorbalance_t p;
+  if(!_cb(m, &p)) return;
+  dt_aligned_pixel_t XYZ = { 0.0f }, rgb = { 0.0f };
+  dt_Lab_to_XYZ(pick->mean, XYZ);
+  dt_XYZ_to_prophotorgb(XYZ, rgb);
+
+  dt_aligned_pixel_t lift = { 0.0f }, gamma = { 0.0f }, gain = { 0.0f }, res;
+  static const dt_aligned_pixel_t zero = { 0.0f };
+  for(int c = 0; c < 3; c++)
+  {
+    lift[c] = p.lift[c + 1] + p.lift[0] - 2.0f;
+    gamma[c] = 2.0f - p.gamma[c + 1] * p.gamma[0];
+    gain[c] = p.gain[c + 1] * p.gain[0];
+  }
+  // _apply_CDL
+  for_each_channel(c) res[c] = gain[c] * rgb[c] + lift[c];
+  dt_vector_max(res, res, zero);
+  dt_vector_powf(res, gamma, rgb);
+  for_each_channel(c) rgb[c] = CLAMP(rgb[c], 0.0f, 1.0f);
+
+  dt_prophotorgb_to_XYZ(rgb, XYZ);
+  *p.grey = XYZ[1] * 100.0f;
+}
+
+// apply_lift_neutralize, apply_gamma_neutralize, apply_gain_neutralize
+static void _cb_neutralize(dt_iop_module_t *m, const dt_api_pick_t *pick, const int level)
+{
+  _colorbalance_t p;
+  if(!_cb(m, &p)) return;
+  _colorbalance_state_t *s = pick->state;
+  dt_aligned_pixel_t RGB = { 0.0f };
+  float Y;
+  _cb_rgb(pick->mean, RGB, &Y);
+  for(int c = 0; c < 3; c++) s->color_patches[level][c] = RGB[c];
+  s->color_patches_flags[level] = _CB_USER_SELECTED;
+
+  for(int c = 0; c < 3; c++)
+  {
+    if(level == _CB_LIFT)
+      p.lift[c + 1] = powf(Y, 1.0f / (2.0f - p.gamma[c + 1])) - RGB[c] * p.gain[c + 1] + 1.0f;
+    else if(level == _CB_GAMMA)
+      p.gamma[c + 1] = CLAMP(2.0 - logf(Y) / logf(RGB[c] * p.gain[c + 1] + p.lift[c + 1] - 1.0f), 0.0001f, 2.0f);
+    else
+      p.gain[c + 1] = (powf(Y, 1.0f / (2.0f - p.gamma[c + 1])) - p.lift[c + 1] + 1.0f) / MAX(RGB[c], 0.000001f);
+  }
+}
+
+static void _cb_lift_hue(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick)
+{
+  _cb_neutralize(m, pick, _CB_LIFT);
+}
+
+static void _cb_gamma_hue(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick)
+{
+  _cb_neutralize(m, pick, _CB_GAMMA);
+}
+
+static void _cb_gain_hue(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick)
+{
+  _cb_neutralize(m, pick, _CB_GAIN);
+}
+
+// apply_lift_auto: the area's darkest
+static void _cb_lift_factor(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick)
+{
+  _colorbalance_t p;
+  if(!_cb(m, &p)) return;
+  _colorbalance_state_t *s = pick->state;
+  const float Y = _cb_Y(pick->min);
+  s->luma_patches[_CB_LIFT] = Y;
+  s->luma_patches_flags[_CB_LIFT] = _CB_USER_SELECTED;
+  p.lift[0] = -p.gain[0] * Y + 1.0f;
+}
+
+// apply_gamma_auto
+static void _cb_gamma_factor(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick)
+{
+  _colorbalance_t p;
+  if(!_cb(m, &p)) return;
+  _colorbalance_state_t *s = pick->state;
+  const float Y = _cb_Y(pick->mean);
+  s->luma_patches[_CB_GAMMA] = Y;
+  s->luma_patches_flags[_CB_GAMMA] = _CB_USER_SELECTED;
+  p.gamma[0] = 2.0f - logf(0.1842f) / logf(MAX(p.gain[0] * Y + p.lift[0] - 1.0f, 0.000001f));
+}
+
+// apply_gain_auto: the area's brightest
+static void _cb_gain_factor(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick)
+{
+  _colorbalance_t p;
+  if(!_cb(m, &p)) return;
+  _colorbalance_state_t *s = pick->state;
+  const float Y = _cb_Y(pick->max);
+  s->luma_patches[_CB_GAIN] = Y;
+  s->luma_patches_flags[_CB_GAIN] = _CB_USER_SELECTED;
+  p.gain[0] = p.lift[0] / Y;
+}
+
+// apply_autoluma
+static void _cb_auto_luma(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick)
+{
+  _colorbalance_t p;
+  if(!_cb(m, &p)) return;
+  _colorbalance_state_t *s = pick->state;
+  const float *picked[3] = { pick->min, pick->mean, pick->max };
+  for(int k = 0; k < 3; k++)
+    if(s->luma_patches_flags[k] == _CB_INVALID)
+    {
+      s->luma_patches[k] = _cb_Y(picked[k]);
+      s->luma_patches_flags[k] = _CB_AUTO_SELECTED;
+    }
+
+  for(int runs = 0; runs < 100; ++runs)
+  {
+    p.gain[0] = CLAMP(p.lift[0] / s->luma_patches[_CB_GAIN], 0.0f, 2.0f);
+    p.lift[0] = CLAMP(-p.gain[0] * s->luma_patches[_CB_LIFT] + 1.0f, 0.0f, 2.0f);
+    p.gamma[0] = CLAMP(2.0f - logf(0.1842f)
+                         / logf(MAX(p.gain[0] * s->luma_patches[_CB_GAMMA] + p.lift[0] - 1.0f, 0.000001f)),
+                       0.0f, 2.0f);
+  }
+}
+
+// apply_autocolor
+static void _cb_auto_color(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick)
+{
+  _colorbalance_t p;
+  if(!_cb(m, &p)) return;
+  _colorbalance_state_t *s = pick->state;
+  dt_aligned_pixel_t RGB = { 0.0f };
+  float Y;
+  _cb_rgb(pick->mean, RGB, &Y);
+  for(int k = 0; k < 3; k++)
+    if(s->color_patches_flags[k] == _CB_INVALID)
+    {
+      for(int c = 0; c < 3; c++) s->color_patches[k][c] = RGB[c];
+      s->color_patches_flags[k] = _CB_AUTO_SELECTED;
+    }
+
+  // the samples after the factors, and their lightness
+  dt_aligned_pixel_t samples[3] = { { 0.f } };
+  float greys[3];
+  for(int k = 0; k < 3; k++)
+  {
+    for(int c = 0; c < 3; ++c)
+      samples[k][c] = _cb_CDL(s->color_patches[k][c], p.gain[0], p.lift[0] - 1.0f, 2.0f - p.gamma[0]);
+    dt_aligned_pixel_t XYZ = { 0.0f };
+    dt_prophotorgb_to_XYZ(samples[k], XYZ);
+    greys[k] = XYZ[1];
+  }
+
+  dt_aligned_pixel_t RGB_lift = { p.lift[1] - 1.0f, p.lift[2] - 1.0f, p.lift[3] - 1.0f };
+  dt_aligned_pixel_t RGB_gamma = { p.gamma[1], p.gamma[2], p.gamma[3] };
+  dt_aligned_pixel_t RGB_gain = { p.gain[1], p.gain[2], p.gain[3] };
+
+  for(int runs = 0; runs < 1000; ++runs)
+  {
+    for(int c = 0; c < 3; ++c)
+      RGB_gain[c] = CLAMP((powf(greys[_CB_GAIN], 1.0f / (2.0f - RGB_gamma[c])) - RGB_lift[c])
+                            / MAX(samples[_CB_GAIN][c], 0.000001f),
+                          0.75f, 1.25f);
+    for(int c = 0; c < 3; ++c)
+      RGB_lift[c] = CLAMP(powf(greys[_CB_LIFT], 1.0f / (2.0f - RGB_gamma[c])) - samples[_CB_LIFT][c] * RGB_gain[c],
+                          -0.025f, 0.025f);
+    for(int c = 0; c < 3; ++c)
+      RGB_gamma[c] = 2.0f - CLAMP(logf(MAX(greys[_CB_GAMMA], 0.000001f))
+                                    / logf(MAX(RGB_gain[c] * samples[_CB_GAMMA][c] + RGB_lift[c], 0.000001f)),
+                                  0.75f, 1.25f);
+  }
+
+  for(int c = 0; c < 3; c++)
+  {
+    p.lift[c + 1] = RGB_lift[c] + 1.0f;
+    p.gamma[c + 1] = RGB_gamma[c];
+    p.gain[c + 1] = RGB_gain[c];
+  }
+}
+
+// set_visible_widgets: the master sliders hide in the legacy mode, the
+// optimizers outside slope, offset, power, and the hue sliders when the
+// color control sliders (a preference) are RGBL
+static const char *_cb_grey_unavailable(const dt_iop_module_t *m)
+{
+  const int *mode = _P(int, m, "mode");
+  return mode && *mode == 2 ? "the contrast fulcrum is hidden in the mode \"lift, gamma, gain (sRGB)\"" : NULL;
+}
+
+static const char *_cb_hue_unavailable(const dt_iop_module_t *m)
+{
+  return !g_strcmp0(dt_conf_get_string_const("plugins/darkroom/colorbalance/controls"), "RGBL")
+    ? "the hue sliders are hidden: color control sliders is RGBL (set it to HSL or both in darktable)" : NULL;
+}
+
+static const char *_cb_optimizer_unavailable(const dt_iop_module_t *m)
+{
+  const int *mode = _P(int, m, "mode");
+  return mode && *mode != 1 ? "the auto optimizers work in the mode \"slope, offset, power (ProPhoto RGB)\" only"
+                            : NULL;
+}
+
 // ---- color balance rgb (colorbalancergb.c) -----------------------------------
 
 // pipe_RGB_to_Ych: a sample in the module's profile to Ych (D65)
@@ -1317,6 +1570,8 @@ static void _retouch_fill(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt
 
 // -----------------------------------------------------------------------------
 
+#define _CB_STATE .state_size = sizeof(_colorbalance_state_t)
+
 static const dt_api_picker_t _pickers[] = {
   { "agx", "exposure range/auto tune levels", IOP_CS_NONE, TRUE, _agx_auto_tune },
   { "agx", "white relative exposure", IOP_CS_NONE, TRUE, _agx_white },
@@ -1327,6 +1582,15 @@ static const dt_api_picker_t _pickers[] = {
   { "borders", "pickers/border color", IOP_CS_NONE, FALSE, _borders_border },
   { "borders", "pickers/frame line color", IOP_CS_NONE, FALSE, _borders_frame },
   { "channelmixerrgb", "picker", IOP_CS_NONE, FALSE, _channelmixerrgb, _channelmixerrgb_unavailable },
+  { "colorbalance", "contrast fulcrum", IOP_CS_NONE, FALSE, _cb_grey, _cb_grey_unavailable },
+  { "colorbalance", "shadows/factor", IOP_CS_NONE, FALSE, _cb_lift_factor, _CB_STATE },
+  { "colorbalance", "shadows/hue", IOP_CS_NONE, FALSE, _cb_lift_hue, _cb_hue_unavailable, _CB_STATE },
+  { "colorbalance", "mid-tones/factor", IOP_CS_NONE, FALSE, _cb_gamma_factor, _CB_STATE },
+  { "colorbalance", "mid-tones/hue", IOP_CS_NONE, FALSE, _cb_gamma_hue, _cb_hue_unavailable, _CB_STATE },
+  { "colorbalance", "highlights/factor", IOP_CS_NONE, FALSE, _cb_gain_factor, _CB_STATE },
+  { "colorbalance", "highlights/hue", IOP_CS_NONE, FALSE, _cb_gain_hue, _cb_hue_unavailable, _CB_STATE },
+  { "colorbalance", "optimize luma", IOP_CS_NONE, FALSE, _cb_auto_luma, _cb_optimizer_unavailable, _CB_STATE },
+  { "colorbalance", "neutralize colors", IOP_CS_NONE, FALSE, _cb_auto_color, _cb_optimizer_unavailable, _CB_STATE },
   { "colorbalancergb", "offset/hue", IOP_CS_NONE, FALSE, _cbrgb_offset },
   { "colorbalancergb", "lift/hue", IOP_CS_NONE, FALSE, _cbrgb_lift },
   { "colorbalancergb", "power/hue", IOP_CS_NONE, FALSE, _cbrgb_power },

@@ -157,7 +157,7 @@ message only):
 |---|---|
 | `ping` | version, `server` (`engine` or `gui`) and `methods`: the methods this server has, and options added to a method later (`render.zoom`), so a client can check before calling |
 | `film_rolls` | film rolls with image counts |
-| `images_list {film_id, rating, label, offset, limit}` | images in folder/filename order with rating, reject, color labels; `rating` is `visible` (default), `all`, `rejected` or `1`..`5` (at least) |
+| `images_list {film_id, rating, label, tag, offset, limit}` | images in folder/filename order with rating, reject, color labels; `rating` is `visible` (default), `all`, `rejected` or `1`..`5` (at least); `tag` (`images_list.tag`) only those with that tag or one under it (`places` takes `places\|paris`; case ignored) |
 | `image_info {imgid}` | one image, as in `images_list`, and its camera data (`exif`: maker, model, lens, aperture, exposure time, bias, ISO, focal length, focus distance, crop factor, when taken, raw / HDR / monochrome) |
 | `collection {offset, limit}` | darktable's current collection (the lighttable's and filmstrip's photos, in their order), its rules, and the selected images |
 | `darkroom_open {imgid}` | darktable's window only: shows the photo in the darkroom, as clicking it in the filmstrip (in the darkroom) or double-clicking it in the lighttable does; the switch completes on the main loop (a `darkroom` event, `library_status` `darkroom_imgid`) |

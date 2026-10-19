@@ -6099,12 +6099,21 @@ static gboolean _images_list(JsonObject *params, JsonBuilder *b, gchar **err)
   const int offset = MAX(0, params ? json_object_get_int_member_with_default(params, "offset", 0) : 0);
   const int limit = CLAMP(params ? json_object_get_int_member_with_default(params, "limit", 100) : 100, 1, 1000);
   const char *rating = params ? json_object_get_string_member_with_default(params, "rating", "visible") : "visible";
+  // a tag and the tags under it, as a collection's tag rule ("places" also takes "places|paris")
+  const char *tag = params ? json_object_get_string_member_with_default(params, "tag", "") : "";
+  if(!tag) tag = "";
 
   // clang-format off
   gchar *where = g_strdup_printf(" WHERE (?1 < 0 OR i.film_id = ?1)"
                                  "   AND %s"
                                  "   AND (?2 < 0 OR EXISTS (SELECT 1 FROM main.color_labels AS c"
-                                 "                          WHERE c.imgid = i.id AND c.color = ?2))",
+                                 "                          WHERE c.imgid = i.id AND c.color = ?2))"
+                                 "   AND (?5 = '' OR EXISTS (SELECT 1 FROM main.tagged_images AS ti"
+                                 "                           JOIN data.tags AS t ON t.id = ti.tagid"
+                                 "                           WHERE ti.imgid = i.id"
+                                 "                             AND (LOWER(t.name) = LOWER(?5)"
+                                 "                                  OR SUBSTR(LOWER(t.name), 1, LENGTH(?5) + 1)"
+                                 "                                     = LOWER(?5) || '|')))",
                                  _rating_clause(rating));
   gchar *q_count = g_strconcat("SELECT COUNT(*) FROM main.images AS i", where, NULL);
   gchar *q_rows = g_strconcat("SELECT i.id, i.filename, f.folder, i.version, i.flags, i.width, i.height,"
@@ -6124,6 +6133,7 @@ static gboolean _images_list(JsonObject *params, JsonBuilder *b, gchar **err)
   {
     sqlite3_bind_int(st, 1, film_id);
     sqlite3_bind_int(st, 2, label);
+    sqlite3_bind_text(st, 5, tag, -1, SQLITE_TRANSIENT);
     json_builder_set_member_name(b, "total");
     json_builder_add_int_value(b, sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : 0);
     sqlite3_finalize(st);
@@ -6135,6 +6145,7 @@ static gboolean _images_list(JsonObject *params, JsonBuilder *b, gchar **err)
     sqlite3_bind_int(st, 2, label);
     sqlite3_bind_int(st, 3, limit);
     sqlite3_bind_int(st, 4, offset);
+    sqlite3_bind_text(st, 5, tag, -1, SQLITE_TRANSIENT);
     json_builder_set_member_name(b, "images");
     json_builder_begin_array(b);
     while(sqlite3_step(st) == SQLITE_ROW) _add_image_row(b, st);
@@ -10975,7 +10986,7 @@ static gboolean _quit_window(gpointer data)
 }
 
 static const char *_methods[] = {
-  "ping", "film_rolls", "images_list", "image_info", "thumbnail", "thumbnails", "import", "set_rating", "set_label",
+  "ping", "film_rolls", "images_list", "images_list.tag", "image_info", "thumbnail", "thumbnails", "import", "set_rating", "set_label",
   "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
   "module_enable", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",

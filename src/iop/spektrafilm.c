@@ -5407,6 +5407,55 @@ static float _solve_scale_for_lightness(const sf_sim_t *sim,
   return fminf(fmaxf(ratio * ratio * ratio, 0.5f), 4.0f); /* the slider's own $MIN / $MAX */
 }
 
+// what color_picker_apply() solves from an area pick's maximum, for an
+// editor with no GUI: darktable-api (src/api) looks it up by name. rgb_max
+// is in the work profile; returns FALSE when no simulation can be built
+__attribute__((visibility("default")))
+gboolean dt_iop_spektrafilm_picker_solve(const dt_iop_params_t *params,
+                                         const dt_iop_order_iccprofile_info_t *work_profile,
+                                         const float rgb_max[3],
+                                         const gboolean is_scale,
+                                         float *solved)
+{
+  /* Build a standalone sim from the module's current live params: the
+     picker runs independently of any specific piece's cached data, so this
+     is a one-off build for this measurement, not the pipe's own d->sim
+     (which _ensure_sim also caches on -- see there for what gets set). */
+  dt_iop_spektrafilm_data_t d_tmp;
+  memset(&d_tmp, 0, sizeof(d_tmp));
+  d_tmp.p = *(const dt_iop_spektrafilm_params_t *)params;
+  dt_pthread_mutex_init(&d_tmp.lock);
+  sf_sim_t *sim = _ensure_sim(&d_tmp, work_profile);
+  if(!sim)
+  {
+    dt_pthread_mutex_destroy(&d_tmp.lock);
+    return FALSE;
+  }
+
+  /* Where the picked highlight lands, in the probe's lightness. Above the
+     compressor's knee threshold (SF_OUT_LIGHT_T = 0.7) and short of its
+     asymptotic limit of 1.0: the knee only starts doing useful work well above
+     its threshold, so aiming just past it leaves visible unused headroom and
+     reads dark; 0.95 still does. 0.97 is close enough to the limit to use
+     nearly all of the range while still landing on the curve rather than at
+     its asymptote, where the solver's bisection would have little gradient to
+     work with. Nothing hard-clips at any target -- the knee is asymptotic by
+     construction. */
+  /* The scale aims higher than the boost. The boost hands its result to the
+     compressor, whose knee bends anything approaching 1.0 back down, so a
+     target near the limit still lands short of it. The scale multiplies the
+     finished colour with nothing behind it, so what it aims for is what it
+     gets, and a highlight can sit closer to white before anything is lost. */
+  const float target_L = is_scale ? 0.995f : 0.97f;
+  *solved = is_scale ? _solve_scale_for_lightness(sim, rgb_max, target_L)
+                     : _solve_boost_for_lightness(sim, rgb_max, target_L);
+
+  if(d_tmp.gpu) sf_sim_gpu_free(d_tmp.gpu);
+  if(d_tmp.sim) sf_sim_free(d_tmp.sim);
+  dt_pthread_mutex_destroy(&d_tmp.lock);
+  return TRUE;
+}
+
 void color_picker_apply(dt_iop_module_t *self,
                         GtkWidget *picker,
                         dt_dev_pixelpipe_t *pipe)
@@ -5428,48 +5477,15 @@ void color_picker_apply(dt_iop_module_t *self,
   const dt_iop_order_iccprofile_info_t *work_profile = dt_ioppr_get_pipe_work_profile_info(pipe);
   if(!work_profile) return;
 
-  /* Build a standalone sim from the module's current live params: the
-     picker runs independently of any specific piece's cached data, so this
-     is a one-off build for this measurement, not the pipe's own d->sim
-     (which _ensure_sim also caches on -- see there for what gets set). */
-  dt_iop_spektrafilm_data_t d_tmp;
-  memset(&d_tmp, 0, sizeof(d_tmp));
-  d_tmp.p = *(dt_iop_spektrafilm_params_t *)self->params;
-  dt_pthread_mutex_init(&d_tmp.lock);
-  sf_sim_t *sim = _ensure_sim(&d_tmp, work_profile);
-  if(!sim)
-  {
-    dt_pthread_mutex_destroy(&d_tmp.lock);
-    return;
-  }
-
   /* the brightest tone in the picked area is what determines whether the
      compressor's knee engages usefully; picked_color_max is already an
      area-mode min/max/mean pick (see dt_color_picker_new(..., DT_COLOR_PICKER_AREA, ...)
      above in gui_init). */
   const float rgb_max[3] = { self->picked_color_max[0], self->picked_color_max[1],
                             self->picked_color_max[2] };
-  /* Where the picked highlight lands, in the probe's lightness. Above the
-     compressor's knee threshold (SF_OUT_LIGHT_T = 0.7) and short of its
-     asymptotic limit of 1.0: the knee only starts doing useful work well above
-     its threshold, so aiming just past it leaves visible unused headroom and
-     reads dark; 0.95 still does. 0.97 is close enough to the limit to use
-     nearly all of the range while still landing on the curve rather than at
-     its asymptote, where the solver's bisection would have little gradient to
-     work with. Nothing hard-clips at any target -- the knee is asymptotic by
-     construction. */
-  /* The scale aims higher than the boost. The boost hands its result to the
-     compressor, whose knee bends anything approaching 1.0 back down, so a
-     target near the limit still lands short of it. The scale multiplies the
-     finished colour with nothing behind it, so what it aims for is what it
-     gets, and a highlight can sit closer to white before anything is lost. */
-  const float target_L = is_scale ? 0.995f : 0.97f;
-  const float solved = is_scale ? _solve_scale_for_lightness(sim, rgb_max, target_L)
-                                : _solve_boost_for_lightness(sim, rgb_max, target_L);
-
-  if(d_tmp.gpu) sf_sim_gpu_free(d_tmp.gpu);
-  if(d_tmp.sim) sf_sim_free(d_tmp.sim);
-  dt_pthread_mutex_destroy(&d_tmp.lock);
+  float solved;
+  if(!dt_iop_spektrafilm_picker_solve(self->params, work_profile, rgb_max, is_scale, &solved))
+    return;
 
   dt_iop_spektrafilm_params_t *p = self->params;
   GtkWidget *w = is_scale ? g->output_scale : g->output_boost;

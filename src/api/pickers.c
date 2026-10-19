@@ -31,6 +31,7 @@
 #include "common/illuminants.h"
 #include "common/iop_profile.h"
 #include "common/math.h"
+#include "common/spektra_fetch.h"
 #include "control/conf.h"
 #include "develop/openmp_maths.h"
 #include "develop/pixelpipe_hb.h"
@@ -1568,6 +1569,49 @@ static void _retouch_fill(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt
   for(int c = 0; c < 3; c++) fill_color[c] = pick->output_mean[c];
 }
 
+// ---- spektrafilm (spektrafilm.c) --------------------------------------------
+
+// color_picker_apply: the area's max solved through the module's film
+// simulation, which spektrafilm exports for this (dt_iop_spektrafilm_picker_solve)
+typedef gboolean (*_spektrafilm_solve_t)(const dt_iop_params_t *params,
+                                         const dt_iop_order_iccprofile_info_t *work_profile,
+                                         const float rgb_max[3], gboolean is_scale, float *solved);
+
+static void _spektrafilm(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick,
+                         const gboolean is_scale)
+{
+  float *field = _P(float, m, is_scale ? "output_scale" : "output_luminance_boost");
+  _spektrafilm_solve_t solve = NULL;
+  const dt_iop_order_iccprofile_info_t *const work_profile = dt_ioppr_get_pipe_work_profile_info(pipe);
+  if(!field || !work_profile
+     || !g_module_symbol(m->so->module, "dt_iop_spektrafilm_picker_solve", (gpointer *)&solve))
+    return;
+  const float rgb_max[3] = { pick->max[0], pick->max[1], pick->max[2] };
+  float solved;
+  if(solve(m->params, work_profile, rgb_max, is_scale, &solved)) *field = solved;
+}
+
+// the window's picker does nothing then (no simulation), its module
+// showing the download
+static const char *_spektrafilm_unavailable(const dt_iop_module_t *m)
+{
+  GPtrArray *packs = sf_fetch_list_packs();
+  const gboolean none = packs->len == 0;
+  g_ptr_array_unref(packs);
+  return none ? "spektrafilm's data pack isn't installed (the module offers its download in darktable's window)"
+              : NULL;
+}
+
+static void _spektrafilm_boost(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick)
+{
+  _spektrafilm(m, pipe, pick, FALSE);
+}
+
+static void _spektrafilm_scale(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick)
+{
+  _spektrafilm(m, pipe, pick, TRUE);
+}
+
 // -----------------------------------------------------------------------------
 
 #define _CB_STATE .state_size = sizeof(_colorbalance_state_t)
@@ -1632,6 +1676,8 @@ static const dt_api_picker_t _pickers[] = {
   { "rgblevels", "pickers/black", IOP_CS_NONE, FALSE, _rgblevels_black },
   { "rgblevels", "pickers/gray", IOP_CS_NONE, FALSE, _rgblevels_gray },
   { "rgblevels", "pickers/white", IOP_CS_NONE, FALSE, _rgblevels_white },
+  { "spektrafilm", "pre-compression boost", IOP_CS_NONE, FALSE, _spektrafilm_boost, _spektrafilm_unavailable },
+  { "spektrafilm", "post-compression scale", IOP_CS_NONE, FALSE, _spektrafilm_scale, _spektrafilm_unavailable },
   { "splittoning", "shadows/hue", IOP_CS_NONE, FALSE, _splittoning_shadows },
   { "splittoning", "highlights/hue", IOP_CS_NONE, FALSE, _splittoning_highlights },
   { "temperature", "settings/from image area", IOP_CS_NONE, FALSE, _temperature, _temperature_unavailable,

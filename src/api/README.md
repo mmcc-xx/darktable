@@ -77,7 +77,8 @@ example. The example clients below start it this way when nobody has.
 - **Notifications:** every change is announced to the other clients:
   `{"jsonrpc":"2.0","method":"event","params":{"type","imgid","history_end","unsaved","client"}}`
   with `type` one of `edit`, `saved`, `reset`, `reopened`, `closed`,
-  `image` (rating or label), `removed`, `library_released`, `library_acquired`.
+  `image` (rating or label), `removed`, `library_released`, `library_acquired`,
+  `clients` (a client said `client_hello` or, having said it, disconnected).
 - `--idle-exit` stops the engine that many seconds after the last client
   disconnected, unless an image has unsaved changes.
 
@@ -156,6 +157,8 @@ message only):
 | method | does |
 |---|---|
 | `ping` | version, `server` (`engine` or `gui`) and `methods`: the methods this server has, and options added to a method later (`render.zoom`), so a client can check before calling |
+| `client_hello {kind, name}` | a client says what it is: `kind` a short word (at most 32 bytes: `mcp` for darktable-api-mcp, `web` for the web app, `web-worker` for its helper processes), `name` free text (at most 128 bytes, optional); replaces earlier values; replies `client`; the other clients get a `clients` event. Works while the library is released |
+| `clients` | `{clients: [{id, kind, name, imgid, self}]}` in connection order: `kind` and `name` are null until the client said hello, `imgid` is the image it last opened (0 if none), `self` marks the caller. Works while the library is released |
 | `film_rolls` | film rolls with image counts |
 | `images_list {film_id, rating, label, tag, offset, limit}` | images in folder/filename order with rating, reject, color labels; `rating` is `visible` (default), `all`, `rejected` or `1`..`5` (at least); `tag` (`images_list.tag`) only those with that tag or one under it (`places` takes `places\|paris`; case ignored) |
 | `image_info {imgid}` | one image, as in `images_list`, and its camera data (`exif`: maker, model, lens, aperture, exposure time, bias, ISO, focal length, focus distance, crop factor, when taken, raw / HDR / monochrome) |

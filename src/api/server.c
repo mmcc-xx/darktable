@@ -9950,6 +9950,8 @@ struct _client_t
   dt_imgid_t current;               // the image this client last opened
   gboolean dead;
   guint source;
+  gchar *kind;                      // what the client says it is (client_hello), or NULL
+  gchar *name;
 };
 
 static GList *_clients = NULL;
@@ -10787,6 +10789,8 @@ static void _client_free(_client_t *c)
   if(c->in_fd > STDERR_FILENO) close(c->in_fd);
   if(c->out_fd != c->in_fd && c->out_fd > STDERR_FILENO) close(c->out_fd);
   g_string_free(c->inbuf, TRUE);
+  g_free(c->kind);
+  g_free(c->name);
   g_free(c);
 }
 
@@ -10986,7 +10990,7 @@ static gboolean _quit_window(gpointer data)
 }
 
 static const char *_methods[] = {
-  "ping", "film_rolls", "images_list", "images_list.tag", "image_info", "thumbnail", "thumbnails", "import", "set_rating", "set_label",
+  "ping", "client_hello", "clients", "film_rolls", "images_list", "images_list.tag", "image_info", "thumbnail", "thumbnails", "import", "set_rating", "set_label",
   "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
   "module_enable", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
@@ -11101,6 +11105,7 @@ static gboolean _handle(_client_t *c, const gchar *line)
                                || !g_strcmp0(method, "shutdown") || !g_strcmp0(method, "image_remove")))
     err = _ERR(API_E_BUSY, NULL, "a background job is running (job_list): wait for it, or job_cancel it, first");
   else if(_released && g_strcmp0(method, "ping") && g_strcmp0(method, "library_status")
+     && g_strcmp0(method, "client_hello") && g_strcmp0(method, "clients")
      && g_strcmp0(method, "library_acquire") && g_strcmp0(method, "shutdown")
      && g_strcmp0(method, "handover"))
     err = _ERR(API_E_RELEASED, NULL, "the library is released: call library_acquire first");
@@ -11117,6 +11122,53 @@ static gboolean _handle(_client_t *c, const gchar *line)
     json_builder_set_member_name(b, "methods");
     json_builder_begin_array(b);
     for(int k = 0; _methods[k]; k++) json_builder_add_string_value(b, _methods[k]);
+    json_builder_end_array(b);
+  }
+  else if(!g_strcmp0(method, "client_hello"))
+  {
+    const gchar *kind = params && json_object_has_member(params, "kind")
+                        && json_node_get_value_type(json_object_get_member(params, "kind")) == G_TYPE_STRING
+                          ? json_object_get_string_member(params, "kind") : NULL;
+    const gchar *name = params && json_object_has_member(params, "name")
+                        && json_node_get_value_type(json_object_get_member(params, "name")) == G_TYPE_STRING
+                          ? json_object_get_string_member(params, "name") : NULL;
+    if(!kind || !*kind || strlen(kind) > 32)
+      err = _ERRF(API_E_PARAMS, "kind", "kind: a short word (1 to 32 bytes) is required");
+    else if(name && strlen(name) > 128)
+      err = _ERRF(API_E_PARAMS, "name", "name: at most 128 bytes");
+    else
+    {
+      g_free(c->kind);
+      g_free(c->name);
+      c->kind = g_strdup(kind);
+      c->name = name && *name ? g_strdup(name) : NULL;
+      json_builder_set_member_name(b, "client");
+      json_builder_add_int_value(b, c->id);
+      event = "clients";
+    }
+  }
+  else if(!g_strcmp0(method, "clients"))
+  {
+    json_builder_set_member_name(b, "clients");
+    json_builder_begin_array(b);
+    for(GList *l = _clients; l; l = g_list_next(l))
+    {
+      const _client_t *k = l->data;
+      json_builder_begin_object(b);
+      json_builder_set_member_name(b, "id");
+      json_builder_add_int_value(b, k->id);
+      json_builder_set_member_name(b, "kind");
+      if(k->kind) json_builder_add_string_value(b, k->kind);
+      else json_builder_add_null_value(b);
+      json_builder_set_member_name(b, "name");
+      if(k->name) json_builder_add_string_value(b, k->name);
+      else json_builder_add_null_value(b);
+      json_builder_set_member_name(b, "imgid");
+      json_builder_add_int_value(b, k->current);
+      json_builder_set_member_name(b, "self");
+      json_builder_add_boolean_value(b, k == c);
+      json_builder_end_object(b);
+    }
     json_builder_end_array(b);
   }
   else if(!g_strcmp0(method, "film_rolls"))
@@ -11412,7 +11464,9 @@ static gboolean _client_cb(gint fd, GIOCondition cond, gpointer data)
     // the source is removed by returning G_SOURCE_REMOVE
     c->source = 0;
     const gboolean stdio = _opt.listen_fd < 0;
+    const gboolean had_kind = c->kind != NULL;
     _client_free(c);
+    if(had_kind) _notify(NULL, "clients", NO_IMGID);
     if(stdio) _request_quit();   // stdin closed: the client is gone
     return G_SOURCE_REMOVE;
   }

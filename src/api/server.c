@@ -3345,6 +3345,29 @@ static gboolean _name_free(const dt_develop_t *dev, const dt_masks_form_t *form)
   return TRUE;
 }
 
+// a combine name as a shape's state: classic's operators, and with flexi
+// masks screen, product and sum (the flexi operator itself, which _flexi_op
+// passes through; mask_list reports them); -1 for an unknown name
+static int _combine_state(const char *name)
+{
+  static const struct { const char *name; int state; } ops[] = {
+    { "union", DT_MASKS_STATE_UNION }, { "intersection", DT_MASKS_STATE_INTERSECTION },
+    { "difference", DT_MASKS_STATE_DIFFERENCE }, { "exclusion", DT_MASKS_STATE_EXCLUSION },
+#ifdef HAVE_MASKS_FLEXI
+    { "screen", DT_MASKS_STATE_FLEXI_SCREEN }, { "product", DT_MASKS_STATE_FLEXI_PRODUCT },
+    { "sum", DT_MASKS_STATE_FLEXI_SUM },
+#endif
+    { NULL, 0 } };
+  for(int k = 0; ops[k].name; k++)
+    if(!g_ascii_strcasecmp(name, ops[k].name)) return ops[k].state;
+  return -1;
+}
+#ifdef HAVE_MASKS_FLEXI
+#define API_COMBINE_NAMES "union, intersection, difference, exclusion, screen, product or sum"
+#else
+#define API_COMBINE_NAMES "union, intersection, difference or exclusion"
+#endif
+
 #ifdef HAVE_MASKS_FLEXI
 // flexi masks (dev-doc/masks_data_model.md): a group folds its members with
 // one operator, held by its marker, the group's first point; a member has no
@@ -3354,7 +3377,8 @@ static gboolean _name_free(const dt_develop_t *dev, const dt_masks_form_t *form)
 // classic runs)
 static dt_masks_state_t _flexi_op(const int op)
 {
-  return op & DT_MASKS_STATE_INTERSECTION ? DT_MASKS_STATE_FLEXI_MINIMUM
+  return op & DT_MASKS_STATE_FLEXI_OP ? op & DT_MASKS_STATE_FLEXI_OP  // screen, product, sum as given
+         : op & DT_MASKS_STATE_INTERSECTION ? DT_MASKS_STATE_FLEXI_MINIMUM
          : op & DT_MASKS_STATE_DIFFERENCE ? DT_MASKS_STATE_FLEXI_DIFFERENCE
          : op & DT_MASKS_STATE_EXCLUSION ? DT_MASKS_STATE_FLEXI_EXCLUSION
          : 0;                                       // union: maximum
@@ -3666,10 +3690,8 @@ static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err
       gp->formid = f->formid;
       gp->parentid = grp->formid;
       const char *combine = json_object_get_string_member_with_default(o, "combine", "union");
-      int state = !g_ascii_strcasecmp(combine, "intersection") ? DT_MASKS_STATE_INTERSECTION
-                  : !g_ascii_strcasecmp(combine, "difference") ? DT_MASKS_STATE_DIFFERENCE
-                  : !g_ascii_strcasecmp(combine, "exclusion") ? DT_MASKS_STATE_EXCLUSION
-                  : DT_MASKS_STATE_UNION;
+      int state = _combine_state(combine);
+      if(state < 0) state = DT_MASKS_STATE_UNION;
 #ifdef HAVE_MASKS_FLEXI
       free(gp);
       gp = _flexi_member(f->formid);
@@ -3900,15 +3922,10 @@ static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
                      ? json_object_get_object_member(params, "shape") : NULL;
   const char *combine = params ? json_object_get_string_member_with_default(params, "combine", "union") : "union";
   const gboolean inverted = params ? json_object_get_boolean_member_with_default(params, "inverted", FALSE) : FALSE;
-  static const struct { const char *name; int state; } ops[] = {
-    { "union", DT_MASKS_STATE_UNION }, { "intersection", DT_MASKS_STATE_INTERSECTION },
-    { "difference", DT_MASKS_STATE_DIFFERENCE }, { "exclusion", DT_MASKS_STATE_EXCLUSION }, { NULL, 0 } };
-  int op = -1;
-  for(int k = 0; ops[k].name; k++)
-    if(!g_ascii_strcasecmp(combine, ops[k].name)) op = ops[k].state;
+  const int op = _combine_state(combine);
   if(op < 0)
   {
-    *err = _ERR(API_E_PARAMS, "combine", "combine: union, intersection, difference or exclusion");
+    *err = _ERR(API_E_PARAMS, "combine", "combine: " API_COMBINE_NAMES);
     return FALSE;
   }
   const float opacity = params ? json_object_get_double_member_with_default(params, "opacity", -1.0) : -1.0;
@@ -7426,16 +7443,11 @@ static gboolean _mask_ai(JsonObject *params, JsonBuilder *b, gchar **err)
     return FALSE;
   }
   const char *combine = params ? json_object_get_string_member_with_default(params, "combine", "union") : "union";
-  static const struct { const char *name; int state; } ops[] = {
-    { "union", DT_MASKS_STATE_UNION }, { "intersection", DT_MASKS_STATE_INTERSECTION },
-    { "difference", DT_MASKS_STATE_DIFFERENCE }, { "exclusion", DT_MASKS_STATE_EXCLUSION }, { NULL, 0 } };
-  int op = -1;
-  for(int k = 0; ops[k].name; k++)
-    if(!g_ascii_strcasecmp(combine, ops[k].name)) op = ops[k].state;
+  const int op = _combine_state(combine);
   if(op < 0)
   {
     g_free(p);
-    *err = _ERR(API_E_PARAMS, "combine", "combine: union, intersection, difference or exclusion");
+    *err = _ERR(API_E_PARAMS, "combine", "combine: " API_COMBINE_NAMES);
     return FALSE;
   }
   const gboolean inverted = params ? json_object_get_boolean_member_with_default(params, "inverted", FALSE) : FALSE;

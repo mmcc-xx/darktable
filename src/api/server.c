@@ -35,7 +35,8 @@
    reset, reopened, closed, image (rating/label), markers (marker_set/_remove), library_released,
    library_acquired, handover or (darktable's window) darkroom: the photo its
    darkroom shows now, imgid 0 for none. --idle-exit stops the engine that many seconds after the
-   last client left, unless an image has unsaved changes.
+   last client left, unless an image has unsaved changes or a job runs; once its executable was
+   rebuilt, that many seconds after the last request even with clients connected (they reconnect).
 
    the session methods (module_*, history_*, geometry_*, save, reset,
    render, session_close) work on params.imgid if given, else on the image the
@@ -11908,12 +11909,31 @@ static gboolean _any_unsaved(void)
   return FALSE;
 }
 
-// idle exit: nobody connected, nothing unsaved, nothing happened for a while
+// our executable as we started from it: a build replaces it
+static GStatBuf _binary_stat;
+static gboolean _binary_known = FALSE;
+
+static gboolean _rebuilt(void)
+{
+  GStatBuf st;
+  return _binary_known
+    && (g_stat(_opt.binary, &st) != 0 || st.st_mtime != _binary_stat.st_mtime
+        || st.st_ino != _binary_stat.st_ino || st.st_size != _binary_stat.st_size);
+}
+
+// idle exit: nothing unsaved, no job, nothing happened for a while, and
+// nobody connected; or our executable was rebuilt, so the clients that only
+// listen for events (the web app) don't keep an old build running: they
+// reconnect, and start the new one, on their next request
 static gboolean _idle_cb(gpointer data)
 {
-  if(!_clients && !_any_unsaved()
-     && g_get_monotonic_time() - _last_activity > (gint64)_opt.idle_exit_s * G_USEC_PER_SEC)
+  if(!_any_unsaved() && !_jobs_running()
+     && g_get_monotonic_time() - _last_activity > (gint64)_opt.idle_exit_s * G_USEC_PER_SEC
+     && (!_clients || (!_released && _rebuilt())))
+  {
+    if(_clients) dt_print(DT_DEBUG_ALWAYS, "[api] %s was rebuilt: stopping while idle", _opt.binary);
     _request_quit();
+  }
   return G_SOURCE_CONTINUE;
 }
 
@@ -12216,7 +12236,10 @@ void dt_api_start(const dt_api_options_t *options)
   else
     _client_new(STDIN_FILENO, _opt.out_fd);
   if(_opt.idle_exit_s > 0 && _opt.listen_fd >= 0)
+  {
+    _binary_known = _opt.binary && g_stat(_opt.binary, &_binary_stat) == 0;
     _idle_source = g_timeout_add_seconds(1, _idle_cb, NULL);
+  }
 }
 
 // unsaved edits outlive the server: written next to its socket when it

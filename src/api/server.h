@@ -33,6 +33,7 @@ typedef struct dt_api_options_t
   int out_fd;              // stdout for the stdin/stdout client
   int max_sessions;        // images kept open at once
   int idle_exit_s;         // quit after this long with no client and nothing unsaved; 0: never
+  const char *binary;      // our executable: rebuilt, idle_exit_s no longer waits for clients; or NULL
   gboolean in_gui;         // darktable's window serves: no release, no shutdown
   void (*quit)(void);      // asked to stop (shutdown, stdin closed, idle)
 } dt_api_options_t;

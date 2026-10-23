@@ -111,9 +111,10 @@ int main(int argc, char **argv)
   g_unix_signal_add(SIGTERM, _on_signal, NULL);
   g_unix_signal_add(SIGINT, _on_signal, NULL);
 
+  gchar *binary = g_find_program_in_path(argv[0]);
   const dt_api_options_t options = {
     .listen_fd = listen_fd, .socket_path = listen_path, .out_fd = out_fd,
-    .max_sessions = max_sessions, .idle_exit_s = idle_exit_s,
+    .max_sessions = max_sessions, .idle_exit_s = idle_exit_s, .binary = binary,
     .in_gui = FALSE, .quit = _quit };
   dt_api_start(&options);
   g_main_loop_run(_loop);
@@ -125,6 +126,7 @@ int main(int argc, char **argv)
     _exit(0);
   }
   dt_cleanup();
+  g_free(binary);
   g_ptr_array_free(m, TRUE);
   return 0;
 }

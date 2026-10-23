@@ -80,7 +80,12 @@ example. The example clients below start it this way when nobody has.
   `image` (rating or label), `markers` (marker_set or marker_remove), `removed`, `library_released`, `library_acquired`,
   `clients` (a client said `client_hello` or, having said it, disconnected).
 - `--idle-exit` stops the engine that many seconds after the last client
-  disconnected, unless an image has unsaved changes.
+  disconnected, unless an image has unsaved changes or a job runs. Once its
+  executable was rebuilt (changed on disk), it stops that many seconds after
+  the last request even with clients connected (not while the library is
+  released), so a client that stays connected for events, like the web app,
+  doesn't keep an old build running: clients reconnect and start the new
+  one on their next request.
 
 ## darktable's window serves the same API
 

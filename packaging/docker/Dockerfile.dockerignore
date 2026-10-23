@@ -1,0 +1,8 @@
+.git
+build
+build-*
+*.log
+*.o
+*.a
+**/__pycache__
+packaging/docker/README.md

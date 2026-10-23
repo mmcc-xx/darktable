@@ -9219,7 +9219,18 @@ done:
     const int shape_px = MAX(box[2], box[3]);
     json_builder_set_member_name(b, "shape_px");
     json_builder_add_int_value(b, shape_px);
-    if(shape_px > _FILL_LARGE)
+    if(filled && !upscaled && side > 5 * made_at / 4)
+    {
+      // a fill made elsewhere (online) has texture; what it lacks is
+      // resolution: it was made smaller than the patch and is enlarged
+      gchar *w = g_strdup_printf("the fill was made at %d px for a %d px patch (%.1fx enlarged):"
+                                 " it is likely softer than the photo around it; check it at 100%%"
+                                 " (upscale sharpens it)", made_at, side, (double)side / MAX(made_at, 1));
+      json_builder_set_member_name(b, "warning");
+      json_builder_add_string_value(b, w);
+      g_free(w);
+    }
+    else if(!filled && shape_px > _FILL_LARGE)
     {
       gchar *w = g_strdup_printf("the shape is large (%d px across; fills look right up to about %d px):"
                                  " the fill is likely a soft smear rather than texture; check it at 100%%",

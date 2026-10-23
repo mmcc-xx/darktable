@@ -32,7 +32,7 @@
    image, at most --max-sessions, default 3), and each change is announced to
    the other clients as a notification {"method": "event", "params": {"type",
    "imgid", "history_end", "unsaved", "client"}} with type edit, saved,
-   reset, reopened, closed, image (rating/label), library_released,
+   reset, reopened, closed, image (rating/label), markers (marker_set/_remove), library_released,
    library_acquired, handover or (darktable's window) darkroom: the photo its
    darkroom shows now, imgid 0 for none. --idle-exit stops the engine that many seconds after the
    last client left, unless an image has unsaved changes.
@@ -6530,6 +6530,388 @@ static gboolean _set_label(JsonObject *params, JsonBuilder *b, gchar **err)
   return _image_info(params, b, err);
 }
 
+// named markers: points and areas a client puts on a photo and names, so
+// others can refer to them. Per image, in raw space, kept in a JSON file
+// next to the library (not part of the edit history); a library held in
+// memory keeps them in memory. Read on every call: the engine and
+// darktable's window hand the library over, so nothing is cached.
+#define MARKERS_MAX 100
+static gchar *_markers_mem = NULL;
+
+static gchar *_markers_file(void)
+{
+  const char *db = darktable.db ? dt_database_get_path(darktable.db) : NULL;
+  return db && *db && g_strcmp0(db, ":memory:") ? g_strconcat(db, ".markers.json", NULL) : NULL;
+}
+
+// the whole file as a parsed root object; NULL with *bad set when it exists
+// but can't be read. A missing file is empty.
+static JsonParser *_markers_read(gboolean *bad)
+{
+  *bad = FALSE;
+  gchar *file = _markers_file();
+  gchar *data = NULL;
+  gboolean have = FALSE;
+  if(file)
+  {
+    if(g_file_test(file, G_FILE_TEST_EXISTS))
+    {
+      if(g_file_get_contents(file, &data, NULL, NULL)) have = TRUE;
+      else *bad = TRUE;
+    }
+  }
+  else if(_markers_mem)
+  {
+    data = g_strdup(_markers_mem);
+    have = TRUE;
+  }
+  JsonParser *p = NULL;
+  if(have)
+  {
+    p = json_parser_new();
+    if(!json_parser_load_from_data(p, data, -1, NULL)
+       || !JSON_NODE_HOLDS_OBJECT(json_parser_get_root(p))
+       || !json_object_has_member(json_node_get_object(json_parser_get_root(p)), "images")
+       || !JSON_NODE_HOLDS_OBJECT(json_object_get_member(json_node_get_object(json_parser_get_root(p)), "images")))
+    {
+      g_object_unref(p);
+      p = NULL;
+      *bad = TRUE;
+    }
+  }
+  if(*bad) dt_print(DT_DEBUG_ALWAYS, "[api] markers file %s is unreadable", file ? file : "(memory)");
+  g_free(data);
+  g_free(file);
+  return p;
+}
+
+// the image's marker array of a parsed file, or NULL
+static JsonArray *_markers_of(JsonParser *p, const dt_imgid_t imgid)
+{
+  if(!p) return NULL;
+  JsonObject *images = json_object_get_object_member(json_node_get_object(json_parser_get_root(p)), "images");
+  gchar *key = g_strdup_printf("%d", imgid);
+  JsonArray *a = json_object_has_member(images, key) && JSON_NODE_HOLDS_ARRAY(json_object_get_member(images, key))
+                 ? json_object_get_array_member(images, key) : NULL;
+  g_free(key);
+  return a;
+}
+
+// write the parsed file back (an empty image entry is dropped)
+static gboolean _markers_write(JsonParser *p, gchar **err)
+{
+  JsonObject *images = json_object_get_object_member(json_node_get_object(json_parser_get_root(p)), "images");
+  GList *keys = json_object_get_members(images);
+  for(GList *l = keys; l; l = g_list_next(l))
+  {
+    JsonNode *n = json_object_get_member(images, l->data);
+    if(!JSON_NODE_HOLDS_ARRAY(n) || json_array_get_length(json_node_get_array(n)) == 0)
+      json_object_remove_member(images, l->data);
+  }
+  g_list_free(keys);
+  JsonGenerator *g = json_generator_new();
+  json_generator_set_root(g, json_parser_get_root(p));
+  gchar *data = json_generator_to_data(g, NULL);
+  g_object_unref(g);
+  gchar *file = _markers_file();
+  gboolean ok = TRUE;
+  GError *error = NULL;
+  if(file)
+  {
+    ok = g_file_set_contents(file, data, -1, &error);
+    if(!ok) *err = _ERRF(API_E_FAILED, NULL, "can't write %s: %s", file, error->message);
+    g_clear_error(&error);
+  }
+  else
+  {
+    g_free(_markers_mem);
+    _markers_mem = g_strdup(data);
+  }
+  g_free(data);
+  g_free(file);
+  return ok;
+}
+
+// a parsed file to modify: the existing one, or a fresh empty one
+static JsonParser *_markers_open(gchar **err)
+{
+  gboolean bad;
+  JsonParser *p = _markers_read(&bad);
+  if(bad)
+  {
+    *err = _ERR(API_E_FAILED, NULL, "the markers file is unreadable: fix or delete it (not overwritten)");
+    return NULL;
+  }
+  if(!p)
+  {
+    p = json_parser_new();
+    json_parser_load_from_data(p, "{\"version\":1,\"images\":{}}", -1, NULL);
+  }
+  return p;
+}
+
+// the image's array in a file to modify, created when missing
+static JsonArray *_markers_array(JsonParser *p, const dt_imgid_t imgid)
+{
+  JsonArray *a = _markers_of(p, imgid);
+  if(a) return a;
+  JsonObject *images = json_object_get_object_member(json_node_get_object(json_parser_get_root(p)), "images");
+  gchar *key = g_strdup_printf("%d", imgid);
+  a = json_array_new();
+  json_object_set_array_member(images, key, a);
+  g_free(key);
+  return a;
+}
+
+static gboolean _markers_imgid(JsonObject *params, dt_imgid_t *imgid, gchar **err)
+{
+  *imgid = params ? json_object_get_int_member_with_default(params, "imgid", -1) : -1;
+  if(!dt_is_valid_imgid(*imgid) || !_image_exists(*imgid))
+  {
+    *err = _ERRF(API_E_NOT_FOUND, "imgid", "no image with id %d", *imgid);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+static void _markers_names(JsonArray *a, GString *s)
+{
+  for(guint i = 0; a && i < json_array_get_length(a); i++)
+    g_string_append_printf(s, "%s'%s'", i ? ", " : "",
+                           json_object_get_string_member_with_default(json_array_get_object_element(a, i), "name", ""));
+  if(!a || !json_array_get_length(a)) g_string_append(s, "none");
+}
+
+static gboolean _marker_set(const gchar *by, JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_imgid_t imgid;
+  if(!_markers_imgid(params, &imgid, err)) return FALSE;
+
+  const JsonNode *nn = json_object_get_member(params, "name");
+  gchar *name = nn && json_node_get_value_type((JsonNode *)nn) == G_TYPE_STRING
+                ? g_strstrip(g_strdup(json_node_get_string((JsonNode *)nn))) : NULL;
+  if(!name || !*name || g_utf8_strlen(name, -1) > 64)
+  {
+    g_free(name);
+    *err = _ERR(API_E_PARAMS, "name", "name: a string of 1 to 64 characters is required");
+    return FALSE;
+  }
+  const gchar *kind = json_object_has_member(params, "kind")
+                      && json_node_get_value_type(json_object_get_member(params, "kind")) == G_TYPE_STRING
+                        ? json_object_get_string_member(params, "kind") : NULL;
+  int lo = 0, hi = 0;
+  if(!g_strcmp0(kind, "point")) lo = hi = 1;
+  else if(!g_strcmp0(kind, "rect")) lo = hi = 4;
+  else if(!g_strcmp0(kind, "ellipse")) { lo = 8; hi = 128; }
+  else if(!g_strcmp0(kind, "outline")) { lo = 3; hi = 500; }
+  else
+  {
+    g_free(name);
+    *err = _ERR(API_E_PARAMS, "kind", "kind must be point, rect, ellipse or outline");
+    return FALSE;
+  }
+  JsonArray *pts = json_object_has_member(params, "points") && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "points"))
+                   ? json_object_get_array_member(params, "points") : NULL;
+  const int np = pts ? json_array_get_length(pts) : 0;
+  if(np < lo || np > hi)
+  {
+    g_free(name);
+    if(lo == hi)
+      *err = _ERRF(API_E_PARAMS, "points", "a %s takes exactly %d point%s ([x, y] in raw space)", kind, lo, lo == 1 ? "" : "s");
+    else
+      *err = _ERRF(API_E_PARAMS, "points", "an %s takes %d to %d points ([x, y] in raw space), not %d", kind, lo, hi, np);
+    return FALSE;
+  }
+  for(int i = 0; i < np; i++)
+  {
+    JsonNode *n = json_array_get_element(pts, i);
+    JsonArray *xy = JSON_NODE_HOLDS_ARRAY(n) ? json_node_get_array(n) : NULL;
+    gboolean ok = xy && json_array_get_length(xy) == 2;
+    for(int k = 0; ok && k < 2; k++)
+    {
+      JsonNode *v = json_array_get_element(xy, k);
+      ok = JSON_NODE_HOLDS_VALUE(v)
+           && (json_node_get_value_type(v) == G_TYPE_DOUBLE || json_node_get_value_type(v) == G_TYPE_INT64)
+           && isfinite(json_node_get_double(v));
+    }
+    if(!ok)
+    {
+      g_free(name);
+      *err = _ERRF(API_E_PARAMS, "points", "points[%d] must be [x, y] with finite numbers", i);
+      return FALSE;
+    }
+  }
+  const gchar *note = json_object_has_member(params, "note")
+                      && json_node_get_value_type(json_object_get_member(params, "note")) == G_TYPE_STRING
+                        ? json_object_get_string_member(params, "note") : "";
+  if(g_utf8_strlen(note, -1) > 500)
+  {
+    g_free(name);
+    *err = _ERR(API_E_PARAMS, "note", "note: at most 500 characters");
+    return FALSE;
+  }
+
+  JsonParser *p = _markers_open(err);
+  if(!p)
+  {
+    g_free(name);
+    return FALSE;
+  }
+  JsonArray *a = _markers_array(p, imgid);
+  int at = -1;
+  gchar *fold = g_utf8_casefold(name, -1);
+  for(guint i = 0; i < json_array_get_length(a); i++)
+  {
+    gchar *f = g_utf8_casefold(json_object_get_string_member_with_default(json_array_get_object_element(a, i), "name", ""), -1);
+    if(!g_strcmp0(f, fold)) at = i;
+    g_free(f);
+  }
+  g_free(fold);
+  if(at < 0 && json_array_get_length(a) >= MARKERS_MAX)
+  {
+    g_free(name);
+    g_object_unref(p);
+    *err = _ERRF(API_E_PARAMS, "name", "at most %d markers per image: marker_remove some first", MARKERS_MAX);
+    return FALSE;
+  }
+
+  JsonBuilder *mb = json_builder_new();
+  json_builder_begin_object(mb);
+  json_builder_set_member_name(mb, "name");
+  json_builder_add_string_value(mb, name);
+  json_builder_set_member_name(mb, "kind");
+  json_builder_add_string_value(mb, kind);
+  json_builder_set_member_name(mb, "points");
+  json_builder_begin_array(mb);
+  for(int i = 0; i < np; i++)
+  {
+    JsonArray *xy = json_array_get_array_element(pts, i);
+    json_builder_begin_array(mb);
+    json_builder_add_double_value(mb, json_array_get_double_element(xy, 0));
+    json_builder_add_double_value(mb, json_array_get_double_element(xy, 1));
+    json_builder_end_array(mb);
+  }
+  json_builder_end_array(mb);
+  json_builder_set_member_name(mb, "note");
+  json_builder_add_string_value(mb, note);
+  json_builder_set_member_name(mb, "by");
+  json_builder_add_string_value(mb, by ? by : "");
+  json_builder_set_member_name(mb, "updated");
+  json_builder_add_int_value(mb, g_get_real_time() / G_USEC_PER_SEC);
+  json_builder_end_object(mb);
+  JsonNode *mn = json_builder_get_root(mb);
+  g_object_unref(mb);
+  JsonObject *mo = json_node_dup_object(mn);
+  json_node_unref(mn);
+
+  if(at >= 0)
+  {
+    // json-glib has no insert: rebuild the array with the new one at `at`
+    JsonArray *na = json_array_new();
+    for(guint i = 0; i < json_array_get_length(a); i++)
+      if((int)i == at) json_array_add_object_element(na, json_object_ref(mo));
+      else json_array_add_element(na, json_node_copy(json_array_get_element(a, i)));
+    JsonObject *images = json_object_get_object_member(json_node_get_object(json_parser_get_root(p)), "images");
+    gchar *key = g_strdup_printf("%d", imgid);
+    json_object_set_array_member(images, key, na);
+    g_free(key);
+  }
+  else
+    json_array_add_object_element(a, json_object_ref(mo));
+
+  const gboolean ok = _markers_write(p, err);
+  g_object_unref(p);
+  g_free(name);
+  if(!ok)
+  {
+    json_object_unref(mo);
+    return FALSE;
+  }
+  json_builder_set_member_name(b, "imgid");
+  json_builder_add_int_value(b, imgid);
+  json_builder_set_member_name(b, "marker");
+  JsonNode *out = json_node_new(JSON_NODE_OBJECT);
+  json_node_take_object(out, mo);
+  json_builder_add_value(b, out);
+  return TRUE;
+}
+
+static gboolean _marker_list(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_imgid_t imgid;
+  if(!_markers_imgid(params, &imgid, err)) return FALSE;
+  gboolean bad;
+  JsonParser *p = _markers_read(&bad);  // unreadable: an empty list (warned)
+  JsonArray *a = _markers_of(p, imgid);
+  json_builder_set_member_name(b, "imgid");
+  json_builder_add_int_value(b, imgid);
+  json_builder_set_member_name(b, "markers");
+  json_builder_begin_array(b);
+  for(guint i = 0; a && i < json_array_get_length(a); i++)
+    json_builder_add_value(b, json_node_copy(json_array_get_element(a, i)));
+  json_builder_end_array(b);
+  if(p) g_object_unref(p);
+  return TRUE;
+}
+
+static gboolean _marker_remove(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_imgid_t imgid;
+  if(!_markers_imgid(params, &imgid, err)) return FALSE;
+  const gboolean all = json_object_get_boolean_member_with_default(params, "all", FALSE);
+  const gchar *name = json_object_has_member(params, "name")
+                      && json_node_get_value_type(json_object_get_member(params, "name")) == G_TYPE_STRING
+                        ? json_object_get_string_member(params, "name") : NULL;
+  if(!all && (!name || !*name))
+  {
+    *err = _ERR(API_E_PARAMS, "name", "marker_remove needs a name, or all: true");
+    return FALSE;
+  }
+  JsonParser *p = _markers_open(err);
+  if(!p) return FALSE;
+  JsonArray *a = _markers_of(p, imgid);
+  int removed = 0;
+  if(all)
+  {
+    removed = a ? json_array_get_length(a) : 0;
+    if(a) while(json_array_get_length(a)) json_array_remove_element(a, 0);
+  }
+  else
+  {
+    gchar *fold = g_utf8_casefold(g_strstrip(g_strdup(name)), -1);
+    for(guint i = 0; a && i < json_array_get_length(a); i++)
+    {
+      gchar *f = g_utf8_casefold(json_object_get_string_member_with_default(json_array_get_object_element(a, i), "name", ""), -1);
+      const gboolean hit = !g_strcmp0(f, fold);
+      g_free(f);
+      if(hit)
+      {
+        json_array_remove_element(a, i);
+        removed = 1;
+        break;
+      }
+    }
+    g_free(fold);
+    if(!removed)
+    {
+      GString *s = g_string_new(NULL);
+      _markers_names(a, s);
+      *err = _ERRF(API_E_NOT_FOUND, "name", "image %d has no marker '%s'; it has: %s", imgid, name, s->str);
+      g_string_free(s, TRUE);
+      g_object_unref(p);
+      return FALSE;
+    }
+  }
+  const gboolean ok = removed ? _markers_write(p, err) : TRUE;
+  g_object_unref(p);
+  if(!ok) return FALSE;
+  json_builder_set_member_name(b, "imgid");
+  json_builder_add_int_value(b, imgid);
+  json_builder_set_member_name(b, "removed");
+  json_builder_add_int_value(b, removed);
+  return TRUE;
+}
+
 static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err);
 
 // the darkroom's image renders through its mirror (_pipe_session)
@@ -11013,7 +11395,7 @@ static gboolean _quit_window(gpointer data)
 }
 
 static const char *_methods[] = {
-  "ping", "client_hello", "clients", "film_rolls", "images_list", "images_list.tag", "image_info", "thumbnail", "thumbnails", "import", "set_rating", "set_label",
+  "ping", "client_hello", "clients", "film_rolls", "images_list", "images_list.tag", "image_info", "thumbnail", "thumbnails", "import", "set_rating", "set_label", "marker_set", "marker_list", "marker_remove",
   "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
   "module_enable", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
@@ -11224,6 +11606,20 @@ static gboolean _handle(_client_t *c, const gchar *line)
     {
       event = "image";
       event_img = json_object_get_int_member_with_default(params, "imgid", NO_IMGID);
+    }
+  }
+  else if(!g_strcmp0(method, "marker_set") || !g_strcmp0(method, "marker_list") || !g_strcmp0(method, "marker_remove"))
+  {
+    const gboolean set = !g_strcmp0(method, "marker_set");
+    const gboolean list = !g_strcmp0(method, "marker_list");
+    if(list ? _marker_list(params, b, &err) : set ? _marker_set(c->kind, params, b, &err)
+                                                  : _marker_remove(params, b, &err))
+    {
+      if(!list)
+      {
+        event = "markers";
+        event_img = json_object_get_int_member_with_default(params, "imgid", NO_IMGID);
+      }
     }
   }
   else if(!g_strcmp0(method, "session_open"))

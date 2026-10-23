@@ -77,7 +77,7 @@ example. The example clients below start it this way when nobody has.
 - **Notifications:** every change is announced to the other clients:
   `{"jsonrpc":"2.0","method":"event","params":{"type","imgid","history_end","unsaved","client"}}`
   with `type` one of `edit`, `saved`, `reset`, `reopened`, `closed`,
-  `image` (rating or label), `removed`, `library_released`, `library_acquired`,
+  `image` (rating or label), `markers` (marker_set or marker_remove), `removed`, `library_released`, `library_acquired`,
   `clients` (a client said `client_hello` or, having said it, disconnected).
 - `--idle-exit` stops the engine that many seconds after the last client
   disconnected, unless an image has unsaved changes.
@@ -172,6 +172,7 @@ message only):
 | `set_metadata {imgids, values}` | metadata fields by name or xmp key (`""` clears one), as the metadata editor |
 | `set_location {imgids, latitude, longitude, elevation, clear}` | the location, as geotagging sets it; `clear` removes it. These three write the sidecar and tell the window's panels; each image gets an `image` event |
 | `set_rating {imgid, rating}` / `set_label {imgid, label, on}` | 0..5 or `"reject"` (as the lighttable); color label 0..4 (red, yellow, green, blue, purple) |
+| `marker_set {imgid, name, kind, points, note}` / `marker_list {imgid}` / `marker_remove {imgid, name}` or `{imgid, all: true}` | named markers: points and areas a client puts on a photo, so others can refer to them ("left tree"). Per image, shared by every client, kept in `<library>.markers.json` (in memory for a `:memory:` library), not in the edit history. `kind`: `point` (1 point), `rect` (4 corners), `ellipse` (8-128 outline points), `outline` (3-500); points are `[x, y]` in raw space (as `mask_add` shapes); `name` 1-64 chars, unique per image ignoring case (setting an existing one replaces it in place); `note` <= 500 chars; at most 100 per image. A marker is `{name, kind, points, note, by, updated}` (`by`: the setting client's `client_hello` kind). `marker_set` and `marker_remove` send a `markers` event |
 | `session_open {imgid, fresh}` / `session_close` | open a photo for editing: load it and replay its history, as the darkroom does, or join the session another client has open (`joined`, `unsaved` in the reply); `fresh` reloads it as saved, dropping unsaved changes for everyone (refused for the photo in darktable's darkroom, which writes its edit to the library every `autosave_interval` seconds itself: undo there with `history_end`). `session_close` closes it for everyone |
 | `module_list` | the photo's modules in pipe order: enabled, in history, and `label` as darktable shows the instance ("local contrast", "exposure • sky") |
 | `module_get {operation, instance, raw}` | settings by name through introspection: value, default, declared range, enum names and labels; lists with their `shape` and nested values; `raw` adds `params_hex`, the settings as darktable stores them (every field, also those not listed) |

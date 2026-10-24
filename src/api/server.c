@@ -3728,11 +3728,17 @@ static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err
                                      : dt_conf_get_float("plugins/darkroom/masks/path/border"));
     const double hardness = _NUM(sh, "hardness", dt_conf_get_float("plugins/darkroom/masks/brush/hardness"));
     const double density = _NUM(sh, "density", dt_conf_get_float("plugins/darkroom/masks/brush/density"));
+    // corners: "smooth" (default) rounds the shape off through its points,
+    // "sharp" puts the control points on them (a polygon or polyline)
+    const char *corners = json_object_get_string_member_with_default(sh, "corners", "smooth");
+    const gboolean sharp = !g_strcmp0(corners, "sharp");
     gboolean ok = n >= (brush ? 2 : 3) && border > 0.0 && border <= 1.0
-                  && hardness >= 0.0 && hardness <= 1.0 && density >= 0.0 && density <= 1.0;
-    // a point is [x, y] (smoothed through its neighbours) or an object as
-    // mask_list gives it: corner, ctrl1, ctrl2, border (pairs), hardness,
-    // density, smooth (false: the control points stay as given)
+                  && hardness >= 0.0 && hardness <= 1.0 && density >= 0.0 && density <= 1.0
+                  && (sharp || !g_strcmp0(corners, "smooth"));
+    // a point is [x, y] (smoothed through its neighbours, or sharp) or an
+    // object as mask_list gives it: corner, ctrl1, ctrl2, border (pairs),
+    // hardness, density, smooth (false: the control points stay as given,
+    // or on the corner without them)
     typedef struct { float corner[2], ctrl1[2], ctrl2[2], border[2], hardness, density; gboolean smooth, has_ctrl; } _pt_t;
     _pt_t *pt = g_new0(_pt_t, MAX(n, 1));
     gboolean all_ctrl = TRUE;
@@ -3743,7 +3749,7 @@ static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err
       q->border[0] = q->border[1] = brush ? border : MAX(0.0005f, border);
       q->hardness = hardness;
       q->density = density;
-      q->smooth = TRUE;
+      q->smooth = !sharp;
       gboolean got_ctrl = FALSE;
       if(JSON_NODE_HOLDS_ARRAY(e))
       {
@@ -3768,7 +3774,7 @@ static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err
         }
         q->hardness = _NUM(o, "hardness", q->hardness);
         q->density = _NUM(o, "density", q->density);
-        q->smooth = json_object_get_boolean_member_with_default(o, "smooth", !got_ctrl);
+        q->smooth = json_object_get_boolean_member_with_default(o, "smooth", !got_ctrl && !sharp);
         q->has_ctrl = got_ctrl;
       }
       else
@@ -3776,17 +3782,24 @@ static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err
       ok = ok && q->corner[0] >= 0.0 && q->corner[0] <= 1.0 && q->corner[1] >= 0.0 && q->corner[1] <= 1.0
               && q->border[0] >= 0.0 && q->border[1] >= 0.0 && q->hardness >= 0.0 && q->hardness <= 1.0
               && q->density >= 0.0 && q->density <= 1.0;
-      if(ok && !q->smooth && !got_ctrl) ok = FALSE;
-      if(!got_ctrl) all_ctrl = FALSE;
+      // a sharp corner, as the path tool's ctrl+click makes it
+      if(!q->smooth && !got_ctrl)
+      {
+        memcpy(q->ctrl1, q->corner, sizeof(q->ctrl1));
+        memcpy(q->ctrl2, q->corner, sizeof(q->ctrl2));
+        q->has_ctrl = TRUE;
+      }
+      if(!q->has_ctrl) all_ctrl = FALSE;
     }
     if(!ok)
     {
       g_free(pt);
       *err = _ERR(API_E_PARAMS, "shape", brush ? "brush: points (2 or more, raw space): [x, y] or {corner, ctrl1, ctrl2, border,"
                               " hardness, density, smooth}; width 0..1 (relative to the shorter side), hardness"
-                              " and density 0..1"
+                              " and density 0..1; corners smooth or sharp"
                             : "path: points (3 or more, raw space; closed): [x, y] or {corner, ctrl1, ctrl2,"
-                              " border, smooth}; border 0..1 (relative to the shorter side)");
+                              " border, smooth}; border 0..1 (relative to the shorter side); corners smooth or"
+                              " sharp");
       return NULL;
     }
     form = dt_masks_create(brush ? DT_MASKS_BRUSH : DT_MASKS_PATH);
@@ -11401,7 +11414,7 @@ static const char *_methods[] = {
   "module_enable", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
   "retouch_remove", "blend_get", "blend_set", "mask_add", "mask_list",
-  "mask_remove", "mask_add.path", "mask_ai", "mask_ai_encode", "export.background", "sample", "ai_denoise",
+  "mask_remove", "mask_add.path", "mask_add.corners", "mask_ai", "mask_ai_encode", "export.background", "sample", "ai_denoise",
 #ifdef HAVE_OVERLAY_COMPOSITE_HQ
   "ai_fill",
 #if defined(HAVE_AI) && defined(PNG_SIMPLIFIED_READ_SUPPORTED) && defined(PNG_SIMPLIFIED_WRITE_SUPPORTED)

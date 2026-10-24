@@ -10592,6 +10592,20 @@ static _control_t *_control_find(dt_iop_module_t *m, const char *name, GList **l
   return NULL;
 }
 
+// a control darktable hides for this image: hidden itself or in a box, or
+// on a stack page not shown (white balance on a monochrome raw shows its
+// "disabled" page). pressed anyway, its picker never gets a sample
+static gboolean _control_hidden(const dt_iop_module_t *m, const _control_t *c)
+{
+  for(GtkWidget *w = c->widget; w && w != m->widget; w = gtk_widget_get_parent(w))
+  {
+    if(!gtk_widget_get_visible(w)) return TRUE;
+    GtkWidget *parent = gtk_widget_get_parent(w);
+    if(GTK_IS_STACK(parent) && gtk_stack_get_visible_child(GTK_STACK(parent)) != w) return TRUE;
+  }
+  return FALSE;
+}
+
 // the darkroom's pipe runs, for auto buttons that need one before they can
 // work (tone equalizer's wands read its histogram) or after (rgb levels'
 // auto levels computes in the pipe)
@@ -11122,6 +11136,16 @@ static gboolean _picker_apply(JsonObject *params, JsonBuilder *b, gchar **err)
   {
     g_list_free_full(list, _control_free);
     *err = _ERRF(API_E_NOT_FOUND, "name", "module '%s' has no picker or button '%s' (picker_list)", m->op, name ? name : "");
+    return FALSE;
+  }
+  if(_control_hidden(m, c))
+  {
+    // the headless picker's reason, when it has one, says why
+    const dt_api_picker_t *pk = c->picker ? dt_api_picker_find(m->op, c->name) : NULL;
+    const char *why = pk && pk->unavailable ? pk->unavailable(m) : NULL;
+    *err = why ? _ERRF(API_E_UNAVAILABLE, "name", "%s: %s", m->op, why)
+               : _ERRF(API_E_UNAVAILABLE, "name", "darktable hides '%s' of '%s' for this image", c->name, m->op);
+    g_list_free_full(list, _control_free);
     return FALSE;
   }
   float area[4] = { 0.f };

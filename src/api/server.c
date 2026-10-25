@@ -8101,9 +8101,16 @@ typedef struct _job_t
   gint done, total;
   int generated, skipped, failed;
   struct _import_t *import;
+  // an AI fill made elsewhere: the request, the fill read, and how far it is
+  JsonObject *fill_params;
+  float *fill;
+  int fill_w, fill_h, fill_side, fill_made_at, fill_upscaled;
+  int fill_instance;
 } _job_t;
 
 static GList *_jobs = NULL;
+static gint64 _gui_last_edit = 0;       // see _settling
+static gboolean _settling = FALSE;
 static int _next_job = 1;
 
 static void _notify_job(const _job_t *j);
@@ -8948,11 +8955,8 @@ static void _fill_upscale(float **f, int *w, int *h, const int side, int *upscal
 }
 
 // a fill made elsewhere (filled): a PNG or other image libpng reads, any
-// size, as encoded RGBA at side x side; *made_at: its larger side. upscale:
-// a fill much smaller than the crop goes through darktable's AI upscaler
-// first (*upscaled: its factor, 0 if not)
-static float *_fill_read(const char *path, const int side, const gboolean upscale, int *made_at,
-                         int *upscaled, gchar **err)
+// size, as encoded RGBA at *w x *h
+static float *_fill_load(const char *path, int *w, int *h, gchar **err)
 {
 #ifndef PNG_SIMPLIFIED_READ_SUPPORTED
   *err = _ERR(API_E_UNAVAILABLE, "filled", "this darktable's libpng cannot read PNG files simply (libpng 1.6)");
@@ -8965,26 +8969,40 @@ static float *_fill_read(const char *path, const int side, const gboolean upscal
     return NULL;
   }
   im.format = PNG_FORMAT_RGBA;
-  int w = im.width, h = im.height;
-  *made_at = MAX(w, h);
+  *w = im.width;
+  *h = im.height;
   guint8 *px = g_try_malloc(PNG_IMAGE_SIZE(im));
-  float *f = dt_alloc_align_float((size_t)4 * w * h);
-  float *out = dt_alloc_align_float((size_t)4 * side * side);
-  if(!px || !f || !out || !png_image_finish_read(&im, NULL, px, 0, NULL))
+  float *f = dt_alloc_align_float((size_t)4 * *w * *h);
+  if(!px || !f || !png_image_finish_read(&im, NULL, px, 0, NULL))
   {
-    if(!px || !f || !out) png_image_free(&im);
+    if(!px || !f) png_image_free(&im);
     *err = _ERRF(API_E_PARAMS, "filled", "filled: could not read %s", path);
     g_free(px);
     dt_free_align(f);
-    dt_free_align(out);
     return NULL;
   }
-  for(size_t k = 0; k < (size_t)w * h; k++)
+  for(size_t k = 0; k < (size_t)*w * *h; k++)
   {
     for(int c = 0; c < 3; c++) f[4 * k + c] = px[4 * k + c] / 255.0f;
     f[4 * k + 3] = 0.0f;
   }
   g_free(px);
+  return f;
+#endif
+}
+
+// f (w x h, encoded RGBA, taken) as side x side: upscale: a fill much
+// smaller than the crop goes through darktable's AI upscaler first
+// (*upscaled: its factor, 0 if not); then stretched to the crop. NULL when
+// out of memory. Runs on a thread: no develop, session or pipe state
+static float *_fill_fit(float *f, int w, int h, const int side, const gboolean upscale, int *upscaled)
+{
+  float *out = dt_alloc_align_float((size_t)4 * side * side);
+  if(!out)
+  {
+    dt_free_align(f);
+    return NULL;
+  }
   if(upscale && side > 5 * MAX(w, h) / 4) _fill_upscale(&f, &w, &h, side, upscaled);
   // to side x side: a fill made at another size or aspect is stretched to the crop
   if(w == side && h == side)
@@ -9005,7 +9023,6 @@ static float *_fill_read(const char *path, const int side, const gboolean upscal
       {
         dt_free_align(f);
         dt_free_align(out);
-        *err = g_strdup("out of memory");
         return NULL;
       }
       for(int y = 0; y < q; y++)
@@ -9018,7 +9035,19 @@ static float *_fill_read(const char *path, const int side, const gboolean upscal
   }
   dt_free_align(f);
   return out;
-#endif
+}
+
+// _fill_load and _fill_fit; *made_at: the file's larger side
+static float *_fill_read(const char *path, const int side, const gboolean upscale, int *made_at,
+                         int *upscaled, gchar **err)
+{
+  int w = 0, h = 0;
+  float *f = _fill_load(path, &w, &h, err);
+  if(!f) return NULL;
+  *made_at = MAX(w, h);
+  float *out = _fill_fit(f, w, h, side, upscale, upscaled);
+  if(!out) *err = g_strdup("out of memory");
+  return out;
 }
 
 // a fill made elsewhere matched to the photo: some models (FLUX Erase)
@@ -9181,6 +9210,12 @@ static gboolean _inpaint(dt_ai_context_t *ctx, const float *ext, float *buf, con
 
 // fill a drawn shape with an inpainting model: a new composite instance
 // with the patch and the shape as its mask (see the section's comment)
+#if defined(HAVE_AI) && defined(HAVE_OVERLAY_COMPOSITE_HQ)
+static gpointer _fill_job_run(gpointer data);
+// the job whose finish is running ai_fill again: its fill is already made
+static _job_t *_fill_ready = NULL;
+#endif
+
 static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
 {
 #if !defined(HAVE_AI)
@@ -9288,6 +9323,7 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
   int upscaled = 0;                         // the AI upscaler's factor on it
   float match[6] = { 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f };  // color match: gains, offsets
   gboolean matched = FALSE;
+  const _job_t *queued = NULL;              // the background job a filled call started
   // the session whose pipe measures and renders: in darktable's window the
   // darkroom's mirror (_pipe_session), with its own copy of the instance
   _session_t *owner = _cur, *ps = _cur;
@@ -9422,8 +9458,67 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
       ok = _fill_export(buf, mask, side, size, to_srgb, crop_image, crop_mask, err);
     goto done;
   }
-  if(filled && !(ext = _fill_read(filled, side, json_object_get_boolean_member_with_default(params, "upscale", FALSE),
-                                  &made_at, &upscaled, err)))
+  if(filled && _fill_ready)
+  {
+    // the fill the job prepared
+    if(_fill_ready->fill_side != side)
+    {
+      *err = g_strdup("the photo's size or crop changed while the fill was prepared: run ai_fill again");
+      goto done;
+    }
+    ext = _fill_ready->fill;
+    _fill_ready->fill = NULL;
+    made_at = _fill_ready->fill_made_at;
+    upscaled = _fill_ready->fill_upscaled;
+  }
+  else if(filled && json_object_get_boolean_member_with_default(params, "background", FALSE))
+  {
+    // the PNG is read now, so it may be deleted when the reply comes; the
+    // upscale and the resample are the job's
+    for(GList *l = _jobs; l; l = g_list_next(l))
+    {
+      const _job_t *o = l->data;
+      if(o->state == _JOB_RUNNING && o->imgid == host && !g_strcmp0(o->type, "ai_fill"))
+      {
+        *err = _ERRF(API_E_BUSY, NULL, "job %d fills this photo already", o->id);
+        goto done;
+      }
+    }
+    int fw = 0, fh = 0;
+    float *loaded = _fill_load(filled, &fw, &fh, err);
+    if(!loaded) goto done;
+    _job_t *j = g_new0(_job_t, 1);
+    j->id = _next_job++;
+    j->type = "ai_fill";
+    j->imgid = host;
+    j->state = _JOB_RUNNING;
+    j->started = g_get_monotonic_time();
+    // a deep copy: the request's object goes when its reply is sent
+    JsonNode *pn = json_node_init_object(json_node_alloc(), params);
+    gchar *pjson = json_to_string(pn, FALSE);
+    json_node_free(pn);
+    JsonNode *pc = json_from_string(pjson, NULL);
+    g_free(pjson);
+    j->fill_params = pc ? json_object_ref(json_node_get_object(pc)) : json_object_new();
+    if(pc) json_node_unref(pc);
+    json_object_remove_member(j->fill_params, "background");
+    j->fill = loaded;
+    j->fill_w = fw;
+    j->fill_h = fh;
+    j->fill_side = side;
+    j->fill_made_at = MAX(fw, fh);
+    j->fill_instance = reuse;
+    // darktable's job handle, where its control runs (its window)
+    j->handle = dt_control_job_create(NULL, "api: ai fill");
+    if(j->handle && _in_gui) dt_control_job_add_progress(j->handle, _("AI fill"), FALSE);
+    _jobs = g_list_append(_jobs, j);
+    j->thread = g_thread_new("api-fill", _fill_job_run, j);
+    queued = j;
+    ok = TRUE;
+    goto done;
+  }
+  else if(filled && !(ext = _fill_read(filled, side, json_object_get_boolean_member_with_default(params, "upscale", FALSE),
+                                       &made_at, &upscaled, err)))
     goto done;
   if(!_inpaint(ctx, ext, buf, mask, side, size, to_srgb, to_cam,
                ((uint64_t)rx << 32) ^ (uint64_t)ry ^ ((uint64_t)host << 48),
@@ -9543,7 +9638,16 @@ done:
   dt_free_align(ext);
   if(ctx) dt_ai_unload_model(ctx);
   if(env) dt_ai_env_destroy(env);
-  if(ok && crop_to)
+  if(queued)
+  {
+    _add_job(b, queued);
+    json_builder_set_member_name(b, "patch");
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "size");
+    json_builder_add_int_value(b, side);
+    json_builder_end_object(b);
+  }
+  else if(ok && crop_to)
   {
     // the instance stays, set up without a patch, for the filled call
     _add_instance(b, m);
@@ -9643,6 +9747,92 @@ done:
   return ok;
 #endif
 }
+
+#if defined(HAVE_AI) && defined(HAVE_OVERLAY_COMPOSITE_HQ)
+// the upscale and the resample of a background fill (filled with
+// background: true) on a thread; the rest is _ai_fill again, on the
+// server's thread, with the fill made
+static gboolean _fill_job_finish(gpointer data)
+{
+  _job_t *j = data;
+  // a request waiting in _gui_settle runs the main loop: not inside it
+  if(_settling)
+  {
+    g_timeout_add(50, _fill_job_finish, j);
+    return G_SOURCE_REMOVE;
+  }
+  g_thread_join(j->thread);
+  j->thread = NULL;
+  j->finished = g_get_monotonic_time();
+  gboolean ok = FALSE;
+  if(g_atomic_int_get(&j->cancel)
+     || (j->handle && dt_control_job_get_state(j->handle) == DT_JOB_STATE_CANCELLED))
+  {
+    j->state = _JOB_CANCELLED;
+    j->error = g_strdup_printf("cancelled: the composite instance %d is left without a patch (module_remove it)",
+                               j->fill_instance);
+  }
+  else if(!_session_find(j->imgid))
+  {
+    j->state = _JOB_FAILED;
+    j->error = g_strdup_printf("photo %d was closed while its fill was prepared", j->imgid);
+  }
+  else if(!j->fill)
+  {
+    j->state = _JOB_FAILED;
+    j->error = g_strdup("out of memory");
+  }
+  else
+  {
+    _session_t *saved = _cur;
+    _cur = _session_find(j->imgid);
+    JsonBuilder *b = json_builder_new();
+    json_builder_begin_object(b);
+    gchar *err = NULL;
+    _fill_ready = j;
+    ok = _ai_fill(j->fill_params, b, &err);
+    _fill_ready = NULL;
+    json_builder_end_object(b);
+    if(_cur->gui) _gui_last_edit = g_get_monotonic_time();
+    _cur = saved;
+    if(ok)
+    {
+      j->state = _JOB_DONE;
+      j->result = json_builder_get_root(b);
+    }
+    else
+    {
+      j->state = _JOB_FAILED;
+      j->error = err ? err : g_strdup("the fill failed");
+      err = NULL;
+    }
+    g_free(err);
+    g_object_unref(b);
+  }
+  dt_free_align(j->fill);
+  j->fill = NULL;
+  if(j->fill_params) json_object_unref(j->fill_params);
+  j->fill_params = NULL;
+  if(j->handle)
+  {
+    dt_control_job_dispose(j->handle);
+    j->handle = NULL;
+  }
+  if(ok) _notify(NULL, "edit", j->imgid);
+  _notify_job(j);
+  return G_SOURCE_REMOVE;
+}
+
+static gpointer _fill_job_run(gpointer data)
+{
+  _job_t *j = data;
+  j->fill = _fill_fit(j->fill, j->fill_w, j->fill_h, j->fill_side,
+                      json_object_get_boolean_member_with_default(j->fill_params, "upscale", FALSE),
+                      &j->fill_upscaled);
+  g_idle_add(_fill_job_finish, j);
+  return NULL;
+}
+#endif
 
 // ---- exports and AI mask encoding in the background ---------------------
 // as AI denoise: the slow part on a thread of its own, the rest on the
@@ -11443,6 +11633,7 @@ static const char *_methods[] = {
   "ai_fill",
 #if defined(HAVE_AI) && defined(PNG_SIMPLIFIED_READ_SUPPORTED) && defined(PNG_SIMPLIFIED_WRITE_SUPPORTED)
   "ai_fill.external",
+  "ai_fill.background",
 #endif
 #endif
   "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "image_remove", "style_list", "style_create", "style_delete", "style_apply",
@@ -11474,8 +11665,6 @@ static const struct { const char *method; const char *event; } _session_methods[
 // request on that photo, let the window's pending work run until 300 ms
 // after the edit and the darkroom's pipes are idle (2 s at most). The API's
 // own sockets wait meanwhile (_settling), so no request runs inside another
-static gint64 _gui_last_edit = 0;
-static gboolean _settling = FALSE;
 
 static void _gui_settle(void)
 {

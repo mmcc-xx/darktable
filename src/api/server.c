@@ -7476,8 +7476,50 @@ static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
     *err = _ERR(API_E_PARAMS, NULL, "render needs path, width > 0 and height > 0");
     return FALSE;
   }
+  // show_mask {operation, instance}: that module's mask as the darkroom's
+  // "display mask" shows it (yellow over a gray image), without the focus
+  JsonNode *smn = params ? json_object_get_member(params, "show_mask") : NULL;
+  dt_iop_module_t *mask_m = NULL;
+  if(smn && !JSON_NODE_HOLDS_NULL(smn))
+  {
+    if(!JSON_NODE_HOLDS_OBJECT(smn))
+    {
+      *err = _ERR(API_E_PARAMS, "show_mask", "show_mask must be {operation, instance}");
+      return FALSE;
+    }
+    mask_m = _find_module(json_node_get_object(smn), err);
+    if(!mask_m) return FALSE;
+    const int mode = mask_m->blend_params ? mask_m->blend_params->mask_mode : 0;
+    if(!(mask_m->flags() & IOP_FLAGS_SUPPORTS_BLENDING) || !(mode & DEVELOP_MASK_ENABLED)
+       || mode == DEVELOP_MASK_ENABLED)
+    {
+      *err = _ERRF(API_E_PARAMS, "show_mask", "%s instance %d has no mask", mask_m->op,
+                   mask_m->multi_priority);
+      return FALSE;
+    }
+    if(!mask_m->enabled)
+    {
+      *err = _ERRF(API_E_PARAMS, "show_mask", "%s instance %d is off: its mask does nothing",
+                   mask_m->op, mask_m->multi_priority);
+      return FALSE;
+    }
+    _cur->pipe.mask_display_module = mask_m;
+    _cur->pipe.mask_display_request = DT_DEV_PIXELPIPE_DISPLAY_MASK;
+    // the module's blend must run again to draw the mask
+    dt_dev_pixelpipe_cache_invalidate_later(&_cur->pipe, mask_m->iop_order, "api show_mask");
+  }
   _view_t v;
-  if(!_process_view(params, max_w, max_h, &v, err)) return FALSE;
+  const gboolean done = _process_view(params, max_w, max_h, &v, err);
+  const gboolean mask_shown = mask_m && (_cur->pipe.mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK);
+  if(mask_m)
+  {
+    _cur->pipe.mask_display_module = NULL;
+    _cur->pipe.mask_display_request = DT_DEV_PIXELPIPE_DISPLAY_NONE;
+    // the lines from the module on hold the overlay (later modules passed
+    // through): the next render computes them again
+    dt_dev_pixelpipe_cache_invalidate_later(&_cur->pipe, mask_m->iop_order, "api show_mask");
+  }
+  if(!done) return FALSE;
   const gint64 t1 = g_get_monotonic_time();
 
   // backbuf is a cache line in display byte order (BGRA): convert a copy
@@ -7499,6 +7541,12 @@ static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
     return FALSE;
   }
   _add_view(b, &v);
+  if(mask_m)
+  {
+    // false: the mask is the same everywhere (nothing to draw)
+    json_builder_set_member_name(b, "mask_shown");
+    json_builder_add_boolean_value(b, mask_shown);
+  }
   json_builder_set_member_name(b, "jpeg_ms");
   json_builder_add_int_value(b, (g_get_monotonic_time() - t1) / 1000);
   return TRUE;
@@ -11639,7 +11687,7 @@ static const char *_methods[] = {
   "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "image_remove", "style_list", "style_create", "style_delete", "style_apply",
   "history_paste", "collection", "darkroom_open", "image_info.exif", "image_metadata", "tag_list", "set_tags",
   "set_metadata", "set_location", "picker_list", "picker_apply", "picker_apply.headless", "module_remove", "module_rename", "history_compress",
-  "render.history_end", "render_variants", "darkroom_snapshot", "share", "save", "reset", "render", "render.uncropped", "render.zoom", "export",
+  "render.history_end", "render_variants", "darkroom_snapshot", "share", "save", "reset", "render", "render.uncropped", "render.zoom", "render.show_mask", "export",
   "library_status", "library_release", "library_acquire", "handover", "shutdown", "shutdown.quit_window",
   "errors.codes", NULL };
 

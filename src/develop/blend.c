@@ -1049,18 +1049,23 @@ void dt_develop_blend_process(dt_iop_module_t *self,
   }
 
   const gboolean valid_request = dt_iop_has_focus(self) && (piece->pipe == self->dev->full.pipe);
+  // a pipe may ask to show one module's mask without the focus
+  // (pipe->mask_display_module, set by darktable-api's render)
+  const gboolean pipe_request = piece->pipe->mask_display_module == self;
+  const dt_dev_pixelpipe_display_mask_t wanted_mask_display =
+    pipe_request ? piece->pipe->mask_display_request : self->request_mask_display;
 
   // does user want us to display a specific channel? The details threshold
   // carves a mask out of the image's detail even with no drawn, parametric or
   // raster mask, so it has something to show too
   const dt_dev_pixelpipe_display_mask_t request_mask_display =
-      valid_request && (mode_parametric || mode_drawn || d->details != 0.0f)
-        ? self->request_mask_display
+      (valid_request || pipe_request) && (mode_parametric || mode_drawn || d->details != 0.0f)
+        ? wanted_mask_display
         : DT_DEV_PIXELPIPE_DISPLAY_NONE;
 
   const dt_dev_pixelpipe_display_mask_t request_raster_display =
-      valid_request && raster
-        ? self->request_mask_display
+      (valid_request || pipe_request) && raster
+        ? wanted_mask_display
         : DT_DEV_PIXELPIPE_DISPLAY_NONE;
 
   // get channel max values depending on colorspace
@@ -1604,6 +1609,11 @@ gboolean dt_develop_blend_process_cl(dt_iop_module_t *self,
   const dt_dev_pixelpipe_display_mask_t mask_display = piece->pipe->mask_display;
 
   const gboolean valid_request = dt_iop_has_focus(self) && (piece->pipe == self->dev->full.pipe);
+  // a pipe may ask to show one module's mask without the focus
+  // (pipe->mask_display_module, set by darktable-api's render)
+  const gboolean pipe_request = piece->pipe->mask_display_module == self;
+  const dt_dev_pixelpipe_display_mask_t wanted_mask_display =
+    pipe_request ? piece->pipe->mask_display_request : self->request_mask_display;
 
   const gboolean raster = mask_mode & DEVELOP_MASK_RASTER;
   // a flexi mask renders through the drawn group renderer
@@ -1617,13 +1627,13 @@ gboolean dt_develop_blend_process_cl(dt_iop_module_t *self,
   // carves a mask out of the image's detail even with no drawn, parametric or
   // raster mask, so it has something to show too
   const dt_dev_pixelpipe_display_mask_t request_mask_display =
-      valid_request && (mode_parametric || mode_drawn || d->details != 0.0f)
-        ? self->request_mask_display
+      (valid_request || pipe_request) && (mode_parametric || mode_drawn || d->details != 0.0f)
+        ? wanted_mask_display
         : DT_DEV_PIXELPIPE_DISPLAY_NONE;
 
   const dt_dev_pixelpipe_display_mask_t request_raster_display =
-      valid_request && raster
-        ? self->request_mask_display
+      (valid_request || pipe_request) && raster
+        ? wanted_mask_display
         : DT_DEV_PIXELPIPE_DISPLAY_NONE;
 
   // get channel max values depending on colorspace

@@ -297,6 +297,10 @@ typedef struct dt_dev_pixelpipe_t
   gboolean tiling;
   // should this pixelpipe display a mask in the end?
   dt_dev_pixelpipe_display_mask_t mask_display;
+  // show this module's mask (as mask_display_request) without the darkroom
+  // focus; NULL: only the focused module's, on the darkroom's full pipe
+  struct dt_iop_module_t *mask_display_module;
+  dt_dev_pixelpipe_display_mask_t mask_display_request;
   // should this pixelpipe completely suppressed the blendif module?
   gboolean bypass_blendif;
   // input data based on this timestamp:

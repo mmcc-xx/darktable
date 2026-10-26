@@ -1093,6 +1093,27 @@ static void _shortcut_copy_lua(GtkWidget *widget, dt_shortcut_t *shortcut, gchar
   g_free(lua_command);
 }
 
+gchar *dt_shortcut_action_keys(dt_action_t *action,
+                               const dt_view_type_flags_t views,
+                               const gchar *separator)
+{
+  if(!action) return NULL;
+  GString *keys = NULL;
+  for(GSequenceIter *iter = g_sequence_get_begin_iter(darktable.control->shortcuts);
+      !g_sequence_iter_is_end(iter);
+      iter = g_sequence_iter_next(iter))
+  {
+    dt_shortcut_t *s = g_sequence_get(iter);
+    if(s->action != action || !(s->views & views)) continue;
+    if(keys)
+      g_string_append(keys, separator);
+    else
+      keys = g_string_new(NULL);
+    g_string_append(keys, _shortcut_description(s));
+  }
+  return keys ? g_string_free(keys, FALSE) : NULL;
+}
+
 void dt_shortcut_copy_lua(dt_action_t *action, gchar *preset_name)
 {
   GtkWidget *widget = NULL;
@@ -3084,6 +3105,7 @@ static void _import_extended_clicked(GtkButton *button, gpointer user_data)
       const int lang_len = underscore ? underscore - langcode : strlen(langcode);
       gchar *localized_file = g_strdup_printf("darktable/shortcutsrc.%.*s", lang_len, langcode);
       gchar *shortcuts_file = g_build_filename(sharedir, localized_file, NULL);
+      g_free(localized_file);
       if(g_file_test(shortcuts_file, G_FILE_TEST_EXISTS))
       {
         dt_print(DT_DEBUG_PARAMS,"load localized shortcuts from %s", shortcuts_file);

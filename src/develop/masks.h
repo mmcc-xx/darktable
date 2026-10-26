@@ -621,7 +621,7 @@ typedef struct dt_masks_form_gui_t
 
   // masks panel and canvas feedback, set by blend_gui.c:
   // panel_hover_formids: shapes highlighted on the canvas because their row,
-  //   or the header of a cluster holding them, is hovered. NULL = none
+  //   or the header of a group holding them, is hovered. NULL = none
   // panel_selected_formid: the panel's selection, highlighted on the canvas
   //   while nothing is hovered
   // canvas_hover_formid: the shape under the cursor, whose row the panel
@@ -629,10 +629,22 @@ typedef struct dt_masks_form_gui_t
   // solo_formids: shapes soloed or solo-edited in the panel, highlighted
   //   whatever is hovered (_sync_solo_canvas_highlight in blend_gui.c).
   //   NULL = none
+  // picked_formids: shapes of the panel's multiple selection, highlighted as
+  //   the selection is, whatever is hovered (_picks_sync_canvas in
+  //   blend_gui.c). NULL = none
   GList *panel_hover_formids;
   dt_mask_id_t panel_selected_formid;
   dt_mask_id_t canvas_hover_formid;
   GList *solo_formids;
+  GList *picked_formids;
+  // import_preview: the shapes the import menu entry under the pointer would
+  //   bring in, drawn on the canvas whether a mask is shown or not, with their
+  //   outlines (dt_masks_form_gui_points_t) in import_preview_points, computed
+  //   for the preview pipe output import_preview_hash. NULL = none. Set
+  //   through dt_masks_set_import_preview
+  GList *import_preview;
+  GList *import_preview_points;
+  dt_hash_t import_preview_hash;
 
   // opaque per-type data (e.g. segmentation context for object masks)
   void *scratchpad;
@@ -652,6 +664,9 @@ extern const dt_masks_functions_t dt_masks_functions_gradient;
 extern const dt_masks_functions_t dt_masks_functions_group;
 extern const dt_masks_functions_t dt_masks_functions_parametric;
 extern const dt_masks_functions_t dt_masks_functions_raster;
+/** a path was moved by (dx, dy), in normalized coordinates: what it keeps for
+    its shrink or grow moves with it */
+void dt_masks_path_resize_follow_move(const dt_mask_id_t formid, const float dx, const float dy);
 /** the darkroom module a raster form reads its mask from, or NULL when it is
     gone. Resolved by operation and instance, as the form stores them */
 struct dt_iop_module_t *dt_masks_raster_source(const dt_masks_form_t *form);
@@ -711,6 +726,26 @@ void dt_masks_pixel_release(dt_masks_pixel_cache_t *c);
 gboolean dt_masks_pixel_readable(const dt_imgid_t imgid,
                                  const dt_dtdata_ref_t *ref,
                                  gboolean *transient);
+// preview pixels per pixel of the overlay tint
+#define DT_MASKS_OVERLAY_STEP 2.0f
+// the tint of the hovered element, kept for the preview it was made for. get
+// returns NULL unless it was kept under this key and hash; keep takes the
+// surface and returns it
+cairo_surface_t *dt_masks_pixel_hover_get(const char *key, const dt_hash_t hash);
+cairo_surface_t *dt_masks_pixel_hover_keep(const char *key,
+                                           const dt_hash_t hash,
+                                           cairo_surface_t *surface);
+// a tint surface painted over the whole preview frame, whatever its own size
+void dt_masks_pixel_paint_overlay(cairo_t *cr, cairo_surface_t *overlay);
+// the form drawn at index of the visible group (or of the import menu's
+// preview), or NULL
+dt_masks_form_t *dt_masks_pixel_form_at(const dt_masks_form_gui_t *gui, const int index);
+// bilinear read of m (mw x mh) at pixel coordinates x in [0, mw - 1], y in [0, mh - 1]
+float dt_masks_pixel_bilinear(const float *m,
+                              const int mw,
+                              const int mh,
+                              const float x,
+                              const float y);
 // a mask as the red overlay tint: in proportion, or full above threshold
 cairo_surface_t *dt_masks_pixel_tint(const float *const mask,
                                      const int w,
@@ -986,6 +1021,17 @@ void dt_masks_migrate_classic_to_flexi(struct dt_iop_module_t *module,
                                        struct dt_develop_blend_params_t *bp,
                                        const int history_num);
 
+/** adds `forms`, the mask tree a preset, style or history row carried with
+    `bp` (dt_masks_blend_blob_decode()), to the image of `module` under fresh
+    ids, and points `bp` at them. Takes the forms. With a `history_num`, as
+    for dt_masks_migrate_classic_to_flexi(), they are written to
+    main.masks_history by dt_masks_finish_flexi_migrations(); with none,
+    they go into dev->forms at once */
+void dt_masks_import_stored_forms(struct dt_iop_module_t *module,
+                                  struct dt_develop_blend_params_t *bp,
+                                  GList *forms,
+                                  const int history_num);
+
 /** create the forms of every migration dt_masks_migrate_classic_to_flexi()
     deferred, writing them under the masks_history position
     dt_masks_read_masks_history() reads as current. Call it once
@@ -1009,6 +1055,12 @@ void dt_masks_replace_current_forms(dt_develop_t *dev, GList *forms);
 dt_masks_form_t *dt_masks_get_from_id_ext(GList *forms, dt_mask_id_t id);
 /** returns a form with formid == id from dev->forms */
 dt_masks_form_t *dt_masks_get_from_id(const dt_develop_t *dev, dt_mask_id_t id);
+/** does the mask_id or blend_mask_id of `module`, a module that blends, name
+    a form in `forms`?
+    Then a history item for it must be the masks variant
+    (dt_dev_add_masks_history_item()), the only one that records forms, or a
+    form made for the module (a migrated classic mask) is lost on the next load */
+gboolean dt_masks_module_mask_in_forms(struct dt_iop_module_t *module, GList *forms);
 /** check if a form is used by a given module (directly or as a child of its group) */
 gboolean dt_masks_is_in_module(dt_mask_id_t maskid, const struct dt_iop_module_t *module);
 /** register forms into the mask manager, recording them in `module`'s history
@@ -1016,6 +1068,58 @@ gboolean dt_masks_is_in_module(dt_mask_id_t maskid, const struct dt_iop_module_t
 void dt_masks_register_forms(dt_develop_t *dev,
                              struct dt_iop_module_t *module,
                              GList *forms);
+
+/** a form as a main.masks_history row stores it, converted to the current
+    masks version, or NULL when it cannot be read (logged). `dev` is the image
+    the form belongs to, which converting a form stored before masks v3 needs:
+    with none, such a form is not read */
+dt_masks_form_t *dt_masks_form_from_stored(dt_develop_t *dev,
+                                           const dt_imgid_t imgid,
+                                           const dt_mask_id_t formid,
+                                           const dt_masks_type_t type,
+                                           const char *name,
+                                           const int version,
+                                           const void *points,
+                                           const size_t points_bytes,
+                                           const int nb_points,
+                                           const void *source,
+                                           const size_t source_bytes);
+/** the forms of the main.masks_history snapshot history position `num` of
+    `imgid` renders with: its last one at or before `num` */
+GList *dt_masks_read_forms_at(const dt_imgid_t imgid, const int num);
+/** the forms of `forms` the group `mask_id` reaches, itself first and then
+    depth first. The list is new, the forms are not */
+GList *dt_masks_tree_forms(GList *forms, const dt_mask_id_t mask_id);
+
+/** does the tree of the group `mask_id` hold a form stored as pixels (an AI
+    object not traced into paths)? Its pixels belong to its own image, so a
+    preset or a style leaves it out (dt_masks_blend_blob_encode()) */
+gboolean dt_masks_tree_has_pixel_forms(GList *forms, const dt_mask_id_t mask_id);
+
+/** blend params as presets and styles store them (masks/blend_blob.c):
+    `bp`, followed, when its flexi mask group is in `forms`, by the forms of
+    that group's tree, less those stored as pixels and the group members
+    referring to them. g_free() the result, of `*size` bytes */
+void *dt_masks_blend_blob_encode(const struct dt_develop_blend_params_t *bp,
+                                 GList *forms,
+                                 size_t *size);
+/** does stored blend params of `size` bytes go on after the struct? */
+gboolean dt_masks_blend_blob_has_tail(const size_t size);
+/** the reverse of dt_masks_blend_blob_encode(), for blobs from files too:
+    FALSE, with nothing in `*forms`, when the blob is not one it makes. The
+    forms keep the ids of the image they came from: see
+    dt_masks_blend_blob_remap() */
+gboolean dt_masks_blend_blob_decode(const void *blob,
+                                    const size_t size,
+                                    struct dt_develop_blend_params_t *bp,
+                                    GList **forms);
+/** gives `forms` and their markers fresh ids, used neither in `taken` (forms
+    and markers) nor in `taken_ids` (when not NULL, the new ids are added to
+    it), and rewrites every reference to them, `bp->mask_id` included */
+void dt_masks_blend_blob_remap(GList *forms,
+                               struct dt_develop_blend_params_t *bp,
+                               GList *taken,
+                               GHashTable *taken_ids);
 
 /** read the forms from the db */
 void dt_masks_read_masks_history(dt_develop_t *dev, const dt_imgid_t imgid);
@@ -1063,6 +1167,9 @@ gboolean dt_masks_events_mouse_scrolled(struct dt_iop_module_t *module,
 // mask (size/border/opacity) instead of zoom/pan. Returns FALSE while drawing
 // a path, since path creation has no scroll-adjustable parameter.
 gboolean dt_masks_scroll_over_mask(void);
+// draw the shapes `formids` on the canvas until the next call; NULL clears
+void dt_masks_set_import_preview(GList *formids);
+void dt_masks_import_preview_post_expose(cairo_t *cr, const float zoom_scale);
 void dt_masks_events_post_expose(const struct dt_iop_module_t *module,
                                  cairo_t *cr,
                                  const int32_t width,
@@ -1249,7 +1356,7 @@ typedef enum dt_masks_remove_target_t
 dt_masks_remove_target_t dt_masks_remove_shape_target(const struct dt_iop_module_t *module,
                                                       const dt_masks_form_t *form,
                                                       const dt_mask_id_t parentid);
-/** add every element of `src_grp` to `grp`, keeping its operator and opacity:
+/** add every member of `src_grp` to `grp`, keeping its operator and opacity:
     shapes are shared, parametric channels copied. No history item */
 void dt_masks_group_add_members_of(dt_masks_form_t *grp, const dt_masks_form_t *src_grp);
 /** change the opacity of `form` in its parent group `parentid`, by `amount`,

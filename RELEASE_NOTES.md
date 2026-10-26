@@ -137,6 +137,10 @@ changes (where available).
   When "edit shapes on canvas" is enabled, the node editing area is
   extended beyond the image borders to allow editing of these nodes.
 
+- Raster masks now show up on the canvas. When "edit shapes on canvas"
+  is enabled, hovering a raster mask in the masks panel tints the area
+  of the image that it covers.
+
 - In color assessment mode, when the image is zoomed in show a
   dashed line on the sides of the white border where the image
   extends beyond the current view (horizontally or vertically).
@@ -197,6 +201,14 @@ changes (where available).
 - Pressing ESC or clicking on the dialog X icon (top-right) now exits
   Darktable instead of launching the previous workspace.
 
+- The settings of the path mask "shrink or grow" (the step per scroll
+  tick, the unit, the tracing resolution and the curve smoothing) are
+  now in a popover opened by a gear on the slider, which no longer has
+  a unit toggle. The options for the scroll direction of mask
+  parameters and for the mask indicator in module headers moved from
+  the preferences dialog to the masks panel's options popover, and the
+  masking section of the preferences dialog is gone.
+
 ## Performance Improvements
 
 - The lighttable timeline no longer slows down quadratically with the
@@ -229,6 +241,17 @@ changes (where available).
   every mouse move and long outlines are drawn with far fewer points.
 
 ## Other Changes
+
+- AgX and sigmoid now adapt to HDR output, so one edit exports to
+  SDR, HLG and PQ alike. HLG output peaks at 1000 nits, and PQ output
+  at the new "PQ peak" setting of the export module, 1000 nits by
+  default, which export presets store and darktable-cli sets with
+  `--pq-peak`. With AgX, shadows and midtones keep their SDR brightness
+  and highlights extend to the peak, following Blender's AgX HDR, with
+  a new "HDR purity" slider for the highlights' saturation. Sigmoid
+  scales its target white to the peak, up to 1600% (3248 nits). SDR
+  output is unchanged. Existing edits render as before, and a "follow
+  output peak" toggle in each module opts them in.
 
 - PNG exports using a PQ output color profile now include content
   light level metadata (MaxCLL and MaxFALL) for HDR tone mapping.
@@ -355,6 +378,22 @@ changes (where available).
 
 ## Bug Fixes
 
+- Fixed missing Active D-Lighting exposure compensation for Nikon
+  images shot in sRGB or Adobe RGB.
+
+- Fixed drawn masks appearing too early in the history stack of an
+  image that got a style or a pasted history before it was first
+  opened: going back in the history showed masks from before the step
+  that added them.
+
+- Fixed darktable hanging on exit, with its window already gone, after a
+  raw file failed to load during the session. The lock taken while
+  reading the file was not released when the read failed, so every later
+  raw open waited for it forever.
+
+- Fixed AgX rendering everything above the pivot black when pivot
+  target output was 100% and shoulder power was 7 or more.
+
 - Fixed shift-click on the selected entry of the history stack, which
   did nothing instead of revealing that module in the right-hand panel.
 
@@ -451,6 +490,11 @@ changes (where available).
 
 - Fixed the feather of a drawn path being lost when the shape was
   resized with the scroll wheel.
+
+- Fixed resizing a path mask with the scroll wheel or the "shrink or
+  grow" slider bending its curves into straight chords and giving it a
+  different set of nodes at every step. Its nodes now follow the
+  outline as it grows or shrinks.
 
 - Fixed numeric error in the framing module (borders) causing the
   frame line to be off-center for certain border sizes.
@@ -621,6 +665,41 @@ changes (where available).
 - Fixed memory leaks when processing images.
 
 - Fixed memory leaks when exporting images or the tag list.
+
+- Fixed month collection filter layout issues.
+
+- Fixed capture time based collection filters using the whole time range
+  of the library, instead of the range of the current active collection.
+
+- Fixed GPU memory leaks while displaying the highlight reconstruction
+  mask of filmic rgb, and possible crashes in basic adjustments, rgb
+  levels and base curve when OpenCL memory allocation fails.
+
+- Fixed small memory leaks that grew while a camera was connected, and
+  when filtering collections by inverse values (such as exposure time),
+  using the date range popup, importing localized shortcuts, or
+  creating and editing styles.
+
+- Fixed a possible crash while checking database snapshots for removal
+  when the folder of the data database could not be determined.
+
+- Fixed a GPU memory leak in the OpenCL path of the clipping indicator.
+
+- Fixed an issue where the Windows installer wouldn't run without user
+  input when requested.
+
+- Fixed the right-hand panel jumping when switching tabs in modules
+  taller than the panel, such as AgX or spektrafilm: clicking a tab
+  scrolled the panel until the tab row was at the top.
+
+- Fixed retouch shapes and drawn masks landing in the wrong place when
+  the scale pixels module was enabled: they were shrunk toward the
+  top-left corner of the image instead of being stretched with it.
+
+- Fixed black output from filmic rgb's v1 and v3 color science, when
+  no work profile is used for the luminance, and wrong alpha from its
+  gaussian and poissonian noise, on macOS OpenCL: the kernels read
+  vector lanes they had not set.
 
 ## Lua
 

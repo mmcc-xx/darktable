@@ -588,8 +588,13 @@ void sf_multiplicative_unsharp_mask3(float *const buf,
     const float D = fmaxf(orig[i] + d0, 0.0f);
     const float blur = fmaxf(buf[i] + d0, eps);
     const float ratio = fmaxf(fminf(D / blur, ratio_max), 1.0f / ratio_max);
-    /* fma-pinned, matching spektrafilm_grain_usm */
-    buf[i] = fmaxf(fmaf(D, powf(ratio, amount), -d0), 0.0f);
+    /* fma-pinned, matching spektrafilm_grain_usm. D >= 0 and the power term is
+       positive, so the result is bounded below by -d0: the absolute density
+       stays non-negative while the density relative to the floor may go
+       negative, as in the reference. Clamping at 0 here would rectify the grain
+       below the floor and add density wherever grain is strong relative to the
+       local density. */
+    buf[i] = fmaf(D, powf(ratio, amount), -d0);
   }
 }
 
@@ -614,33 +619,26 @@ void sf_unsharp_mask3(float *const buf,
   for(size_t i = 0; i < nn; i++) buf[i] = fmaf(amount, orig[i] - buf[i], orig[i]);
 }
 
-/* Viewing glare ([gl] add_glare): a faint veil of the viewing illuminant, drawn
-   as a lognormal field of mean `percent`/100 and relative standard deviation
-   `roughness`, blurred by `blur` pixels.
-
-   The reference adds `glare_amount * illuminant_xyz` in XYZ before the output
-   matrix. That illuminant is normalized to Y = 1 and the matrix adapts it to the
-   output white, so it lands on RGB (1, 1, 1) exactly and can be added as one
-   scalar to all three channels after the matrix. It lands after the output gamut
-   compression: at the default 0.03% the difference is far
-   below a code value, and this keeps the whole spatial stage on one side of
-   sf_sim_scan.
+/* Viewing glare field ([gl] compute_random_glare_amount): a lognormal field of
+   linear-space mean `percent`/100 and relative standard deviation `roughness`,
+   blurred by `blur` pixels. sf_sim_scan adds it in XYZ, scaled by the viewing
+   illuminant, before the output matrix and the gamut compression, as
+   add_glare does.
 
    Lognormal with linear-space mean m and std s: sigma2 = ln(1 + (s/m)^2),
    mu = ln(m) - sigma2/2, so with s/m = roughness the shape parameter does not
    depend on the amount at all. */
-void sf_glare(float *const rgb,
-              const int w,
-              const int h,
-              const float percent,
-              const float roughness,
-              const float blur,
-              const int roi_x,
-              const int roi_y,
-              float *const field)
+void sf_glare_field(float *const field,
+                    const int w,
+                    const int h,
+                    const float percent,
+                    const float roughness,
+                    const float blur,
+                    const int roi_x,
+                    const int roi_y,
+                    const uint32_t salt)
 {
   const float mean = percent * 0.01f;
-  if(mean <= 0.0f) return;
   const float sigma2 = logf(1.0f + roughness * roughness);
   const float s = sqrtf(sigma2), bias = -0.5f * sigma2;
 
@@ -648,22 +646,12 @@ void sf_glare(float *const rgb,
   for(int y = 0; y < h; y++)
     for(int x = 0; x < w; x++)
     {
-      const uint32_t seed = grain_pixel_seed((uint32_t)(x + roi_x), (uint32_t)(y + roi_y), 0x5eedu);
+      const uint32_t seed = grain_pixel_seed((uint32_t)(x + roi_x), (uint32_t)(y + roi_y), 0x5eedu, salt);
       field[(size_t)y * w + x] = mean * expf(fmaf(s, grain_normal(seed), bias));
     }
   float *const trans = dt_alloc_align_float((size_t)w * h);
   sf_blur_plane1(field, w, h, blur, NULL, trans);
   dt_free_align(trans);
-
-  const size_t npix = (size_t)w * h;
-  DT_OMP_FOR()
-  for(size_t i = 0; i < npix; i++)
-  {
-    const float g = field[i];
-    rgb[i * 3 + 0] += g;
-    rgb[i * 3 + 1] += g;
-    rgb[i * 3 + 2] += g;
-  }
 }
 
 /* Blur packed buffer with per-channel sigma. `trans` is a w*h intermediate. */
@@ -829,21 +817,22 @@ void sf_halation(float *const raw,
   const size_t nn = npix * 3;
   float *const plane = dt_alloc_align_float(npix);
   float *const trans = dt_alloc_align_float(npix);
-  if(!plane) { dt_free_align(trans); return; }
+  if(!plane || !trans)
+  {
+    dt_free_align(plane);
+    dt_free_align(trans);
+    return;
+  }
 
   /* --- stage 1: scatter PSF (core + 3-component tail) --- */
   if(s_amount > 0.0)
   {
-    float *const core = dt_alloc_align_float(nn);
+    /* raw stays untouched until the final combine, so the core blur runs
+       after the tail loop and reuses comp */
     float *const tail = dt_alloc_align_float(nn);
     float *const comp = dt_alloc_align_float(nn);
-    if(core && tail && comp)
+    if(tail && comp)
     {
-      dt_iop_image_copy(core, raw, nn);
-      float sc[3];
-      for(int c = 0; c < 3; c++) sc[c] = fmaxf((float)(sc_core[c] * scl / pixel_um), 1e-6f);
-      _blur_per_channel(core, w, h, sc, plane, trans);
-
       memset(tail, 0, sizeof(float) * nn);
       for(int g = 0; g < 3; g++)
       {
@@ -855,6 +844,11 @@ void sf_halation(float *const raw,
         const float amp_g = (float)tail_amp[g];
         for(size_t i = 0; i < nn; i++) tail[i] = fmaf(amp_g, comp[i], tail[i]);
       }
+      float *const core = comp;
+      dt_iop_image_copy(core, raw, nn);
+      float sc[3];
+      for(int c = 0; c < 3; c++) sc[c] = fmaxf((float)(sc_core[c] * scl / pixel_um), 1e-6f);
+      _blur_per_channel(core, w, h, sc, plane, trans);
       /* float and fma-pinned, matching spektrafilm_scatter_combine */
       const float s_f = (float)s_amount;
       const float ws[3] = { (float)w_s[0], (float)w_s[1], (float)w_s[2] };
@@ -865,7 +859,6 @@ void sf_halation(float *const raw,
         raw[i] = fmaf(s_f, scattered - raw[i], raw[i]);
       }
     }
-    dt_free_align(core);
     dt_free_align(tail);
     dt_free_align(comp);
   }

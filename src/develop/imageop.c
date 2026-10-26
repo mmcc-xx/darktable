@@ -847,9 +847,11 @@ dt_iop_module_t *dt_iop_gui_duplicate(dt_iop_module_t *base,
       if(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
       {
         dt_iop_commit_blend_params(module, base->blend_params, NULL);
-        if(dt_is_valid_maskid(base->blend_params->mask_id))
+        if(dt_is_valid_maskid(base->blend_params->mask_id)
+           || dt_is_valid_maskid(base->blend_params->blend_mask_id))
         {
           module->blend_params->mask_id = NO_MASKID;
+          module->blend_params->blend_mask_id = NO_MASKID;
           dt_masks_iop_use_same_as(module, base);
         }
       }
@@ -1739,11 +1741,6 @@ static void _init_presets(dt_iop_module_so_t *module_so)
 
     if(!old_blend_params || dt_develop_blend_version() > old_blend_params_version)
     {
-      dt_print(DT_DEBUG_ALWAYS,
-              "[imageop_init_presets] updating '%s' preset '%s' from blendop"
-               " version %d to version %d",
-               module_so->op, name, old_blend_params_version, dt_develop_blend_version());
-
       // we need a dt_iop_module_t for dt_develop_blend_legacy_params()
       // using dt_develop_blend_legacy_params_by_so won't help as we need "module" anyway
       dt_iop_module_t *module;
@@ -1775,6 +1772,27 @@ static void _init_presets(dt_iop_module_so_t *module_so)
         memcpy(new_blend_params, module->default_blendop_params,
                sizeof(dt_develop_blend_params_t));
       }
+
+      // a classic mask needs an image to create its flexi forms in, and this
+      // module has none (dt_masks_migrate_classic_to_flexi()). Stored as
+      // current, it would never be migrated: the preset stays as it is, for
+      // preset apply and auto-apply to convert with the image they have
+      if(dt_develop_blend_mask_is_classic(new_blend_params))
+      {
+        dt_print(DT_DEBUG_PARAMS,
+                 "[imageop_init_presets] keeping '%s' preset '%s' at blendop"
+                 " version %d: its mask is converted when it is applied",
+                 module_so->op, name, old_blend_params_version);
+        free(new_blend_params);
+        dt_iop_cleanup_module(module);
+        free(module);
+        continue;
+      }
+
+      dt_print(DT_DEBUG_ALWAYS,
+               "[imageop_init_presets] updating '%s' preset '%s' from blendop"
+               " version %d to version %d",
+               module_so->op, name, old_blend_params_version, dt_develop_blend_version());
 
       // and write the new blend params back to the database
       sqlite3_stmt *stmt2;
@@ -2128,7 +2146,8 @@ static void _reconcile_raster_form_users(dt_iop_module_t *module,
                                          dt_dev_pixelpipe_t *pipe)
 {
   if(!module->dev) return;
-  dt_masks_form_t *grp = dt_masks_get_from_id(module->dev, bp->mask_id);
+  dt_masks_form_t *grp =
+    dt_masks_get_from_id(module->dev, dt_develop_blend_mask_group_id(module, bp));
 
   for(GList *iter = module->dev->iop; iter; iter = g_list_next(iter))
   {
@@ -2560,6 +2579,13 @@ void dt_iop_commit_params(dt_iop_module_t *module,
       {
         phash = dt_masks_group_hash_ext(phash, grp, module->dev->forms);
       }
+      // a NO_MASKS module's blend mask, apart from its own shapes above
+      dt_masks_form_t *blend_grp =
+        dt_masks_get_from_id(darktable.develop, blendop_params->blend_mask_id);
+      if(blend_grp)
+      {
+        phash = dt_masks_group_hash(phash, blend_grp);
+      }
 
       // previewing a refinement as off changes the render but no parameter, so
       // it enters the hash, from the snapshot above, not from blend_data
@@ -2639,11 +2665,31 @@ void dt_iop_gui_reset(dt_iop_module_t *module)
   DT_LEAVE_GUI_UPDATE();
 }
 
-// resets the blend params to the defaults, but for a locked mask, which keeps
-// its own (see dt_develop_blend_keep_locked_mask)
-static void _commit_reset_blend_params(dt_iop_module_t *module)
+// a reset drops the module's mask unless it is locked, and a NO_MASKS
+// module's own shapes, which go with its params whatever the lock
+static void _reset_remove_masks(dt_iop_module_t *module)
 {
-  if(!dt_develop_blend_mask_locked(module->blend_params))
+  const dt_develop_blend_params_t *bp = module->blend_params;
+  const gboolean locked = dt_develop_blend_mask_locked(bp);
+  const gboolean own_shapes = module->flags() & IOP_FLAGS_NO_MASKS;
+  const dt_mask_id_t ids[] = { !locked || own_shapes ? bp->mask_id : NO_MASKID,
+                               !locked ? bp->blend_mask_id : NO_MASKID };
+  for(size_t k = 0; k < G_N_ELEMENTS(ids); k++)
+  {
+    if(!dt_is_valid_maskid(ids[k])) continue;
+    dt_masks_form_t *grp = dt_masks_get_from_id(darktable.develop, ids[k]);
+    if(grp) dt_masks_form_remove(module, NULL, grp);
+  }
+}
+
+// resets the blend params to the defaults, but for a locked mask, which keeps
+// its own (see dt_develop_blend_keep_locked_mask). `before` is the params as
+// they were before dt_iop_reload_defaults(), which commits the defaults
+// itself and so clears the lock
+static void _commit_reset_blend_params(dt_iop_module_t *module,
+                                       const dt_develop_blend_params_t *before)
+{
+  if(!dt_develop_blend_mask_locked(before))
   {
     dt_iop_commit_blend_params(module, module->default_blendop_params, NULL);
     return;
@@ -2651,8 +2697,16 @@ static void _commit_reset_blend_params(dt_iop_module_t *module)
   // not the default_blendop_params pointer itself: dt_iop_commit_blend_params
   // drops the raster mask source for that one, and a locked mask keeps it
   dt_develop_blend_params_t reset = *module->default_blendop_params;
-  dt_develop_blend_keep_locked_mask(&reset, module->blend_params);
+  dt_develop_blend_keep_locked_mask(module, &reset, before);
   dt_iop_commit_blend_params(module, &reset, NULL);
+}
+
+void dt_iop_reset_params(dt_iop_module_t *module)
+{
+  _reset_remove_masks(module);
+  const dt_develop_blend_params_t before = *module->blend_params;
+  dt_iop_reload_defaults(module);
+  _commit_reset_blend_params(module, &before);
 }
 
 // kept for direct callers from accelerators
@@ -2670,17 +2724,8 @@ static gboolean _gui_reset_callback(GtkButton *button,
        && dt_modifier_is(dt_gdk_event_get_state(event), GDK_CONTROL_MASK))
      || !dt_gui_presets_autoapply_for_module(module, NULL))
   {
-    // if a drawn mask is set, remove it from the list, unless it is locked
-    if(dt_is_valid_maskid(module->blend_params->mask_id)
-       && !dt_develop_blend_mask_locked(module->blend_params))
-    {
-      dt_masks_form_t *grp =
-        dt_masks_get_from_id(darktable.develop, module->blend_params->mask_id);
-      if(grp) dt_masks_form_remove(module, NULL, grp);
-    }
     /* reset to default params */
-    dt_iop_reload_defaults(module);
-    _commit_reset_blend_params(module);
+    dt_iop_reset_params(module);
 
     // the module's forms changed behind the masks panel
     dt_iop_gui_blend_forms_reloaded(module);
@@ -2715,17 +2760,8 @@ static void _gui_reset_clicked(GtkGestureSingle *gesture,
   if(!((dt_key_modifier_state() & GDK_CONTROL_MASK)
        && dt_gui_presets_autoapply_for_module(module, NULL)))
   {
-    // if a drawn mask is set, remove it from the list, unless it is locked
-    if(dt_is_valid_maskid(module->blend_params->mask_id)
-       && !dt_develop_blend_mask_locked(module->blend_params))
-    {
-      dt_masks_form_t *grp =
-        dt_masks_get_from_id(darktable.develop, module->blend_params->mask_id);
-      if(grp) dt_masks_form_remove(module, NULL, grp);
-    }
     /* reset to default params */
-    dt_iop_reload_defaults(module);
-    _commit_reset_blend_params(module);
+    dt_iop_reset_params(module);
 
     // the module's forms changed behind the masks panel
     dt_iop_gui_blend_forms_reloaded(module);
@@ -2893,6 +2929,9 @@ void dt_iop_request_focus(dt_iop_module_t *module)
     /* and finally collection restore hinter messages */
     dt_collection_hint_message(darktable.collection);
 
+    if(darktable.cldiff_stats)  // handle visualizing of module having focus
+      dt_dev_reprocess_center(dev, out_focus_module->iop_order);
+
     // we also remove the focus css class
     GtkWidget *iop_w = gtk_widget_get_parent(dt_iop_gui_get_pluginui(out_focus_module));
     dt_gui_remove_class(iop_w, "dt_module_focus");
@@ -2919,6 +2958,9 @@ void dt_iop_request_focus(dt_iop_module_t *module)
 
     /* redraw the expander */
     gtk_widget_queue_draw(module->expander);
+
+    if(darktable.cldiff_stats)  // handle visualizing of module getting focus
+      dt_dev_reprocess_center(dev, module->iop_order);
 
     // we also add the focus css class
     GtkWidget *iop_w =
@@ -3363,7 +3405,9 @@ static gboolean _mask_indicator_tooltip(GtkWidget *treeview,
     c.total = c.rasters = 1;
   else
     dt_masks_group_walk(module->dev->forms,
-                        dt_masks_get_from_id(module->dev, module->blend_params->mask_id),
+                        dt_masks_get_from_id(module->dev,
+                                             dt_develop_blend_mask_group_id(module,
+                                                                            module->blend_params)),
                         _count_mask_element, &c);
 
   gchar *part1 = NULL;
@@ -4231,7 +4275,8 @@ static gboolean _pipe_has_raster_form_consumer(const dt_dev_pixelpipe_iop_t *pie
     const dt_dev_pixelpipe_iop_t *sink = n->data;
     const dt_develop_blend_params_t *bp = sink->blendop_data;
     if(!sink->enabled || !bp || !(bp->mask_mode & DEVELOP_MASK_FLEXI)) continue;
-    const dt_masks_form_t *grp = dt_masks_get_from_id_ext(piece->pipe->forms, bp->mask_id);
+    const dt_masks_form_t *grp =
+      dt_masks_get_from_id_ext(piece->pipe->forms, dt_develop_blend_mask_group_id(sink->module, bp));
     if(dt_masks_group_find_raster_of(piece->pipe->forms, grp, piece->module, id, FALSE))
       return TRUE;
   }

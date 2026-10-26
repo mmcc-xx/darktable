@@ -12471,10 +12471,36 @@ gboolean dt_api_handover(const char *path)
   return took;
 }
 
+// darktable's window deletes the built-in presets at start for the modules
+// to store them again (gui/gtk.c, dt_gui_presets_init); a headless start
+// keeps them. Once a module's version goes up, its old built-in presets stay
+// next to the new ones, and the auto-apply query in develop.c, which doesn't
+// look at op_version, applies an auto-applied one twice (agx 7 and 8)
+static void _drop_stale_builtin_presets(void)
+{
+  sqlite3_stmt *st = NULL;
+  // clang-format off
+  sqlite3_prepare_v2(dt_database_get(darktable.db),
+                     "DELETE FROM data.presets"
+                     " WHERE writeprotect = 1 AND operation = ?1 AND op_version <> ?2",
+                     -1, &st, NULL);
+  // clang-format on
+  for(GList *l = darktable.iop; l; l = g_list_next(l))
+  {
+    dt_iop_module_so_t *so = l->data;
+    sqlite3_bind_text(st, 1, so->op, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, so->version());
+    sqlite3_step(st);
+    sqlite3_reset(st);
+  }
+  sqlite3_finalize(st);
+}
+
 void dt_api_start(const dt_api_options_t *options)
 {
   _opt = *options;
   _in_gui = _opt.in_gui;
+  if(!_in_gui) _drop_stale_builtin_presets();
   if(_in_gui)
   {
     DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_HISTORY_CHANGE, _gui_history_cb, NULL);

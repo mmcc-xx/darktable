@@ -190,7 +190,7 @@ void dt_overlay_add_from_history(const dt_imgid_t imgid)
     // get imgid (overlay id) using introspection
     const dt_imgid_t *overlay_id = overlay->get_p(op_params, "imgid");
 
-    if(dt_is_valid_imgid(overlay_id))
+    if(overlay_id && dt_is_valid_imgid(*overlay_id))
     {
       dt_overlay_record(imgid, *overlay_id);
 
@@ -232,7 +232,7 @@ void dt_overlay_remove_from_history(const dt_imgid_t imgid,
     // get imgid (overlay id) using introspection
     const dt_imgid_t *overlay_id = overlay->get_p(op_params, "imgid");
 
-    if(dt_is_valid_imgid(overlay_id))
+    if(overlay_id && dt_is_valid_imgid(*overlay_id))
     {
       dt_overlay_remove(imgid, *overlay_id);
 

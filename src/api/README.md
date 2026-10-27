@@ -249,4 +249,7 @@ about 1/255 (mean absolute difference).
 - export to storages other than disk
 - perspective correction (ashift's line detection and fitting); the
   geometry calls cover orientation, straightening and crop only
+- highlight reconstruction switching itself off on a fresh raw with nothing
+  clipped (the window does it after its first render; headless it stays on,
+  which changes nothing visible)
 - `shutdown` stops the engine for every client

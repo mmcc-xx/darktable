@@ -270,6 +270,8 @@ typedef struct dt_iop_demosaic_data_t
   int cs_iter;
   float cs_center;
   gboolean cs_enabled;
+  gboolean autotune_request; // darktable-api: tune on the next process
+  gboolean autotune_done;
 } dt_iop_demosaic_data_t;
 
 static gboolean _get_thumb_quality(const int width, const int height)
@@ -797,6 +799,7 @@ void process(dt_iop_module_t *self,
       autotune = fullpipe && g->autotune_request;
       dt_iop_gui_leave_critical_section(self);
     }
+    autotune |= d->autotune_request;
 
     if(autotune)
     {
@@ -804,6 +807,8 @@ void process(dt_iop_module_t *self,
       const float cs_radius = _capture_radius(self, piece, in, roi_in, xtrans, filters);
       d->cs_radius = cs_radius;
       d->cs_thrs = cs_thrs;
+      d->autotune_request = FALSE;
+      d->autotune_done = TRUE;
 
       if(g)
       {
@@ -1112,6 +1117,7 @@ int process_cl(dt_iop_module_t *self,
       autotune = fullpipe && g->autotune_request;
       dt_iop_gui_leave_critical_section(self);
     }
+    autotune |= d->autotune_request;
 
     if(autotune)
     {
@@ -1119,6 +1125,8 @@ int process_cl(dt_iop_module_t *self,
       const float cs_radius = _capture_radius_cl(self, piece, dev_in, roi_in, xtrans, filters, true_monochrome);
       d->cs_radius = cs_radius;
       d->cs_thrs = cs_thrs;
+      d->autotune_request = FALSE;
+      d->autotune_done = TRUE;
 
       if(g)
       {
@@ -1467,6 +1475,30 @@ void cleanup_global(dt_iop_module_so_t *self)
   _cleanup_lmmse_gamma();
 }
 
+// capture sharpening's autotune for an editor with no GUI: darktable-api
+// (src/api) looks these up by name, asks for the autotune on its pipe's
+// node, processes the pipe and stores the result in the params, as
+// _ui_pipe_done() does for the darkroom
+__attribute__((visibility("default")))
+void dt_iop_demosaic_autotune_request(dt_dev_pixelpipe_iop_t *piece)
+{
+  dt_iop_demosaic_data_t *d = piece->data;
+  d->autotune_request = TRUE;
+  d->autotune_done = FALSE;
+}
+
+__attribute__((visibility("default")))
+gboolean dt_iop_demosaic_autotune_result(dt_dev_pixelpipe_iop_t *piece, float *radius, float *thrs)
+{
+  dt_iop_demosaic_data_t *d = piece->data;
+  d->autotune_request = FALSE;
+  if(!d->autotune_done) return FALSE;
+  d->autotune_done = FALSE;
+  *radius = d->cs_radius;
+  *thrs = d->cs_thrs;
+  return TRUE;
+}
+
 void commit_params(dt_iop_module_t *self,
                    dt_iop_params_t *params,
                    dt_dev_pixelpipe_t *pipe,
@@ -1572,7 +1604,7 @@ void commit_params(dt_iop_module_t *self,
 
 void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
-  piece->data = malloc(sizeof(dt_iop_demosaic_data_t));
+  piece->data = calloc(1, sizeof(dt_iop_demosaic_data_t));
 }
 
 void cleanup_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)

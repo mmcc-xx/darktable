@@ -1470,11 +1470,14 @@ static gboolean _history_end(JsonObject *params, JsonBuilder *b, gchar **err)
   return TRUE;
 }
 
+static void _capture_autotune_on_save(_session_t *s);
+
 static gboolean _save_session(_session_t *s)
 {
   const dt_imgid_t imgid = s->dev->image_storage.id;
   // the history hash alone can miss a change: a draft restored after a
   // release can match the hash of an older thumbnail
+  if(!s->gui) _capture_autotune_on_save(s);
   const gboolean was_dirty = s->dirty;
   dt_dev_write_history(s->dev);
   s->dirty = FALSE;
@@ -1750,6 +1753,148 @@ static void _set_param(dt_iop_module_t *m, const char *name, const double v)
 {
   const dt_introspection_field_t *f = _field(m, name);
   if(f) _set_num(f, (uint8_t *)m->params + f->header.offset, v);
+}
+
+// capture sharpening's autotune (demosaic.c): the radius and noise threshold
+// darktable measures on the raw, which its darkroom stores only from the
+// window and only on an unedited photo (_ui_pipe_done). the session's pipe
+// asks for it on demosaic's node (dt_iop_demosaic_autotune_request) and
+// processes the whole image at full size up to demosaic, with capture
+// sharpening on. FALSE (and *err) when this photo or darktable can't
+typedef void (*_cs_request_t)(dt_dev_pixelpipe_iop_t *piece);
+typedef gboolean (*_cs_result_t)(dt_dev_pixelpipe_iop_t *piece, float *radius, float *thrs);
+
+static gboolean _capture_measure(_session_t *s, dt_iop_module_t *m, float *radius, float *thrs, gchar **err)
+{
+  _cs_request_t request = NULL;
+  _cs_result_t result = NULL;
+  if(!g_module_symbol(m->so->module, "dt_iop_demosaic_autotune_request", (gpointer *)&request)
+     || !g_module_symbol(m->so->module, "dt_iop_demosaic_autotune_result", (gpointer *)&result))
+  {
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "this darktable's demosaic can't measure capture sharpening");
+    return FALSE;
+  }
+  const dt_image_t *img = &s->dev->image_storage;
+  const int method = _param(m, "demosaicing_method");
+  if(!m->enabled || !dt_image_is_raw(img) || (img->flags & DT_IMAGE_4BAYER) || method == 3 || method == 4)
+  {
+    *err = _ERR(API_E_PARAMS, NULL, "capture sharpening needs a raw photo demosaiced in color"
+                                    " (not passthrough, not a 4-color sensor)");
+    return FALSE;
+  }
+  _pipe_sync(s);
+  dt_dev_pixelpipe_t *pipe = &s->pipe;
+  dt_dev_pixelpipe_iop_t *piece = _piece(s, "demosaic");
+  const dt_introspection_field_t *on = _field(m, "cs_enabled");
+  gboolean ok = FALSE;
+  if(piece && piece->enabled && on)
+  {
+    // capture sharpening on for the measurement, as the window's reset
+    // button needs it shown: on the node only (the pipe syncs from the
+    // history, not from the module)
+    void *on_params = g_malloc(m->params_size);
+    memcpy(on_params, m->params, m->params_size);
+    _set_num(on, (uint8_t *)on_params + on->header.offset, 1);
+    dt_iop_commit_params(m, on_params, m->blend_params, pipe, piece);
+    g_free(on_params);
+    GList *off = NULL;
+    for(GList *n = pipe->nodes; n; n = g_list_next(n))
+    {
+      dt_dev_pixelpipe_iop_t *p = n->data;
+      if(p->module->iop_order > m->iop_order && p->enabled && !dt_iop_module_is_gamma(p->module))
+      {
+        p->enabled = FALSE;
+        off = g_list_prepend(off, p);
+      }
+    }
+    const dt_dev_pixelpipe_type_t type = pipe->type;
+    pipe->type |= DT_DEV_PIXELPIPE_IMAGE_FLOAT;
+    // a cached demosaic line wouldn't process again
+    dt_dev_pixelpipe_cache_flush(pipe);
+    dt_dev_pixelpipe_get_dimensions(pipe, s->dev, pipe->iwidth, pipe->iheight,
+                                    &pipe->processed_width, &pipe->processed_height);
+    request(piece);
+    dt_dev_pixelpipe_process(pipe, s->dev, 0, 0, pipe->processed_width, pipe->processed_height, 1.0f,
+                             DT_DEVICE_NONE);
+    ok = result(piece, radius, thrs);
+    pipe->type = type;
+    for(GList *l = off; l; l = g_list_next(l)) ((dt_dev_pixelpipe_iop_t *)l->data)->enabled = TRUE;
+    g_list_free(off);
+    g_free(pipe->backbuf);
+    pipe->backbuf = NULL;
+    pipe->backbuf_size = 0;
+    pipe->backbuf_width = pipe->backbuf_height = 0;
+    dt_dev_pixelpipe_cache_flush(pipe);
+  }
+  s->pipe_changed = TRUE;
+  _pipe_sync(s);
+  if(!ok) *err = g_strdup("darktable could not measure capture sharpening on this photo");
+  return ok;
+}
+
+// darktable's intended setup, an auto-applied demosaic preset with capture
+// sharpening on and radius 0, tunes every render of an unedited photo; the
+// window stores the result on the first render (_ui_pipe_done). a session
+// without the window stores it when it first saves the photo, before the
+// history makes it edited and radius 0 would stay
+static void _capture_autotune_on_save(_session_t *s)
+{
+  dt_iop_module_t *m = dt_iop_get_module_by_op_priority(s->dev->iop, "demosaic", 0);
+  if(!m || !m->enabled || !_param(m, "cs_enabled") || _param(m, "cs_radius") != 0.0
+     || dt_image_altered(s->dev->image_storage.id))
+    return;
+  float radius, thrs;
+  gchar *err = NULL;
+  if(_capture_measure(s, m, &radius, &thrs, &err))
+  {
+    _set_param(m, "cs_radius", radius);
+    _set_param(m, "cs_thrs", thrs);
+    dt_dev_add_history_item_ext(s->dev, m, TRUE, TRUE);
+    s->pipe_changed = TRUE;
+    s->dirty = TRUE;
+  }
+  g_free(err);
+}
+
+static gboolean _module_set(JsonObject *params, JsonBuilder *b, gchar **err);
+
+// capture_autotune: measure capture sharpening's radius and noise threshold
+// on this photo and store them, capture sharpening on, as one history item;
+// what the reset button by the radius does in the window, on any photo,
+// edited or not. in the window the measurement runs on the render mirror and
+// the result goes through the darkroom (module_set)
+static gboolean _capture_autotune(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
+    return FALSE;
+  }
+  _session_t *s = _pipe_session(err);
+  if(!s) return FALSE;
+  dt_iop_module_t *m = dt_iop_get_module_by_op_priority(s->dev->iop, "demosaic", 0);
+  if(!m)
+  {
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "this darktable has no demosaic module");
+    return FALSE;
+  }
+  float radius, thrs;
+  const gint64 t0 = g_get_monotonic_time();
+  if(!_capture_measure(s, m, &radius, &thrs, err)) return FALSE;
+  const int ms = (g_get_monotonic_time() - t0) / 1000;
+  JsonObject *set = json_object_new();
+  json_object_set_string_member(set, "operation", "demosaic");
+  JsonObject *values = json_object_new();
+  json_object_set_boolean_member(values, "cs_enabled", TRUE);
+  json_object_set_double_member(values, "cs_radius", radius);
+  json_object_set_double_member(values, "cs_thrs", thrs);
+  json_object_set_object_member(set, "values", values);
+  const gboolean ok = _module_set(set, b, err);
+  json_object_unref(set);
+  if(!ok) return FALSE;
+  json_builder_set_member_name(b, "ms");
+  json_builder_add_int_value(b, ms);
+  return TRUE;
 }
 
 // ashift's automatic crop fitted to its input (dt_iop_ashift_fit_crop),
@@ -11673,7 +11818,7 @@ static gboolean _quit_window(gpointer data)
 static const char *_methods[] = {
   "ping", "client_hello", "clients", "film_rolls", "images_list", "images_list.tag", "image_info", "thumbnail", "thumbnails", "import", "set_rating", "set_label", "marker_set", "marker_list", "marker_remove",
   "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
-  "module_enable", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
+  "module_enable", "capture_autotune", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
   "retouch_remove", "blend_get", "blend_set", "mask_add", "mask_list",
   "mask_remove", "mask_add.path", "mask_add.corners", "mask_ai", "mask_ai_encode", "export.background", "sample", "ai_denoise",
@@ -11702,7 +11847,7 @@ static const struct { const char *method; const char *event; } _session_methods[
   { "mask_remove", "edit" }, { "mask_ai", "edit" }, { "mask_ai_encode", NULL }, { "sample", NULL },
   { "module_move", "edit" }, { "picker_list", NULL }, { "picker_apply", NULL }, { "curve_get", NULL }, { "curve_set", "edit" },
   { "module_add", "edit" }, { "ai_fill", "edit" }, { "module_remove", "edit" }, { "module_rename", "edit" }, { "history_compress", "saved" },
-  { "module_set", "edit" }, { "module_enable", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" },
+  { "module_set", "edit" }, { "module_enable", "edit" }, { "capture_autotune", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" },
   { "save", "saved" }, { "reset", "reset" }, { "session_close", "closed" }, { NULL, NULL } };
 
 // returns FALSE when the engine should stop
@@ -11926,6 +12071,8 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _module_set(params, b, &err);
   else if(!g_strcmp0(method, "module_enable"))
     _module_enable(params, b, &err);
+  else if(!g_strcmp0(method, "capture_autotune"))
+    _capture_autotune(params, b, &err);
   else if(!g_strcmp0(method, "history_list"))
     _history_list(b, &err);
   else if(!g_strcmp0(method, "preset_list"))

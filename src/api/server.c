@@ -211,7 +211,7 @@
                                     database and caches, reloads darktablerc
                                     and restores each draft whose image was
                                     not changed meanwhile
-     export {imgid, format, quality, max_width, max_height, high_quality,
+     export {imgid, format, quality, bpp, max_width, max_height, high_quality,
              upscale, style, path, on_conflict, save}
                                  -> exports the image's saved edit as
                                     darktable's export module does (its
@@ -5573,6 +5573,7 @@ static _export_t *_export_prepare(JsonObject *params, const dt_imgid_t current, 
   const gchar *conflict = params ? json_object_get_string_member_with_default(params, "on_conflict", NULL) : NULL;
   const gchar *style = params ? json_object_get_string_member_with_default(params, "style", NULL) : NULL;
   const int quality = params ? json_object_get_int_member_with_default(params, "quality", 0) : 0;
+  const int bpp = params ? json_object_get_int_member_with_default(params, "bpp", 0) : 0;
   const int max_w = params ? json_object_get_int_member_with_default(params, "max_width", -1) : -1;
   const int max_h = params ? json_object_get_int_member_with_default(params, "max_height", -1) : -1;
   const gboolean save = params ? json_object_get_boolean_member_with_default(params, "save", FALSE) : FALSE;
@@ -5592,6 +5593,11 @@ static _export_t *_export_prepare(JsonObject *params, const dt_imgid_t current, 
   if(conflict && conflict_action < 0)
   {
     *err = _ERR(API_E_PARAMS, "on_conflict", "on_conflict: unique, overwrite, overwrite_if_changed or skip");
+    return NULL;
+  }
+  if(bpp && bpp != 8 && bpp != 16 && bpp != 32)
+  {
+    *err = _ERR(API_E_PARAMS, "bpp", "bpp: 8, 16 or 32 bits per channel");
     return NULL;
   }
   if(max_w < -1 || max_h < -1)
@@ -5648,6 +5654,26 @@ static _export_t *_export_prepare(JsonObject *params, const dt_imgid_t current, 
     g_free(v);
   }
   g_free(qkey);
+  // the bit depth, for tiff (8, 16 or 32) and png (8 or 16); a 16-bit
+  // tiff as integers, not half floats
+  const gboolean is_tiff = !g_strcmp0(format->plugin_name, "tiff");
+  const gboolean is_png = !g_strcmp0(format->plugin_name, "png");
+  if(bpp && !(is_tiff || (is_png && bpp != 32)))
+  {
+    _conf_restore(overrides);
+    *err = _ERR(API_E_PARAMS, "bpp", "bpp: 8, 16 or 32 for tiff, 8 or 16 for png");
+    return NULL;
+  }
+  gchar *bkey = g_strdup_printf("plugins/imageio/format/%s/bpp", format->plugin_name);
+  if(bpp)
+  {
+    gchar *v = g_strdup_printf("%d", bpp);
+    _conf_override(&overrides, bkey, v);
+    g_free(v);
+    if(is_tiff)
+      _conf_override(&overrides, "plugins/imageio/format/tiff/pixelformat", bpp == 32 ? "true" : "false");
+  }
+  g_free(bkey);
   dt_imageio_module_data_t *sdata = storage->get_params(storage);
   dt_imageio_module_data_t *fdata = format->get_params(format);
   _conf_restore(overrides);
@@ -7222,6 +7248,45 @@ static gboolean _set_tags(JsonObject *params, const dt_imgid_t current, JsonBuil
       dt_tag_detach_images(tagid, imgs, FALSE);
   }
   if(_in_gui) DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_TAG_CHANGED);
+  _imgs_changed(imgs, b);
+  g_list_free(imgs);
+  return TRUE;
+}
+
+// images into one group, as the lighttable's grouping (ctrl+g) with
+// `leader` (default the first) as its representative; the group's members
+// are replied
+static gboolean _group(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!params || !json_object_has_member(params, "imgids"))
+  {
+    *err = _ERR(API_E_PARAMS, "imgids", "needs imgids: the images to group");
+    return FALSE;
+  }
+  GList *imgs = _imgids(params, NO_IMGID, err);
+  if(!imgs) return FALSE;
+  const dt_imgid_t leader = json_object_has_member(params, "leader")
+    ? json_object_get_int_member(params, "leader") : GPOINTER_TO_INT(imgs->data);
+  if(!g_list_find(imgs, GINT_TO_POINTER(leader)))
+  {
+    if(!_image_exists(leader))
+    {
+      *err = _ERRF(API_E_NOT_FOUND, "leader", "no image with id %d", leader);
+      g_list_free(imgs);
+      return FALSE;
+    }
+    imgs = g_list_prepend(imgs, GINT_TO_POINTER(leader));
+  }
+  for(GList *l = imgs; l; l = g_list_next(l))
+    if(GPOINTER_TO_INT(l->data) != leader) dt_grouping_add_to_group(leader, GPOINTER_TO_INT(l->data));
+  const dt_imgid_t group_id = dt_grouping_change_representative(leader);
+  if(_in_gui)
+    dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
+                               DT_COLLECTION_PROP_UNDEF, NULL);
+  json_builder_set_member_name(b, "group_id");
+  json_builder_add_int_value(b, group_id);
+  g_list_free(imgs);
+  imgs = dt_grouping_get_members(group_id);
   _imgs_changed(imgs, b);
   g_list_free(imgs);
   return TRUE;
@@ -11831,8 +11896,8 @@ static const char *_methods[] = {
 #endif
   "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "image_remove", "style_list", "style_create", "style_delete", "style_apply",
   "history_paste", "collection", "darkroom_open", "image_info.exif", "image_metadata", "tag_list", "set_tags",
-  "set_metadata", "set_location", "picker_list", "picker_apply", "picker_apply.headless", "module_remove", "module_rename", "history_compress",
-  "render.history_end", "render_variants", "darkroom_snapshot", "share", "save", "reset", "render", "render.uncropped", "render.zoom", "render.show_mask", "export",
+  "group", "set_metadata", "set_location", "picker_list", "picker_apply", "picker_apply.headless", "module_remove", "module_rename", "history_compress",
+  "render.history_end", "render_variants", "darkroom_snapshot", "share", "save", "reset", "render", "render.uncropped", "render.zoom", "render.show_mask", "export", "export.bpp",
   "library_status", "library_release", "library_acquire", "handover", "shutdown", "shutdown.quit_window",
   "errors.codes", NULL };
 
@@ -12153,6 +12218,15 @@ static gboolean _handle(_client_t *c, const gchar *line)
     if(ok)
     {
       GList *imgs = _imgids(params, c->current, &err);
+      for(GList *l = imgs; l; l = g_list_next(l)) _notify(c, "image", GPOINTER_TO_INT(l->data));
+      g_list_free(imgs);
+    }
+  }
+  else if(!g_strcmp0(method, "group"))
+  {
+    if(_group(params, b, &err))
+    {
+      GList *imgs = _imgids(params, NO_IMGID, &err);
       for(GList *l = imgs; l; l = g_list_next(l)) _notify(c, "image", GPOINTER_TO_INT(l->data));
       g_list_free(imgs);
     }

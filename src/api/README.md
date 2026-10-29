@@ -41,10 +41,11 @@ needs darktable's data files (rawspeed's `cameras.xml`, the default
 Without them a fresh build hangs on its first raw import.
 
 `src/api` builds against darktable master and against releases from 5.6.2
-on: branch `darktable-api` is darktable master, `darktable-api-5.6` is
-darktable 5.6.2 (the same `src/api`; use the one matching the darktable
-that edits the library, as newer module versions can't be read by an
-older darktable). `darktable-api` merges darktable master weekly once the
+on: branch `darktable-api` is darktable master. `darktable-api-5.6`
+(darktable 5.6.2) is frozen at tag `api-dt5.6.2-final` (2026-10-29) with
+the `src/api` of 2026-10-15: no fixes or new methods since. Newer module
+versions can't be read by an older darktable, so open a library edited by
+`darktable-api` with the `darktable` from the same build. `darktable-api` merges darktable master weekly once the
 tests pass, and release branches merge darktable's point releases; nothing
 is rebased or force-pushed, so `git pull` and a rebuild update a clone. What differs between them is in `compat.h`, chosen by the feature
 checks in `compat.cmake` (what a darktable has, not its version number).

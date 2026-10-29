@@ -7,8 +7,8 @@
 >
 > | Branch | What it is |
 > |---|---|
-> | `darktable-api-5.6` | darktable 5.6 with the API. Its edits open in stock darktable 5.6. Most people want this one |
-> | `darktable-api` (default) | darktable master with the API, for development. darktable master is merged in weekly once the tests pass; its edits use module versions darktable 5.6 can't open |
+> | `darktable-api` (default) | darktable master with the API. darktable master is merged in weekly once the tests pass. Its edits use module versions darktable 5.6 can't open: open the library with the `darktable` from the same build |
+> | `darktable-api-5.6` | **frozen** (tag `api-dt5.6.2-final`, 2026-10-29): darktable 5.6.2 with the API as of 2026-10-15; no fixes or new methods since. Its edits open in stock darktable 5.6 |
 >
 > darktable's changes come in as merges and the branches are never
 > rewritten, so `git pull` updates a clone. Everything below is

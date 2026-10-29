@@ -202,10 +202,14 @@
                                     defaults and auto-apply presets again
      library_status              -> owned or released, the lock holder's pid,
                                     the open sessions
-     library_release             -> closes the sessions (unsaved changes kept
+     library_release {auto_acquire}
+                                 -> closes the sessions (unsaved changes kept
                                     as drafts), the caches and the library,
                                     removing the lock files: darktable's GUI
-                                    can open the library now
+                                    can open the library now. auto_acquire
+                                    (default true): once a process has held
+                                    the library and quit, take it back as
+                                    library_acquire does
      library_acquire             -> takes the library back (refused while
                                     another live process holds it), reopens
                                     database and caches, reloads darktablerc
@@ -5830,6 +5834,9 @@ typedef struct _draft_t
 static gboolean _released = FALSE;
 static gchar *_library_path = NULL;   // the library file to reopen
 static GList *_drafts = NULL;
+// library_release {auto_acquire}: the watch, and the lock holder it has seen
+static guint _acquire_watch = 0;
+static int _acquire_holder = 0;   // the holder seen since the release, 0 if none yet
 
 static void _draft_free(_draft_t *d)
 {
@@ -5942,6 +5949,8 @@ static gboolean _library_status(JsonBuilder *b, const dt_imgid_t current, gchar 
     g_free(data);
     json_builder_set_member_name(b, "holder_pid");
     json_builder_add_int_value(b, pid);
+    json_builder_set_member_name(b, "auto_acquire");
+    json_builder_add_boolean_value(b, _acquire_watch != 0);
     json_builder_set_member_name(b, "drafts");
     json_builder_begin_array(b);
     for(GList *l = _drafts; l; l = g_list_next(l))
@@ -6108,6 +6117,60 @@ static gboolean _library_acquire(JsonBuilder *b, gchar **err)
   json_builder_set_member_name(b, "ms");
   json_builder_add_int_value(b, (g_get_monotonic_time() - t0) / 1000);
   return TRUE;
+}
+
+// library_release {auto_acquire}: once a process has held the lock and
+// gone (darktable's window quit), take the library back as library_acquire
+// does. Before a holder appears it waits indefinitely
+static void _acquire_watch_stop(void)
+{
+  if(_acquire_watch) g_source_remove(_acquire_watch);
+  _acquire_watch = 0;
+  _acquire_holder = 0;
+}
+
+static gboolean _acquire_watch_cb(gpointer data)
+{
+  if(!_released)
+  {
+    _acquire_watch = 0;
+    _acquire_holder = 0;
+    return G_SOURCE_REMOVE;
+  }
+  gchar *dbfile = _data_path();
+  // a dead holder's stale lock counts as free: dt_database_init removes it
+  const int pid = MAX(_lock_holder(_library_path), _lock_holder(dbfile));
+  g_free(dbfile);
+  if(pid)
+  {
+    _acquire_holder = pid;
+    return G_SOURCE_CONTINUE;
+  }
+  if(!_acquire_holder) return G_SOURCE_CONTINUE;
+
+  const int was = _acquire_holder;
+  _acquire_watch = 0;
+  _acquire_holder = 0;
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  gchar *err = NULL;
+  if(_library_acquire(b, &err))
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[api] process %d let go of the library: took it back", was);
+    _notify(NULL, "library_acquired", NO_IMGID);
+  }
+  else
+    dt_print(DT_DEBUG_ALWAYS, "[api] process %d let go of the library, but taking it back failed: %s", was, err);
+  json_builder_end_object(b);
+  g_object_unref(b);
+  g_free(err);
+  return G_SOURCE_REMOVE;
+}
+
+static void _acquire_watch_start(void)
+{
+  _acquire_watch_stop();
+  _acquire_watch = g_timeout_add_seconds(2, _acquire_watch_cb, NULL);
 }
 
 // ---- handing the library over to darktable's window ----------------------
@@ -11898,7 +11961,7 @@ static const char *_methods[] = {
   "history_paste", "collection", "darkroom_open", "image_info.exif", "image_metadata", "tag_list", "set_tags",
   "group", "set_metadata", "set_location", "picker_list", "picker_apply", "picker_apply.headless", "module_remove", "module_rename", "history_compress",
   "render.history_end", "render_variants", "darkroom_snapshot", "share", "save", "reset", "render", "render.uncropped", "render.zoom", "render.show_mask", "export", "export.bpp",
-  "library_status", "library_release", "library_acquire", "handover", "shutdown", "shutdown.quit_window",
+  "library_status", "library_release", "library_release.auto_acquire", "library_acquire", "handover", "shutdown", "shutdown.quit_window",
   "errors.codes", NULL };
 
 // methods that work on an edit session, and the event each one sends
@@ -12318,6 +12381,9 @@ static gboolean _handle(_client_t *c, const gchar *line)
   {
     if(!g_strcmp0(method, "library_release") ? _library_release(b, &err) : _library_acquire(b, &err))
       event = !g_strcmp0(method, "library_release") ? "library_released" : "library_acquired";
+    if(!err && !g_strcmp0(method, "library_release")
+       && (!params || json_object_get_boolean_member_with_default(params, "auto_acquire", TRUE)))
+      _acquire_watch_start();
   }
   else if(!g_strcmp0(method, "reset"))
     _reset(b, &err);

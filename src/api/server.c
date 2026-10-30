@@ -323,6 +323,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -12520,6 +12522,20 @@ int dt_api_listen(const char *path)
     return -1;
   }
   if(probe >= 0) close(probe);
+  // a refused connect doesn't prove the socket stale: a server whose main
+  // loop is blocked refuses too once its backlog is full. every server holds
+  // this lock until it exits, so a held lock means the socket is still live
+  gchar *lock_path = g_strconcat(path, ".lock", NULL);
+  const int lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if(lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB) != 0)
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[api] %s is held by a running server (%s): leaving its socket alone",
+             path, lock_fd < 0 ? strerror(errno) : "busy");
+    if(lock_fd >= 0) close(lock_fd);
+    g_free(lock_path);
+    return -1;
+  }
+  g_free(lock_path);
   g_unlink(path);
   const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   // only this user may connect
@@ -12530,8 +12546,10 @@ int dt_api_listen(const char *path)
   {
     dt_print(DT_DEBUG_ALWAYS, "[api] cannot listen on %s: %s", path, strerror(errno));
     if(fd >= 0) close(fd);
+    close(lock_fd);
     return -1;
   }
+  // lock_fd stays open, and the lock held, for the life of the process
   return fd;
 }
 

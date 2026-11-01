@@ -12,14 +12,13 @@ keeps an edit session with a live pixelpipe between requests.
 library your darktable uses. Saving writes the history in this build's
 module versions; an older darktable can't read some of them.
 
-A web front end using it (library browsing, editing with live previews,
-handing the library to darktable's GUI and back):
-https://github.com/mmcc-xx/darktable-api-web
-An MCP server using it, for AI assistants:
-https://github.com/mmcc-xx/darktable-api-mcp
-
-A demo video (the web app, darktable's window and an AI assistant on one
-photo): https://www.youtube.com/watch?v=VDfZbxvvniY
+darktable-api is three repositories: this fork (the engine),
+[darktable-api-mcp](https://github.com/mmcc-xx/darktable-api-mcp) (an MCP
+server for AI assistants, and the setup instructions for all three) and
+[darktable-api-web](https://github.com/mmcc-xx/darktable-api-web) (a web
+app: the library, editing with live previews, phone included). Demo video
+(the web app, darktable's window and an AI assistant on one photo):
+https://www.youtube.com/watch?v=VDfZbxvvniY
 
 This code was written with AI assistance (Claude), directed and reviewed by
 the branch owner.
@@ -31,8 +30,9 @@ Build darktable as usual with the API enabled (`-DUSE_API=ON`, or
 and lets darktable's window serve the API (`--api-socket`); without it
 neither exists (a build folder configured before the option existed
 needs `cmake -B build -DUSE_API=ON` once). The AI methods (`mask_ai`,
-`ai_denoise`) need `-DUSE_AI=ON`:
+`ai_denoise`, `ai_fill`) need `-DUSE_AI=ON`:
 
+    cmake -B build -G Ninja -DUSE_API=ON -DUSE_AI=ON
     cmake --build build
 
 Build all targets, not just `--target darktable-api`: the engine also
@@ -45,10 +45,11 @@ on: branch `darktable-api` is darktable master. `darktable-api-5.6`
 (darktable 5.6.2) is frozen at tag `api-dt5.6.2-final` (2026-10-29) with
 the `src/api` of 2026-10-15: no fixes or new methods since. Newer module
 versions can't be read by an older darktable, so open a library edited by
-`darktable-api` with the `darktable` from the same build. `darktable-api` merges darktable master weekly once the
-tests pass, and release branches merge darktable's point releases; nothing
-is rebased or force-pushed, so `git pull` and a rebuild update a clone. What differs between them is in `compat.h`, chosen by the feature
-checks in `compat.cmake` (what a darktable has, not its version number).
+`darktable-api` with the `darktable` from the same build. `darktable-api`
+merges darktable master weekly once the tests pass; nothing is rebased or
+force-pushed, so `git pull` and a rebuild update a clone. What differs
+between darktable versions is in `compat.h`, chosen by the feature checks
+in `compat.cmake` (what a darktable has, not its version number).
 A few features use functions only this branch adds to darktable, looked up
 at runtime: without them, sliders' pickers and wands aren't listed,
 `darkroom_snapshot` refuses, and straightening doesn't fit the crop.
@@ -243,7 +244,8 @@ about 1/255 (mean absolute difference).
 ## Not done
 
 - headless, settings the module's GUI code adjusts alongside a change
-  (`gui_changed`) are left as they are; in darktable's window they follow
+  (`gui_changed`) follow only in the 21 modules `also_changed.c` ports; in
+  the others they are left as they are (in darktable's window they follow)
 - auto buttons headless (rgb levels' and levels' "auto levels", tone
   equalizer's wands): they need darktable's window
 - integer arrays and arrays of structs other than curves, path and brush

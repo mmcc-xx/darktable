@@ -2,8 +2,13 @@
 > `darktable-api`, a headless darktable that edits photos in a library on
 > request (JSON-RPC), and `--api-socket`, which lets darktable's own window
 > serve the same API. It is meant for web apps and AI assistants; see
-> [src/api/README.md](src/api/README.md). An MCP server for AI assistants
-> and setup instructions: [darktable-api-mcp](https://github.com/mmcc-xx/darktable-api-mcp).
+> [src/api/README.md](src/api/README.md).
+>
+> darktable-api is three repositories: this fork (the engine),
+> [darktable-api-mcp](https://github.com/mmcc-xx/darktable-api-mcp) (an
+> MCP server for AI assistants, and the setup instructions for all three)
+> and [darktable-api-web](https://github.com/mmcc-xx/darktable-api-web)
+> (a web app). Demo video: https://www.youtube.com/watch?v=VDfZbxvvniY
 >
 > | Branch | What it is |
 > |---|---|

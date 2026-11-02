@@ -67,7 +67,9 @@ jobs:
         btype:
           - Release
         target:
-          - skiptest
+          - build
+        name_suffix:
+          - _tests
         generator:
           - Ninja
         eco: [-DDONT_USE_INTERNAL_LIBRAW=ON]
@@ -76,9 +78,10 @@ jobs:
           - distro: "ubuntu:26.04"
             btype: Debug
             compiler: { compiler: GNU16, CC: gcc-16, CXX: g++-16, packages: gcc-16 g++-16 }
-            target: skiptest
+            target: build
             generator: Ninja
             eco: -DDONT_USE_INTERNAL_LIBRAW=OFF
+            name_suffix: _tests
           # The other entries use the skiptest target, which never configures
           # BUILD_TESTING and so never even compiles the unit tests. This one
           # builds them and runs ctest.
@@ -210,6 +213,17 @@ jobs:
               submodule update --init --depth 1 --filter=blob:none src/tests/integration
           du -sh src/tests/integration/images
           cd -
+      # test_spektra_pack needs a spektrafilm data pack, which darktable does
+      # not ship; SPEKTRA_PACK_DIR points the suite at the published ones.
+      # $GITHUB_WORKSPACE, not the github.workspace expression: inside a
+      # container job the expression is the host path, while the variable is
+      # the path the container sees
+      - name: Get the spektrafilm data packs for the unit tests
+        if: matrix.target == 'build'
+        run: |
+          git clone --depth 1 https://github.com/darktable-org/darktable-spektrafilm.git \
+              "$GITHUB_WORKSPACE/spektrafilm"
+          echo "SPEKTRA_PACK_DIR=$GITHUB_WORKSPACE/spektrafilm/packs" >> "$GITHUB_ENV"
       - name: Build and Install
         run: |
           cmake -E make_directory "${BUILD_DIR}";
@@ -346,7 +360,7 @@ jobs:
 
   macOS:
     if: github.repository == 'darktable-org/darktable' || github.event_name == 'workflow_dispatch'
-    name: macOS_${{ matrix.build.os }}_${{ matrix.compiler.compiler }}_${{ matrix.build.xcode }}_${{ matrix.btype }}
+    name: macOS_${{ matrix.build.os }}_${{ matrix.compiler.compiler }}_${{ matrix.build.xcode }}_${{ matrix.btype }}${{ matrix.name_suffix }}
     runs-on: ${{ matrix.build.os }}
     strategy:
       fail-fast: true
@@ -357,7 +371,9 @@ jobs:
           - { compiler: XCode,   CC: cc, CXX: c++ }
         btype: [ Release ]
         target:
-          - skiptest
+          - build
+        name_suffix:
+          - _tests
         generator:
           - Ninja
         eco: [-DDONT_USE_INTERNAL_LIBRAW=ON -DUSE_GRAPHICSMAGICK=OFF -DUSE_IMAGEMAGICK=ON]
@@ -399,6 +415,28 @@ jobs:
           # disables HDR bracket auto-alignment silently at configure time, so
           # check the formula really is installed.
           brew list --versions opencv
+      # check out only images/ of the pinned commit (~95 MB),
+      # not the whole test repository (~1 GB)
+      - name: Get the integration test images for the unit tests
+        if: matrix.target == 'build'
+        run: |
+          cd src
+          sparse_update='!f() { git sparse-checkout set --no-cone /images/ && git checkout -f -q "$1"; }; f'
+          git -c "submodule.src/tests/integration.update=${sparse_update}" \
+              submodule update --init --depth 1 --filter=blob:none src/tests/integration
+          du -sh src/tests/integration/images
+          cd -
+      # test_spektra_pack needs a spektrafilm data pack, which darktable does
+      # not ship; SPEKTRA_PACK_DIR points the suite at the published ones.
+      # $GITHUB_WORKSPACE, not the github.workspace expression: inside a
+      # container job the expression is the host path, while the variable is
+      # the path the container sees
+      - name: Get the spektrafilm data packs for the unit tests
+        if: matrix.target == 'build'
+        run: |
+          git clone --depth 1 https://github.com/darktable-org/darktable-spektrafilm.git \
+              "$GITHUB_WORKSPACE/spektrafilm"
+          echo "SPEKTRA_PACK_DIR=$GITHUB_WORKSPACE/spektrafilm/packs" >> "$GITHUB_ENV"
       - name: Build and Install
         run: |
           cmake -E make_directory "${BUILD_DIR}";

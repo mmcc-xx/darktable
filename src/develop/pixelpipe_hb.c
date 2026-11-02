@@ -2085,12 +2085,24 @@ static void _diff_statistics(const dt_iop_module_t *self,
   int outrange_2 = 0;
   int outrange_4 = 0;
   int outliers = 0;
+
+  const size_t per32 = DT_CACHELINE_BYTES / 4;
+  int32_t *errpos = dt_calloc_aligned(dt_get_num_threads() * DT_CACHELINE_BYTES);
+  float *errlevel = dt_calloc_aligned(dt_get_num_threads() * DT_CACHELINE_BYTES);
+
   DT_OMP_FOR(reduction(+ : outrange_2, outrange_4, outliers))
   for(size_t i = 0; i < npix * ch; i+=ch)
   {
     const float a = ch == 1 ? dat_a[i] : (dat_a[i] + dat_a[i+1] + dat_a[i+2]) / 3.0f;
     const float b = ch == 1 ? dat_b[i] : (dat_b[i] + dat_b[i+1] + dat_b[i+2]) / 3.0f;
     const float ad = fabsf(a - b);
+    const int idx = dt_get_thread_num() * per32;
+    if(ad > errlevel[idx])
+    {
+      errlevel[idx] = ad;
+      errpos[idx] = (int)(i / ch);
+    }
+
     outrange_2 += ad > 2.0f * stddev ? 1 : 0;
     outrange_4 += ad > 4.0f * stddev ? 1 : 0;
     outliers += ad > 8.0f * stddev ? 1 : 0;
@@ -2109,9 +2121,20 @@ static void _diff_statistics(const dt_iop_module_t *self,
       }
     }
   }
+
+  int maxpnt = 0;
+  for(int i = 1; i < dt_get_num_threads()*per32; i += per32)
+    if(errlevel[i] > errlevel[maxpnt]) maxpnt = i;
+
+  char position[64] = { 0 };
+  if(errlevel[maxpnt] > 1e-8)
+    snprintf(position, sizeof(position), "%d/%d", errpos[maxpnt] % width, errpos[maxpnt] / width);
+
+  dt_free_align(errpos);
+  dt_free_align(errlevel);
   dt_print_pipe(DT_DEBUG_ALWAYS, "OpenCL diff stats", NULL, self, devid, NULL, NULL,
-           "(%4dx%4d) max=%.5e  std=%.5e  mean=%+.5e  S2:%7d %4.1f%%   S4:%7d %4.1f%%   S8:%6d %3.1f%%",
-           width, height, max_abs, stddev, mean,
+           "(%4dx%4d) max=%.5e %10s  std=%.5e  mean=%+.5e  S2:%7d %4.1f%%   S4:%7d %4.1f%%   S8:%6d %3.1f%%",
+           width, height, max_abs, position, stddev, mean,
            outrange_2, 100.0f * (float)outrange_2 / (float)npix,
            outrange_4, 100.0f * (float)outrange_4 / (float)npix,
            outliers, 100.0f * (float)outliers / (float)npix);
@@ -2677,8 +2700,14 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
       dt_opencl_image_fits_device(pipe->devid, roi_in.width, roi_in.height,
                                   in_bpp, bpp, untiled_factor_cl, tiling.overhead, tiling.overlap);
 
+    // the fitter only sees roi_in; an upscaled roi_out can exceed the device's
+    // maximum image size although its input fits
+    const gboolean out_fits =
+         roi_out->width <= darktable.opencl->dev[pipe->devid].max_image_width
+      && roi_out->height <= darktable.opencl->dev[pipe->devid].max_image_height;
+
     const gboolean may_tile = _piece_may_tile(piece);
-    const gboolean no_tiling = fitter == DT_OPENCL_NO_TILING;
+    const gboolean no_tiling = fitter == DT_OPENCL_NO_TILING && out_fits;
     const gboolean fast_tiling = fitter == DT_OPENCL_FAST_TILING
         && !memcmp(&roi_in, roi_out, sizeof(roi_in))
         && !(module->flags() & (IOP_FLAGS_WRITE_RASTER | IOP_FLAGS_WRITE_DETAILS))
@@ -2911,7 +2940,9 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
                           "device=%i (%s), %s",
                           pipe->devid, darktable.opencl->dev[pipe->devid].cname,
                           cl_errstr(err));
-          else if(_is_debug_pipe(pipe) && !(module->flags() & IOP_FLAGS_HIDDEN))
+          else if(_is_debug_pipe(pipe)
+              && !((module->flags() & IOP_FLAGS_HIDDEN) && (darktable.unmuted & DT_DEBUG_VERBOSE) == 0)
+              && piece->pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_NONE)
           {
             if(darktable.dump_pfm_pipe)
               dt_opencl_dump_pipe_pfm(module->op, pipe->devid, *cl_mem_output,
@@ -2919,7 +2950,7 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
 
             if(darktable.dump_diff_pipe || darktable.cldiff_stats)
             {
-              const float visualize = darktable.cldiff_stats
+              const gboolean visualize = darktable.cldiff_stats
                                     && dt_pipe_is_full(pipe)
                                     && dt_iop_has_focus(module);
               float *clout = _opencl_dump_diff_pipe_pfm(pipe, module, piece, cl_mem_input, *cl_mem_output, roi_out, &roi_in, cst_out, visualize);
@@ -4126,7 +4157,7 @@ float *dt_dev_get_raster_mask(dt_dev_pixelpipe_iop_t *piece,
     }
     else
     {
-      dt_print_pipe(DT_DEBUG_VERBOSE,
+      dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_MASKS | DT_DEBUG_VERBOSE,
                     "source raster mask",
                     piece->pipe,
                     source_piece->module,

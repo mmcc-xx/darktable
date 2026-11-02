@@ -12513,8 +12513,11 @@ int dt_api_listen(const char *path)
     return -1;
   }
   g_strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
-  // refuse if another server answers; remove a stale socket left by a crash
+  // refuse if another server answers; remove a stale socket left by a crash.
+  // non-blocking: on Linux a connect to a full backlog waits until the
+  // server accepts (EAGAIN here), forever if its main loop is blocked
   const int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+  if(probe >= 0) fcntl(probe, F_SETFL, O_NONBLOCK);
   if(probe >= 0 && connect(probe, (struct sockaddr *)&addr, sizeof(addr)) == 0)
   {
     close(probe);

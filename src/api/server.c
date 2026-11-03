@@ -714,6 +714,9 @@ static gboolean _module_list(JsonBuilder *b, gchar **err)
     json_builder_add_boolean_value(b, in_hist);
     json_builder_set_member_name(b, "iop_order");
     json_builder_add_int_value(b, m->iop_order);
+    // darktable's window never shows these (display encoding, scaling, ...)
+    json_builder_set_member_name(b, "hidden");
+    json_builder_add_boolean_value(b, dt_iop_is_hidden(m));
     json_builder_end_object(b);
   }
   json_builder_end_array(b);
@@ -1392,6 +1395,13 @@ static gboolean _module_enable(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   dt_iop_module_t *m = _find_module(params, err);
   if(!m) return FALSE;
+  if(dt_iop_is_hidden(m))
+  {
+    // the pipe switches these itself; darktable's window has no toggle
+    *err = _ERRF(API_E_PARAMS, "operation",
+                 "'%s' is one of darktable's hidden modules and can't be switched on or off", m->op);
+    return FALSE;
+  }
   m->enabled = json_object_get_boolean_member_with_default(params, "enabled", TRUE);
   _record(m, FALSE);
   json_builder_set_member_name(b, "enabled");

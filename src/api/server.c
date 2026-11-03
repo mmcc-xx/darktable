@@ -7308,12 +7308,17 @@ static gboolean _set_tags(JsonObject *params, const dt_imgid_t current, JsonBuil
       }
     }
   }
+  const gboolean private_ = params && json_object_has_member(params, "private")
+                            && json_object_get_boolean_member(params, "private");
   GList *imgs = _imgids(params, current, err);
   if(!imgs) return FALSE;
   for(guint i = 0; attach && i < json_array_get_length(attach); i++)
   {
     guint tagid = 0;
     dt_tag_new(json_array_get_string_element(attach, i), &tagid);
+    // private, as the tagging module's "private" toggle: left out of exports
+    if(private_)
+      dt_tag_set_flags(tagid, dt_tag_get_flags(tagid) | DT_TF_PRIVATE);
     dt_tag_attach_images(tagid, imgs, FALSE);
   }
   for(guint i = 0; detach && i < json_array_get_length(detach); i++)
@@ -11970,7 +11975,7 @@ static const char *_methods[] = {
 #endif
 #endif
   "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "image_remove", "style_list", "style_create", "style_delete", "style_apply",
-  "history_paste", "collection", "darkroom_open", "image_info.exif", "image_metadata", "tag_list", "set_tags",
+  "history_paste", "collection", "darkroom_open", "image_info.exif", "image_metadata", "tag_list", "set_tags", "set_tags.private",
   "group", "set_metadata", "set_location", "picker_list", "picker_apply", "picker_apply.headless", "module_remove", "module_rename", "history_compress",
   "render.history_end", "render_variants", "darkroom_snapshot", "share", "save", "reset", "render", "render.uncropped", "render.zoom", "render.show_mask", "export", "export.bpp",
   "library_status", "library_release", "library_release.auto_acquire", "library_acquire", "handover", "shutdown", "shutdown.quit_window",

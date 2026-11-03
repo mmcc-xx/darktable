@@ -1029,8 +1029,12 @@ void dt_mipmap_cache_get_with_caller(dt_mipmap_buffer_t *buf,
           // (dt_image_remove), and releasing that one would leave this
           // entry write-locked for good
           struct dt_cache_entry_t *locked_entry = img->cache_entry;
+          // loaders never set the group: keep one changed while the file
+          // was loading (grouping), else it is reverted in cache and db
+          const dt_imgid_t group_id = img->group_id;
           *img = buffered_image;
           img->cache_entry = locked_entry;
+          img->group_id = group_id;
           img->load_status = DT_IMAGEIO_OK;
           // dt_print(DT_DEBUG_ALWAYS, "[mipmap read get] initializing full buffer img %u with %u %u -> %d %d (%p)",
           // imgid, data[0], data[1], img->width, img->height, data);

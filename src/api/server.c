@@ -164,6 +164,9 @@
                                     module's mask (needs USE_AI, AI on)
      mask_list / mask_remove {operation, instance, formid}
                                  -> the module's shapes; take one out
+     mask_attach {operation, instance, formid, combine, inverted, opacity}
+                                 -> an existing shape or group (another
+                                    module's mask) on this module's too, shared
      sample {width, height, zoom, center_x, center_y, uncropped, points,
              radius, boxes, bins}
                                  -> renders as render does and reads the
@@ -3164,6 +3167,10 @@ static void _add_blend(JsonBuilder *b, const dt_iop_module_t *m)
   for(GList *l = grp && (grp->type & DT_MASKS_GROUP) ? grp->points : NULL; l; l = g_list_next(l))
     if(dt_masks_get_from_id(_cur->dev, ((dt_masks_point_group_t *)l->data)->formid)) shapes++;   // not a marker
   json_builder_add_int_value(b, shapes);
+  // the module's group, for mask_attach on another module
+  json_builder_set_member_name(b, "mask_id");
+  if(grp && (grp->type & DT_MASKS_GROUP)) json_builder_add_int_value(b, grp->formid);
+  else json_builder_add_null_value(b);
 
   // parametric ranges: [low end, low full, high full, high end] per channel
   // in the darkroom's units, for the module's input ("_in") and output
@@ -3666,8 +3673,15 @@ static gboolean _mask_attach_ext(dt_iop_module_t *m, dt_masks_form_t *form, cons
     _api_editing = TRUE;
     dt_dev_undo_start_record(dev);
   }
-  if((form->type & DT_MASKS_GROUP) && !_name_free(dev, form)) _name_group(dev, form);
-  dt_masks_gui_form_save_creation(dev, m, form, NULL);
+  // an existing shape (mask_attach) joins the group shared, as the
+  // darkroom's "add existing shape" does; a new one is registered first
+  if(g_list_find(dev->forms, form))
+    dt_masks_group_insert_member(dev, m, form, NULL);
+  else
+  {
+    if((form->type & DT_MASKS_GROUP) && !_name_free(dev, form)) _name_group(dev, form);
+    dt_masks_gui_form_save_creation(dev, m, form, NULL);
+  }
   // the group entry save_creation added: how it combines, and inverted
   dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
   GList *last = grp ? g_list_last(grp->points) : NULL;
@@ -4143,6 +4157,78 @@ static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   dt_masks_form_t *form = _shape_form(sh, 0, err);
   if(!form) return FALSE;
+  return _mask_attach_ext(m, form, op, inverted, opacity, b);
+}
+
+// does form (a group, at any depth) hold the shape or group id
+static gboolean _form_holds(const dt_develop_t *dev, const dt_masks_form_t *form, const dt_mask_id_t id,
+                            const int depth)
+{
+  if(!form || depth > 16) return FALSE;
+  if(form->formid == id) return TRUE;
+  if(!(form->type & DT_MASKS_GROUP)) return FALSE;
+  for(const GList *l = form->points; l; l = g_list_next(l))
+  {
+    const dt_masks_point_group_t *pt = l->data;
+#ifdef HAVE_MASKS_FLEXI
+    if(dt_masks_point_is_marker(pt)) continue;
+#endif
+    if(pt->formid == id
+       || _form_holds(dev, dt_masks_get_from_id((dt_develop_t *)dev, pt->formid), id, depth + 1))
+      return TRUE;
+  }
+  return FALSE;
+}
+
+// an existing shape or group (another module's mask_list formid, or a
+// module's whole mask: its group) on a module's mask too, shared: editing
+// it changes every module using it, as the darkroom's "add existing shape"
+static gboolean _mask_attach_existing(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_iop_module_t *m = _blend_module(params, err);
+  if(!m) return FALSE;
+  if(m->flags() & IOP_FLAGS_NO_MASKS)
+  {
+    *err = _ERRF(API_E_UNAVAILABLE, NULL, "module '%s' takes no drawn masks", m->op);
+    return FALSE;
+  }
+  dt_develop_t *dev = _cur->dev;
+  const dt_mask_id_t formid = params ? json_object_get_int_member_with_default(params, "formid", 0) : 0;
+  dt_masks_form_t *form = dt_is_valid_maskid(formid) ? dt_masks_get_from_id(dev, formid) : NULL;
+  if(!form || (form->type & (DT_MASKS_CLONE | DT_MASKS_NON_CLONE)))
+  {
+    *err = _ERRF(API_E_NOT_FOUND, "formid", "no shape or mask group %d (mask_list)", formid);
+    return FALSE;
+  }
+  const dt_masks_form_t *own = dt_masks_get_from_id(dev, m->blend_params->mask_id);
+  if(own)
+  {
+    if(_form_holds(dev, form, own->formid, 0))
+    {
+      *err = _ERRF(API_E_PARAMS, "formid", "%d is (or holds) module '%s''s own mask", formid, m->op);
+      return FALSE;
+    }
+    for(const GList *l = own->points; l; l = g_list_next(l))
+      if(((dt_masks_point_group_t *)l->data)->formid == formid)
+      {
+        *err = _ERRF(API_E_PARAMS, "formid", "module '%s' already uses %d", m->op, formid);
+        return FALSE;
+      }
+  }
+  const char *combine = json_object_get_string_member_with_default(params, "combine", "union");
+  const gboolean inverted = json_object_get_boolean_member_with_default(params, "inverted", FALSE);
+  const int op = _combine_state(combine);
+  if(op < 0)
+  {
+    *err = _ERR(API_E_PARAMS, "combine", "combine: " API_COMBINE_NAMES);
+    return FALSE;
+  }
+  const float opacity = json_object_get_double_member_with_default(params, "opacity", -1.0);
+  if(opacity > 1.0f)
+  {
+    *err = _ERR(API_E_PARAMS, "opacity", "opacity: 0..1");
+    return FALSE;
+  }
   return _mask_attach_ext(m, form, op, inverted, opacity, b);
 }
 
@@ -11998,7 +12084,7 @@ static const char *_methods[] = {
   "module_enable", "capture_autotune", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
   "retouch_remove", "blend_get", "blend_set", "mask_add", "mask_list",
-  "mask_remove", "mask_add.path", "mask_add.corners", "mask_ai", "mask_ai_encode", "export.background", "sample", "ai_denoise",
+  "mask_remove", "mask_attach", "mask_add.path", "mask_add.corners", "mask_ai", "mask_ai_encode", "export.background", "sample", "ai_denoise",
 #ifdef HAVE_OVERLAY_COMPOSITE_HQ
   "ai_fill",
 #if defined(HAVE_AI) && defined(PNG_SIMPLIFIED_READ_SUPPORTED) && defined(PNG_SIMPLIFIED_WRITE_SUPPORTED)
@@ -12021,7 +12107,7 @@ static const struct { const char *method; const char *event; } _session_methods[
   { "coords", NULL }, { "retouch_list", NULL }, { "retouch_heal", "edit" },
   { "retouch_add", "edit" }, { "retouch_set", "edit" }, { "retouch_remove", "edit" },
   { "blend_get", NULL }, { "blend_set", "edit" }, { "mask_add", "edit" }, { "mask_list", NULL },
-  { "mask_remove", "edit" }, { "mask_ai", "edit" }, { "mask_ai_encode", NULL }, { "sample", NULL },
+  { "mask_remove", "edit" }, { "mask_attach", "edit" }, { "mask_ai", "edit" }, { "mask_ai_encode", NULL }, { "sample", NULL },
   { "module_move", "edit" }, { "picker_list", NULL }, { "picker_apply", NULL }, { "curve_get", NULL }, { "curve_set", "edit" },
   { "module_add", "edit" }, { "ai_fill", "edit" }, { "module_remove", "edit" }, { "module_rename", "edit" }, { "history_compress", "saved" },
   { "module_set", "edit" }, { "module_enable", "edit" }, { "capture_autotune", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" },
@@ -12390,6 +12476,8 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _mask_list(params, b, &err);
   else if(!g_strcmp0(method, "mask_remove"))
     _mask_remove(params, b, &err);
+  else if(!g_strcmp0(method, "mask_attach"))
+    _mask_attach_existing(params, b, &err);
   else if(!g_strcmp0(method, "sample"))
     _sample(params, b, &err);
   else if(!g_strcmp0(method, "coords"))

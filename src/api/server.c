@@ -3384,8 +3384,40 @@ static gboolean _blend_set(JsonObject *params, JsonBuilder *b, gchar **err)
         {
           const double boostf = exp2(bp.blendif_boost_factors[idx]);
           float r[4];
+          gboolean fits = TRUE;
+          double vmax = 0.0; // the boost named must fit the whole range
           for(int k = 0; k < 4; k++)
-            r[k] = CLAMP(_from_display(c, json_array_get_double_element(range, k), boostf), 0.0, 1.0);
+            vmax = MAX(vmax, fabs(json_array_get_double_element(range, k)));
+          for(int k = 0; k < 4 && fits; k++)
+          {
+            const double rv = json_array_get_double_element(range, k);
+            const double raw = _from_display(c, rv, boostf);
+            if(raw < -1e-6 || raw > 1.0 + 1e-6)
+            {
+              // the channel's maximum at this boost is 100·2^stored (128·2^stored for a, b):
+              // name the boost that fits instead of clamping silently (#163)
+              const double top = c->kind == _AB ? 128.0 : 100.0;
+              const double need = c->boost && c->kind != _HUE && vmax > 0.0
+                                  ? ceil((log2(vmax / top) - c->boost_offset) * 100.0) / 100.0 : -1.0;
+              if(c->kind == _PCT && rv < 0.0)
+                *err = _ERRF(API_E_PARAMS, "values", "parametric '%s': range value %g is below 0", key, rv);
+              else if(need >= 0.0 && need <= 18.0)
+                *err = _ERRF(API_E_PARAMS, "values",
+                             "parametric '%s': range value %g is past the channel's maximum at boost %g;"
+                             " give \"boost\": %g (EV) or more", key, rv,
+                             bp.blendif_boost_factors[idx] - c->boost_offset, MAX(need, 0.0));
+              else
+                *err = _ERRF(API_E_PARAMS, "values", "parametric '%s': range value %g is out of range%s", key, rv,
+                             c->kind == _HUE ? " (0..360)" : c->boost ? " even at boost 18" : " (0..100)");
+              fits = FALSE;
+            }
+            r[k] = CLAMP(raw, 0.0, 1.0);
+          }
+          if(!fits)
+          {
+            ok = FALSE;
+            break;
+          }
           if(r[0] > r[1] || r[1] > r[2] || r[2] > r[3])
           {
             *err = _ERRF(API_E_PARAMS, "values", "parametric '%s': range must not decrease", key);

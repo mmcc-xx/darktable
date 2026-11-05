@@ -89,17 +89,23 @@
                                     mask space: the pipe's input, normalized),
                                     "image" (the rendered image, fractions)
                                     and "uncropped" (crop's input)
-     retouch_list                -> retouch's shapes: type, circle center,
-                                    radius and feather, source (raw space),
-                                    algorithm and its options
-     retouch_add {spots: [{x, y, r, algorithm, sx, sy, blur_type,
-                  blur_radius, fill_mode, fill_color, fill_brightness}]}
+     retouch_list                -> retouch's shapes: type, geometry as
+                                    mask_list, source (raw space), wavelet
+                                    scale, algorithm and its options; the
+                                    module's num_scales, merge_from_scale,
+                                    curr_scale
+     retouch_add {spots: [{x, y, r | shape, scale, algorithm, sx, sy,
+                  blur_type, blur_radius, fill_mode, fill_color,
+                  fill_brightness}]}
                                  -> adds circles (raw space; r relative to
-                                    the shorter side) that clone or heal
-                                    from a source, blur or fill, as one
-                                    history item; retouch_heal: heal default
-     retouch_set {formid, x, y, r, sx, sy, algorithm, ...}
+                                    the shorter side) or shapes as mask_add
+                                    takes them that clone or heal from a
+                                    source, blur or fill, as one history
+                                    item; retouch_heal: heal default
+     retouch_set {formid, x, y, r | shape, scale, sx, sy, algorithm, ...}
                                  -> moves, resizes or changes one spot
+     retouch_scales {num_scales, merge_from_scale, curr_scale}
+                                 -> retouch's wavelet decomposition
      retouch_remove {formids}    -> deletes spots, as one history item
      module_add {operation, instance, copy}
                                  -> a new instance after the given one ("new
@@ -2455,8 +2461,11 @@ static int _rt_enum(dt_iop_module_t *m, const char *field, const char *prefix, c
   return v;
 }
 
-// retouch's shapes: type, circle center/radius/source in raw space, and the
-// algorithm retouch applies to each
+static void _add_shape_geometry(JsonBuilder *b, const dt_masks_form_t *form);
+static dt_masks_form_t *_shape_form(JsonObject *sh, const int depth, gchar **err);
+
+// retouch's shapes: type, geometry and source in raw space, wavelet scale
+// and the algorithm retouch applies to each, with the module's scales
 static gboolean _retouch_list(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
@@ -2472,6 +2481,13 @@ static gboolean _retouch_list(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   json_builder_set_member_name(b, "enabled");
   json_builder_add_boolean_value(b, m->enabled);
+  static const char *scales[] = { "num_scales", "merge_from_scale", "curr_scale" };
+  for(int k = 0; k < 3; k++)
+  {
+    const int *v = m->get_p(m->params, scales[k]);
+    json_builder_set_member_name(b, scales[k]);
+    json_builder_add_int_value(b, v ? *v : 0);
+  }
   json_builder_set_member_name(b, "spots");
   json_builder_begin_array(b);
   dt_masks_form_t *grp = dt_masks_get_from_id(_cur->dev, m->blend_params->mask_id);
@@ -2490,19 +2506,8 @@ static gboolean _retouch_list(JsonObject *params, JsonBuilder *b, gchar **err)
                                      ? "brush" : "other");
     json_builder_set_member_name(b, "active");
     json_builder_add_boolean_value(b, (gp->state & DT_MASKS_STATE_USE) != 0);
-    if((form->type & DT_MASKS_CIRCLE) && form->points)
-    {
-      const dt_masks_point_circle_t *c = form->points->data;
-      json_builder_set_member_name(b, "x");
-      json_builder_add_double_value(b, c->center[0]);
-      json_builder_set_member_name(b, "y");
-      json_builder_add_double_value(b, c->center[1]);
-      json_builder_set_member_name(b, "r");
-      json_builder_add_double_value(b, c->radius);
-      // the feather around it, in the same unit as r
-      json_builder_set_member_name(b, "border");
-      json_builder_add_double_value(b, c->border);
-    }
+    // border: the feather around it, in the same unit as r
+    _add_shape_geometry(b, form);
     json_builder_set_member_name(b, "sx");
     json_builder_add_double_value(b, form->source[0]);
     json_builder_set_member_name(b, "sy");
@@ -2512,6 +2517,12 @@ static gboolean _retouch_list(JsonObject *params, JsonBuilder *b, gchar **err)
       dt_introspection_field_t *f = NULL;
       const dt_mask_id_t *id = _rt_form_field(m, k, "formid", &f);
       if(!id || *id != gp->formid) continue;
+      const int *scale = _rt_form_field(m, k, "scale", &f);
+      if(scale)
+      {
+        json_builder_set_member_name(b, "scale");
+        json_builder_add_int_value(b, *scale);
+      }
       const int *algo = _rt_form_field(m, k, "algorithm", &f);
       if(algo)
       {
@@ -2620,18 +2631,60 @@ static void _rt_resync(dt_iop_module_t *m)
   g_free(ids);
 }
 
-// a spot from a request: where (circle, raw space) and the tool with its
+// a spot from a request: where (a circle in raw space, or any retouch shape
+// as mask_add takes it), on which wavelet scale, and the tool with its
 // options; has[] says which were given
 enum { RT_X, RT_Y, RT_R, RT_SX, RT_SY, RT_ALGO, RT_BLUR_TYPE, RT_BLUR_RADIUS, RT_FILL_MODE, RT_FILL_COLOR,
-       RT_FILL_BRIGHTNESS, RT_N };
+       RT_FILL_BRIGHTNESS, RT_SCALE, RT_N };
 
 typedef struct _rt_spot_t
 {
   gboolean has[RT_N];
   float v[5]; // x, y, r, sx, sy
-  int algorithm, blur_type, fill_mode;
+  int algorithm, blur_type, fill_mode, scale;
   float blur_radius, fill_color[3], fill_brightness;
+  dt_masks_form_t *form; // from shape, not on the image yet
 } _rt_spot_t;
+
+static void _rt_spots_free(_rt_spot_t *s, const guint n)
+{
+  for(guint i = 0; i < n; i++)
+    if(s[i].form) dt_masks_free_form(s[i].form);
+  g_free(s);
+}
+
+static int _rt_num_scales(dt_iop_module_t *m)
+{
+  const int *n = m->get_p(m->params, "num_scales");
+  return n ? *n : 0;
+}
+
+// a spot's shape: what retouch's shape buttons draw, with their feather,
+// hardness and density when not given
+static dt_masks_form_t *_rt_shape(JsonObject *o, gchar **err)
+{
+  JsonNode *n = json_object_get_member(o, "shape");
+  JsonObject *sh = JSON_NODE_HOLDS_OBJECT(n) ? json_node_get_object(n) : NULL;
+  const char *type = sh ? json_object_get_string_member_with_default(sh, "type", "") : "";
+  const gboolean brush = !g_strcmp0(type, "brush");
+  if(g_strcmp0(type, "circle") && g_strcmp0(type, "ellipse") && g_strcmp0(type, "path") && !brush)
+  {
+    *err = _ERR(API_E_PARAMS, "spots", "a spot's shape is a circle, ellipse, path or brush (as mask_add takes them)");
+    return NULL;
+  }
+  const char *size = brush ? "width" : "border";
+  if(!json_object_has_member(sh, size))
+  {
+    gchar *conf = g_strdup_printf("plugins/darkroom/spots/%s_border", type);
+    json_object_set_double_member(sh, size, dt_conf_get_float(conf));
+    g_free(conf);
+  }
+  if(brush && !json_object_has_member(sh, "hardness"))
+    json_object_set_double_member(sh, "hardness", dt_conf_get_float("plugins/darkroom/spots/brush_hardness"));
+  if(brush && !json_object_has_member(sh, "density"))
+    json_object_set_double_member(sh, "density", dt_conf_get_float("plugins/darkroom/spots/brush_density"));
+  return _shape_form(sh, 0, err);
+}
 
 static gboolean _rt_number(JsonNode *x, float *out)
 {
@@ -2722,6 +2775,31 @@ static gboolean _rt_parse(dt_iop_module_t *m, JsonObject *o, _rt_spot_t *s, gcha
     }
     s->has[RT_FILL_COLOR] = TRUE;
   }
+  if(json_object_has_member(o, "scale"))
+  {
+    // the residual follows the last scale, and a shape on any other number
+    // would never be drawn (rt_process_forms)
+    float v = -1.f;
+    const int last = _rt_num_scales(m) + 1;
+    if(!_rt_number(json_object_get_member(o, "scale"), &v) || v != (int)v || v < 0.f || v > last)
+    {
+      *err = _ERRF(API_E_PARAMS, "spots", "scale is 0 (the image), 1..%d (a wavelet scale, retouch_scales) or %d"
+                   " (the residual)", last - 1, last);
+      return FALSE;
+    }
+    s->scale = v;
+    s->has[RT_SCALE] = TRUE;
+  }
+  if(json_object_has_member(o, "shape"))
+  {
+    if(s->has[RT_X] || s->has[RT_Y] || s->has[RT_R])
+    {
+      *err = _ERR(API_E_PARAMS, "spots", "a spot takes x, y, r or a shape, not both");
+      return FALSE;
+    }
+    s->form = _rt_shape(o, err);
+    if(!s->form) return FALSE;
+  }
   return TRUE;
 }
 
@@ -2749,6 +2827,8 @@ static void _rt_apply(dt_iop_module_t *m, const int k, const _rt_spot_t *s, cons
   int *algo = _rt_form_field(m, k, "algorithm", &f);
   if(algo && s->has[RT_ALGO]) *algo = s->algorithm;
   if(!algo) return;
+  int *scale = _rt_form_field(m, k, "scale", &f);
+  if(scale && s->has[RT_SCALE]) *scale = s->scale;
   if(*algo == _rt_enum(m, "algorithm", "DT_IOP_RETOUCH_", "blur"))
   {
     int *t = _rt_form_field(m, k, "blur_type", &f);
@@ -2866,7 +2946,7 @@ static gboolean _retouch_add(JsonObject *params, const char *algorithm, JsonBuil
   const guint n = spots ? json_array_get_length(spots) : 0;
   if(!n)
   {
-    *err = _ERR(API_E_PARAMS, "spots", "needs spots [{x, y, r, algorithm, sx, sy, ...}] in raw space (coords)");
+    *err = _ERR(API_E_PARAMS, "spots", "needs spots [{x, y, r or shape, algorithm, sx, sy, ...}] in raw space (coords)");
     return FALSE;
   }
   const int dflt = _rt_enum(m, "algorithm", "DT_IOP_RETOUCH_", algorithm);
@@ -2882,8 +2962,8 @@ static gboolean _retouch_add(JsonObject *params, const char *algorithm, JsonBuil
         s[i].algorithm = dflt;
         s[i].has[RT_ALGO] = TRUE;
       }
-      if(!s[i].has[RT_X] || !s[i].has[RT_Y] || !s[i].has[RT_R])
-        e_err = g_strdup("needs x, y and r");
+      if(!s[i].form && (!s[i].has[RT_X] || !s[i].has[RT_Y] || !s[i].has[RT_R]))
+        e_err = g_strdup("needs x, y and r, or a shape");
       else if(_rt_cloning(m, s[i].algorithm) && (!s[i].has[RT_SX] || !s[i].has[RT_SY]))
         e_err = g_strdup("clone and heal spots need a source (sx, sy)");
       else
@@ -2893,7 +2973,7 @@ static gboolean _retouch_add(JsonObject *params, const char *algorithm, JsonBuil
     {
       *err = g_strdup_printf("spot %u: %s", i, e_err);
       g_free(e_err);
-      g_free(s);
+      _rt_spots_free(s, n);
       return FALSE;
     }
   }
@@ -2915,7 +2995,7 @@ static gboolean _retouch_add(JsonObject *params, const char *algorithm, JsonBuil
   {
     g_free(keys);
     g_free(formids);
-    g_free(s);
+    _rt_spots_free(s, n);
     return FALSE;
   }
   const int count = _rt_forms_count(m);
@@ -2930,7 +3010,7 @@ static gboolean _retouch_add(JsonObject *params, const char *algorithm, JsonBuil
   {
     g_free(keys);
     g_free(formids);
-    g_free(s);
+    _rt_spots_free(s, n);
     *err = _ERRF(API_E_PARAMS, "spots", "retouch holds at most %d shapes; it has %d", count, used);
     return FALSE;
   }
@@ -2955,13 +3035,19 @@ static gboolean _retouch_add(JsonObject *params, const char *algorithm, JsonBuil
     {
       if(old[i]) continue;
       const gboolean cloning = _rt_cloning(m, s[i].algorithm);
-      dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE | (cloning ? DT_MASKS_CLONE : DT_MASKS_NON_CLONE));
-      dt_masks_point_circle_t *circle = malloc(sizeof(dt_masks_point_circle_t));
-      circle->center[0] = s[i].v[RT_X];
-      circle->center[1] = s[i].v[RT_Y];
-      circle->radius = s[i].v[RT_R];
-      circle->border = border;
-      form->points = g_list_append(form->points, circle);
+      dt_masks_form_t *form = s[i].form;
+      s[i].form = NULL;
+      if(!form)
+      {
+        form = dt_masks_create(DT_MASKS_CIRCLE);
+        dt_masks_point_circle_t *circle = malloc(sizeof(dt_masks_point_circle_t));
+        circle->center[0] = s[i].v[RT_X];
+        circle->center[1] = s[i].v[RT_Y];
+        circle->radius = s[i].v[RT_R];
+        circle->border = border;
+        form->points = g_list_append(form->points, circle);
+      }
+      form->type |= cloning ? DT_MASKS_CLONE : DT_MASKS_NON_CLONE;
       if(cloning)
       {
         form->source[0] = s[i].v[RT_SX];
@@ -2986,7 +3072,7 @@ static gboolean _retouch_add(JsonObject *params, const char *algorithm, JsonBuil
   json_builder_end_array(made);
   g_free(keys);
   g_free(formids);
-  g_free(s);
+  _rt_spots_free(s, n); // shapes of spots a key found
   json_builder_set_member_name(b, "added");
   json_builder_add_int_value(b, fresh);
   json_builder_set_member_name(b, "formids");
@@ -2999,6 +3085,8 @@ static gboolean _retouch_add(JsonObject *params, const char *algorithm, JsonBuil
   json_builder_add_int_value(b, dev->history_end);
   return TRUE;
 }
+
+#define _RT_SHAPES (DT_MASKS_CIRCLE | DT_MASKS_ELLIPSE | DT_MASKS_PATH | DT_MASKS_BRUSH)
 
 static dt_masks_form_t *_rt_spot(dt_iop_module_t *m, const dt_mask_id_t formid, GList **link, gchar **err)
 {
@@ -3014,9 +3102,9 @@ static dt_masks_form_t *_rt_spot(dt_iop_module_t *m, const dt_mask_id_t formid, 
   return NULL;
 }
 
-// moves, resizes or changes one spot: its circle, its source, its tool
-// (clone and heal swap, as do blur and fill: the darkroom allows the same)
-// and the tool's options
+// moves, resizes or changes one spot: its circle or shape (of the same
+// type), its source, its wavelet scale, its tool (clone and heal swap, as
+// do blur and fill: the darkroom allows the same) and the tool's options
 static gboolean _retouch_set(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   dt_iop_module_t *m = _rt_module(err);
@@ -3033,20 +3121,33 @@ static gboolean _retouch_set(JsonObject *params, JsonBuilder *b, gchar **err)
     return FALSE;
   }
   _rt_spot_t s;
-  if(!_rt_parse(m, params, &s, err)) return FALSE;
-  const int algorithm = s.has[RT_ALGO] ? s.algorithm : *cur_algo;
-  if(_rt_cloning(m, algorithm) != _rt_cloning(m, *cur_algo))
+  if(!_rt_parse(m, params, &s, err))
   {
-    *err = _ERR(API_E_PARAMS, NULL, "a clone or heal spot can only become clone or heal, a blur or fill spot blur or fill");
+    if(s.form) dt_masks_free_form(s.form);
     return FALSE;
   }
-  if(!_rt_check(m, &s, algorithm, err)) return FALSE;
-  if((s.has[RT_X] || s.has[RT_Y] || s.has[RT_R]) && !((form->type & DT_MASKS_CIRCLE) && form->points))
+  const int algorithm = s.has[RT_ALGO] ? s.algorithm : *cur_algo;
+  if(_rt_cloning(m, algorithm) != _rt_cloning(m, *cur_algo))
+    *err = _ERR(API_E_PARAMS, NULL, "a clone or heal spot can only become clone or heal, a blur or fill spot blur or fill");
+  else if(_rt_check(m, &s, algorithm, err)
+          && (s.has[RT_X] || s.has[RT_Y] || s.has[RT_R]) && !((form->type & DT_MASKS_CIRCLE) && form->points))
+    *err = _ERR(API_E_PARAMS, NULL, "x, y and r move circles; other spots take a whole new shape");
+  else if(!*err && s.form && (s.form->type & _RT_SHAPES) != (form->type & _RT_SHAPES))
+    *err = _ERR(API_E_PARAMS, "shape", "a spot keeps its shape's type: retouch_remove it and retouch_add another");
+  if(*err)
   {
-    *err = _ERR(API_E_PARAMS, NULL, "only circle spots can be moved or resized here");
+    if(s.form) dt_masks_free_form(s.form);
     return FALSE;
   }
   _rt_begin();
+  if(s.form)
+  {
+    // the spot keeps its form, id and source; the old points go with s.form
+    GList *points = form->points;
+    form->points = s.form->points;
+    s.form->points = points;
+    dt_masks_free_form(s.form);
+  }
   if(form->type & DT_MASKS_CIRCLE && form->points)
   {
     dt_masks_point_circle_t *c = form->points->data;
@@ -3058,6 +3159,85 @@ static gboolean _retouch_set(JsonObject *params, JsonBuilder *b, gchar **err)
   if(s.has[RT_SY]) form->source[1] = s.v[RT_SY];
   _rt_apply(m, k, &s, FALSE);
   _rt_end(m);
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, _cur->dev->history_end);
+  return TRUE;
+}
+
+// retouch's wavelet decomposition, as the scale bar sets it: how many
+// scales, from which one up they merge into one layer, and the scale new
+// spots go on. fewer scales pull merge_from_scale down with them; spots left
+// on scales past the residual stay but aren't drawn, as in the darkroom
+static gboolean _retouch_scales(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_iop_module_t *m = _rt_module(err);
+  if(!m) return FALSE;
+  static const char *keys[3] = { "num_scales", "merge_from_scale", "curr_scale" };
+  int *field[3];
+  int v[3];
+  gboolean any = FALSE;
+  for(int k = 0; k < 3; k++)
+  {
+    field[k] = m->get_p(m->params, keys[k]);
+    if(!field[k])
+    {
+      *err = _ERRF(API_E_UNAVAILABLE, NULL, "this darktable's retouch has no %s", keys[k]);
+      return FALSE;
+    }
+    v[k] = *field[k];
+    if(!params || !json_object_has_member(params, keys[k])) continue;
+    float x = -1.f;
+    if(!_rt_number(json_object_get_member(params, keys[k]), &x) || x != (int)x)
+    {
+      *err = _ERRF(API_E_PARAMS, keys[k], "%s is a whole number", keys[k]);
+      return FALSE;
+    }
+    v[k] = x;
+    any = TRUE;
+  }
+  if(!any)
+  {
+    *err = _ERR(API_E_PARAMS, NULL, "needs num_scales, merge_from_scale or curr_scale");
+    return FALSE;
+  }
+  // as retouch's scale bar (rt_num_scales_update): its limit is RETOUCH_MAX_SCALES
+  const int max_scales = 15;
+  if(v[0] < 0 || v[0] > max_scales)
+    *err = _ERRF(API_E_PARAMS, "num_scales", "num_scales is 0..%d", max_scales);
+  else
+  {
+    if(!json_object_has_member(params, keys[1])) v[1] = MIN(v[1], v[0]);
+    if(v[1] < 0 || v[1] > v[0])
+      *err = _ERRF(API_E_PARAMS, "merge_from_scale", "merge_from_scale is 0 (off) or 1..%d, the scale count", v[0]);
+    else if(json_object_has_member(params, keys[2]) && (v[2] < 0 || v[2] > v[0] + 1))
+      *err = _ERRF(API_E_PARAMS, "curr_scale", "curr_scale is 0..%d", v[0] + 1);
+    else
+      v[2] = CLAMP(v[2], 0, v[0] + 1);
+  }
+  if(*err) return FALSE;
+  if(v[0] != *field[0] || v[1] != *field[1] || v[2] != *field[2])
+  {
+    _rt_begin();
+    for(int k = 0; k < 3; k++) *field[k] = v[k];
+    _rt_end(m);
+  }
+  // spots the render skips now
+  int unused = 0;
+  const int count = _rt_forms_count(m);
+  for(int k = 0; k < count; k++)
+  {
+    dt_introspection_field_t *f = NULL;
+    const dt_mask_id_t *id = _rt_form_field(m, k, "formid", &f);
+    const int *scale = _rt_form_field(m, k, "scale", &f);
+    if(id && *id && scale && *scale > v[0] + 1) unused++;
+  }
+  for(int k = 0; k < 3; k++)
+  {
+    json_builder_set_member_name(b, keys[k]);
+    json_builder_add_int_value(b, v[k]);
+  }
+  json_builder_set_member_name(b, "unused_spots");
+  json_builder_add_int_value(b, unused);
   json_builder_set_member_name(b, "history_end");
   json_builder_add_int_value(b, _cur->dev->history_end);
   return TRUE;
@@ -12440,6 +12620,7 @@ static const char *_methods[] = {
   "session_open", "session_close", "module_list", "module_list.all", "module_get", "module_set", "module_set.lists",
   "module_enable", "capture_autotune", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
+  "retouch_add.shape", "retouch_add.scale", "retouch_set.shape", "retouch_set.scale", "retouch_scales",
   "retouch_remove", "blend_get", "blend_set", "mask_add", "mask_list",
   "mask_remove", "mask_attach", "mask_add.path", "mask_add.corners", "mask_add.key", "mask_ai", "mask_ai.key", "retouch_add.key", "module_add.key", "image_duplicate.key", "mask_ai_encode", "export.background", "sample", "sample.blend_of", "ai_denoise",
 #ifdef HAVE_OVERLAY_COMPOSITE_HQ
@@ -12462,7 +12643,7 @@ static const struct { const char *method; const char *event; } _session_methods[
   { "render_variants", NULL },
   { "geometry_get", NULL }, { "preset_list", NULL }, { "preset_apply", "edit" },
   { "coords", NULL }, { "retouch_list", NULL }, { "retouch_heal", "edit" },
-  { "retouch_add", "edit" }, { "retouch_set", "edit" }, { "retouch_remove", "edit" },
+  { "retouch_add", "edit" }, { "retouch_set", "edit" }, { "retouch_scales", "edit" }, { "retouch_remove", "edit" },
   { "blend_get", NULL }, { "blend_set", "edit" }, { "mask_add", "edit" }, { "mask_list", NULL },
   { "mask_remove", "edit" }, { "mask_attach", "edit" }, { "mask_ai", "edit" }, { "mask_ai_encode", NULL }, { "sample", NULL },
   { "module_move", "edit" }, { "picker_list", NULL }, { "picker_apply", NULL }, { "curve_get", NULL }, { "curve_set", "edit" },
@@ -12847,6 +13028,8 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _retouch_add(params, "heal", b, &err);
   else if(!g_strcmp0(method, "retouch_set"))
     _retouch_set(params, b, &err);
+  else if(!g_strcmp0(method, "retouch_scales"))
+    _retouch_scales(params, b, &err);
   else if(!g_strcmp0(method, "retouch_remove"))
     _retouch_remove(params, b, &err);
   else if(!g_strcmp0(method, "geometry_get"))

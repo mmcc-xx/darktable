@@ -72,8 +72,9 @@
                                     included); fresh reloads it as saved.
                                     replies joined and unsaved
      session_close               -> closes the image's session for everyone
-     module_list                 -> the open image's modules: enabled ones and
-                                    those in its history, in pipe order
+     module_list {all}           -> the open image's modules: enabled ones and
+                                    those in its history (all: every one),
+                                    in pipe order
      module_get {operation, instance}
                                  -> the module's settings by name: value,
                                     default, declared range, enum names and
@@ -689,20 +690,22 @@ static void _add_label(JsonBuilder *b, const dt_iop_module_t *m, const char *mul
   g_free(label);
 }
 
-static gboolean _module_list(JsonBuilder *b, gchar **err)
+static gboolean _module_list(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
   {
     *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
+  // all: every module the pipe has, as the darkroom's module search does
+  const gboolean all = params ? json_object_get_boolean_member_with_default(params, "all", FALSE) : FALSE;
   json_builder_set_member_name(b, "modules");
   json_builder_begin_array(b);
   for(GList *l = _cur->dev->iop; l; l = g_list_next(l))
   {
     dt_iop_module_t *m = l->data;
     const gboolean in_hist = _in_history(m);
-    if(!m->enabled && !in_hist) continue;
+    if(!all && !m->enabled && !in_hist) continue;
     json_builder_begin_object(b);
     json_builder_set_member_name(b, "operation");
     json_builder_add_string_value(b, m->op);
@@ -720,6 +723,10 @@ static gboolean _module_list(JsonBuilder *b, gchar **err)
     // darktable's window never shows these (display encoding, scaling, ...)
     json_builder_set_member_name(b, "hidden");
     json_builder_add_boolean_value(b, dt_iop_is_hidden(m));
+    json_builder_set_member_name(b, "deprecated");
+    json_builder_add_boolean_value(b, (m->flags() & IOP_FLAGS_DEPRECATED) != 0);
+    json_builder_set_member_name(b, "one_instance");
+    json_builder_add_boolean_value(b, (m->flags() & IOP_FLAGS_ONE_INSTANCE) != 0);
     json_builder_end_object(b);
   }
   json_builder_end_array(b);
@@ -12430,7 +12437,7 @@ static gboolean _quit_window(gpointer data)
 
 static const char *_methods[] = {
   "ping", "client_hello", "clients", "film_rolls", "images_list", "images_list.tag", "image_info", "thumbnail", "thumbnails", "import", "set_rating", "set_label", "marker_set", "marker_list", "marker_remove",
-  "session_open", "session_close", "module_list", "module_get", "module_set", "module_set.lists",
+  "session_open", "session_close", "module_list", "module_list.all", "module_get", "module_set", "module_set.lists",
   "module_enable", "capture_autotune", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
   "retouch_remove", "blend_get", "blend_set", "mask_add", "mask_list",
@@ -12677,7 +12684,7 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _session_close(_cur);
   }
   else if(!g_strcmp0(method, "module_list"))
-    _module_list(b, &err);
+    _module_list(params, b, &err);
   else if(!g_strcmp0(method, "module_get"))
     _module_get(params, b, &err);
   else if(!g_strcmp0(method, "module_set"))

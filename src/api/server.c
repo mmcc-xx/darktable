@@ -7985,8 +7985,10 @@ static void _rgb_to_lab(const double rgb[3], double lab[3])
   lab[2] = 200.0 * (f[1] - f[2]);
 }
 
-// the mean over pixels [x0, x1) x [y0, y1) of the BGRA view
-static void _add_area(JsonBuilder *b, const uint8_t *buf, const int w, int x0, int y0, int x1, int y1)
+// the mean over pixels [x0, x1) x [y0, y1) of the BGRA view; blend (taken)
+// is added as its "blend" member
+static void _add_area(JsonBuilder *b, const uint8_t *buf, const int w, int x0, int y0, int x1, int y1,
+                      JsonNode *blend)
 {
   double sum[3] = { 0 }, lmin = 1.0, lmax = 0.0;
   size_t n = 0;
@@ -8004,6 +8006,7 @@ static void _add_area(JsonBuilder *b, const uint8_t *buf, const int w, int x0, i
     }
   if(!n)
   {
+    if(blend) json_node_unref(blend);
     json_builder_add_null_value(b);
     return;
   }
@@ -8025,8 +8028,16 @@ static void _add_area(JsonBuilder *b, const uint8_t *buf, const int w, int x0, i
   json_builder_add_double_value(b, round(lmax * 1e4) / 1e4);
   json_builder_set_member_name(b, "pixels");
   json_builder_add_int_value(b, n);
+  if(blend)
+  {
+    json_builder_set_member_name(b, "blend");
+    json_builder_add_value(b, blend);
+  }
   json_builder_end_object(b);
 }
+
+static gboolean _blend_pick(_session_t *s, dt_iop_module_t *m, const float area[4], const gboolean point,
+                            JsonNode **node, gchar **err);
 
 static gboolean _sample_session(JsonObject *params, JsonBuilder *b, gchar **err)
 {
@@ -8044,12 +8055,32 @@ static gboolean _sample_session(JsonObject *params, JsonBuilder *b, gchar **err)
     *err = _ERR(API_E_PARAMS, NULL, "sample needs width > 0 and height > 0");
     return FALSE;
   }
+  // blend_of: also read each point and box in that module's blend
+  // channels (#164)
+  JsonObject *bo = params && json_object_has_member(params, "blend_of")
+                   && JSON_NODE_HOLDS_OBJECT(json_object_get_member(params, "blend_of"))
+                     ? json_object_get_object_member(params, "blend_of") : NULL;
+  if(params && json_object_has_member(params, "blend_of") && !bo)
+  {
+    *err = _ERR(API_E_PARAMS, "blend_of", "blend_of is {operation, instance}");
+    return FALSE;
+  }
+  dt_iop_module_t *bm = bo ? _blend_module(bo, err) : NULL;
+  if(bo && !bm) return FALSE;
   _view_t v;
   if(!_process_view(params, max_w, max_h, &v, err)) return FALSE;
-  const uint8_t *buf = _cur->pipe.backbuf;
+  // the blend readouts render pipes of their own: keep the view's pixels
+  uint8_t *copy = NULL;
+  if(bm)
+  {
+    copy = g_malloc((size_t)v.w * v.h * 4);
+    memcpy(copy, _cur->pipe.backbuf, (size_t)v.w * v.h * 4);
+  }
+  const uint8_t *buf = copy ? copy : _cur->pipe.backbuf;
   // image fractions to view pixels
   const double kx = v.scale * v.pw, ky = v.scale * v.ph;
   _add_view(b, &v);
+  gboolean ok = TRUE;
 
   JsonArray *points = params && json_object_has_member(params, "points")
                       && JSON_NODE_HOLDS_ARRAY(json_object_get_member(params, "points"))
@@ -8068,10 +8099,23 @@ static gboolean _sample_session(JsonObject *params, JsonBuilder *b, gchar **err)
     const int px = (int)floor(json_array_get_double_element(p, 0) * kx) - v.x;
     const int py = (int)floor(json_array_get_double_element(p, 1) * ky) - v.y;
     if(px < 0 || py < 0 || px >= v.w || py >= v.h)
+    {
       json_builder_add_null_value(b);   // outside what was rendered
-    else
-      _add_area(b, buf, v.w, MAX(0, px - radius), MAX(0, py - radius),
-                MIN(v.w, px + radius + 1), MIN(v.h, py + radius + 1));
+      continue;
+    }
+    JsonNode *blend = NULL;
+    if(bm)
+    {
+      // the same square around the point, in image fractions
+      const float x = json_array_get_double_element(p, 0), y = json_array_get_double_element(p, 1);
+      const float area[4] = { CLIP(x - radius / kx), CLIP(y - radius / ky), CLIP(x + (radius + 1) / kx),
+                              CLIP(y + (radius + 1) / ky) };
+      const float pt[4] = { x, y, x, y };
+      ok = _blend_pick(_cur, bm, radius ? area : pt, radius == 0, &blend, err);
+      if(!ok) break;
+    }
+    _add_area(b, buf, v.w, MAX(0, px - radius), MAX(0, py - radius),
+              MIN(v.w, px + radius + 1), MIN(v.h, py + radius + 1), blend);
   }
   json_builder_end_array(b);
 
@@ -8080,7 +8124,7 @@ static gboolean _sample_session(JsonObject *params, JsonBuilder *b, gchar **err)
                        ? json_object_get_array_member(params, "boxes") : NULL;
   json_builder_set_member_name(b, "boxes");
   json_builder_begin_array(b);
-  for(guint k = 0; boxes && k < json_array_get_length(boxes); k++)
+  for(guint k = 0; ok && boxes && k < json_array_get_length(boxes); k++)
   {
     JsonObject *o = JSON_NODE_HOLDS_OBJECT(json_array_get_element(boxes, k))
                     ? json_array_get_object_element(boxes, k) : NULL;
@@ -8093,9 +8137,24 @@ static gboolean _sample_session(JsonObject *params, JsonBuilder *b, gchar **err)
     const int y0 = CLAMP((int)floor(json_object_get_double_member_with_default(o, "top", 0) * ky) - v.y, 0, v.h);
     const int x1 = CLAMP((int)ceil(json_object_get_double_member_with_default(o, "right", 1) * kx) - v.x, 0, v.w);
     const int y1 = CLAMP((int)ceil(json_object_get_double_member_with_default(o, "bottom", 1) * ky) - v.y, 0, v.h);
-    _add_area(b, buf, v.w, x0, y0, x1, y1);
+    JsonNode *blend = NULL;
+    if(bm)
+    {
+      const float area[4] = { CLIP(json_object_get_double_member_with_default(o, "left", 0)),
+                              CLIP(json_object_get_double_member_with_default(o, "top", 0)),
+                              CLIP(json_object_get_double_member_with_default(o, "right", 1)),
+                              CLIP(json_object_get_double_member_with_default(o, "bottom", 1)) };
+      ok = _blend_pick(_cur, bm, area, FALSE, &blend, err);
+      if(!ok) break;
+    }
+    _add_area(b, buf, v.w, x0, y0, x1, y1, blend);
   }
   json_builder_end_array(b);
+  if(!ok)
+  {
+    g_free(copy);
+    return FALSE;
+  }
 
   // histograms of R, G, B and luminance (8-bit output, bins), and how much
   // is clipped: any channel at 255, or all at 0
@@ -8133,6 +8192,7 @@ static gboolean _sample_session(JsonObject *params, JsonBuilder *b, gchar **err)
   json_builder_add_double_value(b, npix ? round(1e6 * high / (double)npix) / 1e6 : 0.0);
   json_builder_set_member_name(b, "clipped_shadows");
   json_builder_add_double_value(b, npix ? round(1e6 * low / (double)npix) / 1e6 : 0.0);
+  g_free(copy);
   return TRUE;
 }
 
@@ -11692,6 +11752,122 @@ done:
   return ok;
 }
 
+// a raw picked value of channel c as the blending tab's slider has it, 0..1
+// at the channel's boost (blend_gui.c, _blendif_scale): first, the sample
+// in the blend space's first picker color space (Lab, RGB), second in its
+// second (LCh, HSL, JzCzhz; _picker_colorspace_for_channel)
+static float _blend_scaled(const dt_develop_blend_colorspace_t space, const _channel_t *c, const float *first,
+                           const float *second, const float boost, const dt_iop_order_iccprofile_info_t *profile)
+{
+  if(space == DEVELOP_BLEND_CS_LAB)
+    switch(c->index)
+    {
+      case DEVELOP_BLENDIF_L_in: return first[0] / boost / 100.0f;
+      case DEVELOP_BLENDIF_A_in: return (first[1] / boost + 128.0f) / 256.0f;
+      case DEVELOP_BLENDIF_B_in: return (first[2] / boost + 128.0f) / 256.0f;
+      case DEVELOP_BLENDIF_C_in: return second[1] / boost / (128.0f * M_SQRT2_F);
+      case DEVELOP_BLENDIF_h_in: return second[2] / boost;
+      default: return 0.0f;
+    }
+  switch(c->index)
+  {
+    case DEVELOP_BLENDIF_GRAY_in:
+      return (profile ? dt_ioppr_get_rgb_matrix_luminance(first, profile->matrix_in, profile->lut_in,
+                                                          profile->unbounded_coeffs_in, profile->lutsize,
+                                                          profile->nonlinearlut)
+                      : 0.3f * first[0] + 0.59f * first[1] + 0.11f * first[2]) / boost;
+    case DEVELOP_BLENDIF_RED_in: return first[0] / boost;
+    case DEVELOP_BLENDIF_GREEN_in: return first[1] / boost;
+    case DEVELOP_BLENDIF_BLUE_in: return first[2] / boost;
+    // H, S, l (HSL) and Jz, Cz, hz share their indices
+    case DEVELOP_BLENDIF_H_in: return second[0] / boost;
+    case DEVELOP_BLENDIF_S_in: return second[1] / boost;
+    case DEVELOP_BLENDIF_l_in: return second[2] / boost;
+    default: return 0.0f;
+  }
+}
+
+// module m's input and output over area (a box, or a point in area[0..1];
+// fractions of the image as rendered) in its blend channels, in blend_set's
+// units at the module's boosts, as the blending tab's pickers read them:
+// {"in": {"Cz": {"mean", "min", "max", "top"[, "boost_needed"]}, ...},
+// "out": ...}; top is the channel's maximum at its boost, boost_needed the
+// boost a range up to max needs when past it (#164). the module is taken
+// on, as pressing a picker does
+static gboolean _blend_pick(_session_t *s, dt_iop_module_t *m, const float area[4], const gboolean point,
+                            JsonNode **node, gchar **err)
+{
+  const dt_develop_blend_params_t *bp = m->blend_params;
+  const dt_iop_colorspace_type_t csts[2] = {
+    bp->blend_cst == DEVELOP_BLEND_CS_LAB ? IOP_CS_LAB : IOP_CS_RGB,
+    bp->blend_cst == DEVELOP_BLEND_CS_LAB ? IOP_CS_LCH
+    : bp->blend_cst == DEVELOP_BLEND_CS_RGB_DISPLAY ? IOP_CS_HSL : IOP_CS_JZCZHZ };
+  dt_api_pick_t picks[2];
+  for(int i = 0; i < 2; i++)
+  {
+    const dt_api_picker_t pk = { .op = m->op, .cst = csts[i], .fixed_cst = TRUE, .output = TRUE };
+    dt_iop_colorspace_type_t cst;
+    gchar *e = NULL;
+    if(!_pick_sample(s, m, &pk, area, point, &picks[i], &cst, &e))
+    {
+      *err = g_strdup_printf("blend_of %s: %s", m->op, e ? e : "no sample");
+      g_free(e);
+      return FALSE;
+    }
+    g_free(e);
+  }
+  // the profile blend.c reads gray through (_blend_init_blendif_parameters)
+  const dt_iop_order_iccprofile_info_t *profile = bp->blend_cst == DEVELOP_BLEND_CS_RGB_SCENE
+    ? dt_ioppr_get_pipe_current_profile_info(m, &s->pipe)
+    : dt_ioppr_get_iop_work_profile_info(m, m->dev->iop);
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  for(int out = 0; out < 2; out++)
+  {
+    json_builder_set_member_name(b, out ? "out" : "in");
+    json_builder_begin_object(b);
+    for(const _channel_t *c = _channels_of(bp); c->name; c++)
+    {
+      const int idx = c->index + 4 * out;
+      const float boost = exp2f(bp->blendif_boost_factors[idx]);
+      const dt_api_pick_t *p0 = &picks[0], *p1 = &picks[1];
+      const float *v[3][2] = { { out ? p0->output_mean : p0->mean, out ? p1->output_mean : p1->mean },
+                               { out ? p0->output_min : p0->min, out ? p1->output_min : p1->min },
+                               { out ? p0->output_max : p0->max, out ? p1->output_max : p1->max } };
+      static const char *names[3] = { "mean", "min", "max" };
+      json_builder_set_member_name(b, c->name);
+      json_builder_begin_object(b);
+      double hi = 0.0;
+      for(int k = 0; k < 3; k++)
+      {
+        const double d = _to_display(c, _blend_scaled(bp->blend_cst, c, v[k][0], v[k][1], boost, profile), boost);
+        hi = MAX(hi, fabs(d));
+        json_builder_set_member_name(b, names[k]);
+        json_builder_add_double_value(b, round(d * 1e4) / 1e4);
+      }
+      if(c->kind != _HUE)
+      {
+        // the channel's top at its boost, as blend_set checks a range (#163)
+        const double top = _to_display(c, 1.0, boost);
+        json_builder_set_member_name(b, "top");
+        json_builder_add_double_value(b, round(top * 1e4) / 1e4);
+        if(c->boost && hi > top)
+        {
+          const double base = c->kind == _AB ? 128.0 : 100.0;
+          json_builder_set_member_name(b, "boost_needed");
+          json_builder_add_double_value(b, MIN(ceil((log2(hi / base) - c->boost_offset) * 100.0) / 100.0, 18.0));
+        }
+      }
+      json_builder_end_object(b);
+    }
+    json_builder_end_object(b);
+  }
+  json_builder_end_object(b);
+  *node = json_builder_get_root(b);
+  g_object_unref(b);
+  return TRUE;
+}
+
 // a ported picker on a session without darktable's window: sampled and
 // applied at once, a job that has ended when picker_apply replies (as the
 // window's, which ends when darktable applied the sample)
@@ -12084,7 +12260,7 @@ static const char *_methods[] = {
   "module_enable", "capture_autotune", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
   "retouch_remove", "blend_get", "blend_set", "mask_add", "mask_list",
-  "mask_remove", "mask_attach", "mask_add.path", "mask_add.corners", "mask_ai", "mask_ai_encode", "export.background", "sample", "ai_denoise",
+  "mask_remove", "mask_attach", "mask_add.path", "mask_add.corners", "mask_ai", "mask_ai_encode", "export.background", "sample", "sample.blend_of", "ai_denoise",
 #ifdef HAVE_OVERLAY_COMPOSITE_HQ
   "ai_fill",
 #if defined(HAVE_AI) && defined(PNG_SIMPLIFIED_READ_SUPPORTED) && defined(PNG_SIMPLIFIED_WRITE_SUPPORTED)

@@ -2811,6 +2811,43 @@ static void _rt_end(dt_iop_module_t *m)
 // spots in retouch, as its circle tool draws them: a circle per spot with
 // the user's circle feather, cloning or healing from a source, or blurring
 // or filling, all in one history step
+// an add's optional key (#45): a repeat with the same key finds what the
+// first call made instead of adding another. NULL when not given; *err set
+// when it isn't a usable string
+static const char *_add_key(JsonObject *o, const size_t size, gchar **err)
+{
+  if(!o || !json_object_has_member(o, "key")) return NULL;
+  JsonNode *n = json_object_get_member(o, "key");
+  const char *key = JSON_NODE_HOLDS_VALUE(n) && json_node_get_value_type(n) == G_TYPE_STRING
+                      ? json_node_get_string(n) : NULL;
+  if(!key || !*key || strlen(key) >= size)
+    *err = _ERRF(API_E_PARAMS, "key", "key: a non-empty string of at most %zu bytes", size - 1);
+  return *err ? NULL : key;
+}
+
+// a shape in a group (at any depth) whose name is key: what an add with
+// that key stored
+static dt_mask_id_t _keyed_form(const dt_masks_form_t *grp, const char *key, const int depth)
+{
+  if(!grp || !(grp->type & DT_MASKS_GROUP) || depth > 16) return NO_MASKID;
+  for(const GList *l = grp->points; l; l = g_list_next(l))
+  {
+    const dt_masks_point_group_t *gp = l->data;
+    const dt_masks_form_t *f = dt_masks_get_from_id(_cur->dev, gp->formid);
+    if(!f) continue;
+    if(!strcmp(f->name, key)) return f->formid;
+    const dt_mask_id_t in = _keyed_form(f, key, depth + 1);
+    if(dt_is_valid_maskid(in)) return in;
+  }
+  return NO_MASKID;
+}
+
+static void _add_created(JsonBuilder *b, const gboolean created)
+{
+  json_builder_set_member_name(b, "created");
+  json_builder_add_boolean_value(b, created);
+}
+
 static gboolean _retouch_add(JsonObject *params, const char *algorithm, JsonBuilder *b, gchar **err)
 {
   dt_iop_module_t *m = _rt_module(err);
@@ -2853,6 +2890,27 @@ static gboolean _retouch_add(JsonObject *params, const char *algorithm, JsonBuil
       return FALSE;
     }
   }
+  // spots with a key the module's shapes already have: those, not new ones
+  const char **keys = g_new0(const char *, n);
+  dt_mask_id_t *formids = g_new0(dt_mask_id_t, n);
+  const dt_masks_form_t *rtgrp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
+  guint fresh = 0;
+  for(guint i = 0; i < n && !*err; i++)
+  {
+    keys[i] = _add_key(json_array_get_object_element(spots, i), sizeof(((dt_masks_form_t *)NULL)->name), err);
+    for(guint j = 0; j < i && keys[i] && !*err; j++)
+      if(!g_strcmp0(keys[i], keys[j]))
+        *err = _ERRF(API_E_PARAMS, "key", "spots %u and %u have the same key", j, i);
+    if(keys[i] && !*err) formids[i] = _keyed_form(rtgrp, keys[i], 0);
+    if(!dt_is_valid_maskid(formids[i])) fresh++;
+  }
+  if(*err)
+  {
+    g_free(keys);
+    g_free(formids);
+    g_free(s);
+    return FALSE;
+  }
   const int count = _rt_forms_count(m);
   int used = 0;
   for(int k = 0; k < count; k++)
@@ -2861,55 +2919,75 @@ static gboolean _retouch_add(JsonObject *params, const char *algorithm, JsonBuil
     const dt_mask_id_t *id = _rt_form_field(m, k, "formid", &f);
     if(id && *id) used++;
   }
-  if(used + (int)n > count)
+  if(used + (int)fresh > count)
   {
+    g_free(keys);
+    g_free(formids);
     g_free(s);
     *err = _ERRF(API_E_PARAMS, "spots", "retouch holds at most %d shapes; it has %d", count, used);
     return FALSE;
   }
-
-  const float border = dt_conf_get_float("plugins/darkroom/spots/circle_border");
-  _rt_begin();
-  // in the window, a history item of its own, so the spots don't merge into
-  // a retouch step on top of the history (as heal_spots does)
-  if(_cur->gui) dt_dev_add_new_history_item(dev, m, TRUE);
   JsonBuilder *ids = json_builder_new();
   json_builder_begin_array(ids);
-  dt_mask_id_t *formids = g_new0(dt_mask_id_t, n);
+  JsonBuilder *made = json_builder_new();
+  json_builder_begin_array(made);
+  gboolean *old = g_new0(gboolean, n);
   for(guint i = 0; i < n; i++)
   {
-    const gboolean cloning = _rt_cloning(m, s[i].algorithm);
-    dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE | (cloning ? DT_MASKS_CLONE : DT_MASKS_NON_CLONE));
-    dt_masks_point_circle_t *circle = malloc(sizeof(dt_masks_point_circle_t));
-    circle->center[0] = s[i].v[RT_X];
-    circle->center[1] = s[i].v[RT_Y];
-    circle->radius = s[i].v[RT_R];
-    circle->border = border;
-    form->points = g_list_append(form->points, circle);
-    if(cloning)
+    old[i] = dt_is_valid_maskid(formids[i]);
+    json_builder_add_boolean_value(made, !old[i]);
+  }
+  if(fresh)
+  {
+    const float border = dt_conf_get_float("plugins/darkroom/spots/circle_border");
+    _rt_begin();
+    // in the window, a history item of its own, so the spots don't merge into
+    // a retouch step on top of the history (as heal_spots does)
+    if(_cur->gui) dt_dev_add_new_history_item(dev, m, TRUE);
+    for(guint i = 0; i < n; i++)
     {
-      form->source[0] = s[i].v[RT_SX];
-      form->source[1] = s[i].v[RT_SY];
+      if(old[i]) continue;
+      const gboolean cloning = _rt_cloning(m, s[i].algorithm);
+      dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE | (cloning ? DT_MASKS_CLONE : DT_MASKS_NON_CLONE));
+      dt_masks_point_circle_t *circle = malloc(sizeof(dt_masks_point_circle_t));
+      circle->center[0] = s[i].v[RT_X];
+      circle->center[1] = s[i].v[RT_Y];
+      circle->radius = s[i].v[RT_R];
+      circle->border = border;
+      form->points = g_list_append(form->points, circle);
+      if(cloning)
+      {
+        form->source[0] = s[i].v[RT_SX];
+        form->source[1] = s[i].v[RT_SY];
+      }
+      dt_masks_gui_form_save_creation(dev, m, form, NULL);
+      // _rt_end's history item keeps the name
+      if(keys[i]) g_strlcpy(form->name, keys[i], sizeof(form->name));
+      formids[i] = form->formid;
     }
-    dt_masks_gui_form_save_creation(dev, m, form, NULL);
-    formids[i] = form->formid;
-    json_builder_add_int_value(ids, form->formid);
+    _rt_resync(m);
+    for(guint i = 0; i < n; i++)
+    {
+      const int k = old[i] ? -1 : _rt_index(m, formids[i]);
+      if(k >= 0) _rt_apply(m, k, &s[i], TRUE);
+    }
+    _rt_end(m);
   }
+  for(guint i = 0; i < n; i++) json_builder_add_int_value(ids, formids[i]);
+  g_free(old);
   json_builder_end_array(ids);
-  _rt_resync(m);
-  for(guint i = 0; i < n; i++)
-  {
-    const int k = _rt_index(m, formids[i]);
-    if(k >= 0) _rt_apply(m, k, &s[i], TRUE);
-  }
+  json_builder_end_array(made);
+  g_free(keys);
   g_free(formids);
   g_free(s);
-  _rt_end(m);
   json_builder_set_member_name(b, "added");
-  json_builder_add_int_value(b, n);
+  json_builder_add_int_value(b, fresh);
   json_builder_set_member_name(b, "formids");
   json_builder_add_value(b, json_builder_get_root(ids));
   g_object_unref(ids);
+  json_builder_set_member_name(b, "created");
+  json_builder_add_value(b, json_builder_get_root(made));
+  g_object_unref(made);
   json_builder_set_member_name(b, "history_end");
   json_builder_add_int_value(b, dev->history_end);
   return TRUE;
@@ -3653,18 +3731,21 @@ static gboolean _flexi_join(dt_develop_t *dev, dt_masks_form_t **grp, dt_masks_p
 // the module's group, joined as op (DT_MASKS_STATE_UNION, ...), drawn
 // masking on, one history item; for the darkroom's image through its path
 static gboolean _mask_attach_ext(dt_iop_module_t *m, dt_masks_form_t *form, const int op,
-                                 const gboolean inverted, const float opacity, JsonBuilder *b);
+                                 const gboolean inverted, const float opacity, const char *name,
+                                 JsonBuilder *b);
 
 static gboolean _mask_attach(dt_iop_module_t *m, dt_masks_form_t *form, const int op, const gboolean inverted,
-                             JsonBuilder *b)
+                             const char *name, JsonBuilder *b)
 {
-  return _mask_attach_ext(m, form, op, inverted, -1.0f, b);
+  return _mask_attach_ext(m, form, op, inverted, -1.0f, name, b);
 }
 
 // opacity: the shape's in the module's group (the mask manager's), or < 0
-// for the user's default
+// for the user's default. name: a new shape's, in place of the one
+// darktable numbers it with (NULL keeps that)
 static gboolean _mask_attach_ext(dt_iop_module_t *m, dt_masks_form_t *form, const int op,
-                                 const gboolean inverted, const float opacity, JsonBuilder *b)
+                                 const gboolean inverted, const float opacity, const char *name,
+                                 JsonBuilder *b)
 {
   dt_develop_t *dev = _cur->dev;
   if(_cur->gui)
@@ -3681,6 +3762,8 @@ static gboolean _mask_attach_ext(dt_iop_module_t *m, dt_masks_form_t *form, cons
   {
     if((form->type & DT_MASKS_GROUP) && !_name_free(dev, form)) _name_group(dev, form);
     dt_masks_gui_form_save_creation(dev, m, form, NULL);
+    // before the history item below, which keeps a copy of the shapes
+    if(name) g_strlcpy(form->name, name, sizeof(form->name));
   }
   // the group entry save_creation added: how it combines, and inverted
   dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
@@ -4155,9 +4238,24 @@ static gboolean _mask_add(JsonObject *params, JsonBuilder *b, gchar **err)
     *err = _ERR(API_E_PARAMS, "opacity", "opacity: 0..1");
     return FALSE;
   }
+  const char *key = _add_key(params, sizeof(((dt_masks_form_t *)NULL)->name), err);
+  if(*err) return FALSE;
+  const dt_mask_id_t keyed = key ? _keyed_form(dt_masks_get_from_id(_cur->dev, m->blend_params->mask_id), key, 0)
+                                 : NO_MASKID;
+  if(dt_is_valid_maskid(keyed))
+  {
+    json_builder_set_member_name(b, "formid");
+    json_builder_add_int_value(b, keyed);
+    json_builder_set_member_name(b, "history_end");
+    json_builder_add_int_value(b, _cur->dev->history_end);
+    _add_created(b, FALSE);
+    return TRUE;
+  }
   dt_masks_form_t *form = _shape_form(sh, 0, err);
   if(!form) return FALSE;
-  return _mask_attach_ext(m, form, op, inverted, opacity, b);
+  if(!_mask_attach_ext(m, form, op, inverted, opacity, key, b)) return FALSE;
+  _add_created(b, TRUE);
+  return TRUE;
 }
 
 // does form (a group, at any depth) hold the shape or group id
@@ -4229,7 +4327,7 @@ static gboolean _mask_attach_existing(JsonObject *params, JsonBuilder *b, gchar 
     *err = _ERR(API_E_PARAMS, "opacity", "opacity: 0..1");
     return FALSE;
   }
-  return _mask_attach_ext(m, form, op, inverted, opacity, b);
+  return _mask_attach_ext(m, form, op, inverted, opacity, NULL, b);
 }
 
 #define _KV(k, v) do { json_builder_set_member_name(b, (k)); json_builder_add_double_value(b, (v)); } while(0)
@@ -4501,12 +4599,28 @@ static gboolean _module_add(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   const gboolean copy = params ? json_object_get_boolean_member_with_default(params, "copy", FALSE) : FALSE;
   dt_develop_t *dev = _cur->dev;
+  // the key is the instance's name: a repeat finds the instance named so
+  const char *key = _add_key(params, sizeof(base->multi_name), err);
+  if(*err) return FALSE;
+  for(GList *l = key ? dev->iop : NULL; l; l = g_list_next(l))
+  {
+    dt_iop_module_t *o = l->data;
+    if(!g_strcmp0(o->op, base->op) && !strcmp(o->multi_name, key))
+    {
+      _add_instance(b, o);
+      json_builder_set_member_name(b, "history_end");
+      json_builder_add_int_value(b, dev->history_end);
+      _add_created(b, FALSE);
+      return TRUE;
+    }
+  }
   dt_iop_module_t *m = NULL;
   gboolean shapes_copied = TRUE, shapes = FALSE;
   if(_cur->gui)
   {
     _api_editing = TRUE;
     m = dt_iop_gui_duplicate(base, copy);
+    if(m && key) dt_iop_update_multi_name(m, key, TRUE, TRUE, TRUE);
     _api_editing = FALSE;
     _gui_changed_by_api();
   }
@@ -4518,6 +4632,11 @@ static gboolean _module_add(JsonObject *params, JsonBuilder *b, gchar **err)
     if(m)
     {
       dt_iop_reload_defaults(m);
+      if(key)
+      {
+        g_strlcpy(m->multi_name, key, sizeof(m->multi_name));
+        m->multi_name_hand_edited = TRUE;
+      }
       if(copy)
       {
         memcpy(m->params, base->params, m->params_size);
@@ -4559,6 +4678,7 @@ static gboolean _module_add(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   json_builder_set_member_name(b, "history_end");
   json_builder_add_int_value(b, dev->history_end);
+  _add_created(b, TRUE);
   return TRUE;
 }
 
@@ -5038,8 +5158,39 @@ static gboolean _image_duplicate(JsonObject *params, const dt_imgid_t current, g
   }
   const gboolean virgin = params ? json_object_get_boolean_member_with_default(params, "virgin", FALSE) : FALSE;
   const gboolean save = params ? json_object_get_boolean_member_with_default(params, "save", FALSE) : FALSE;
-  _session_t *s = _session_find(imgid);
   *saved = FALSE;
+  // the key is the duplicate's version name: a repeat finds the version of
+  // the same file named so
+  const char *key = _add_key(params, 1024, err);
+  if(*err) return FALSE;
+  if(key)
+  {
+    sqlite3_stmt *stmt;
+    // clang-format off
+    DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                                "SELECT i.id FROM main.images AS i, main.images AS o, main.meta_data AS m"
+                                " WHERE o.id = ?1 AND i.film_id = o.film_id AND i.filename = o.filename"
+                                "   AND i.id != o.id AND m.id = i.id AND m.key = ?2 AND m.value = ?3"
+                                " ORDER BY i.id LIMIT 1", -1, &stmt, NULL);
+    // clang-format on
+    DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
+    DT_DEBUG_SQLITE3_BIND_INT(stmt, 2, dt_metadata_get_keyid("Xmp.darktable.version_name"));
+    DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 3, key, -1, SQLITE_TRANSIENT);
+    const dt_imgid_t found = sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : NO_IMGID;
+    sqlite3_finalize(stmt);
+    if(dt_is_valid_imgid(found))
+    {
+      JsonObject *q = json_object_new();
+      json_object_set_int_member(q, "imgid", found);
+      const gboolean ok = _image_info(q, b, err);
+      json_object_unref(q);
+      json_builder_set_member_name(b, "saved");
+      json_builder_add_boolean_value(b, FALSE);
+      _add_created(b, FALSE);
+      return ok;
+    }
+  }
+  _session_t *s = _session_find(imgid);
   if(s && s->gui)
     dt_dev_write_history(s->dev);
   else if(s && s->dirty && !virgin)
@@ -5064,6 +5215,11 @@ static gboolean _image_duplicate(JsonObject *params, const dt_imgid_t current, g
   else
     dt_history_copy_and_paste_on_image(imgid, newid, FALSE, NULL, TRUE, TRUE, TRUE);
   dt_image_cache_set_change_timestamp_from_image(newid, imgid);
+  if(key)
+  {
+    dt_metadata_set(newid, "Xmp.darktable.version_name", key, FALSE);
+    dt_image_synch_xmp(newid);
+  }
   if(_in_gui) DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_FILMROLLS_CHANGED);
   JsonObject *q = json_object_new();
   json_object_set_int_member(q, "imgid", newid);
@@ -5071,6 +5227,7 @@ static gboolean _image_duplicate(JsonObject *params, const dt_imgid_t current, g
   json_object_unref(q);
   json_builder_set_member_name(b, "saved");
   json_builder_add_boolean_value(b, *saved);
+  _add_created(b, TRUE);
   return ok;
 }
 
@@ -8322,6 +8479,20 @@ static gboolean _mask_ai(JsonObject *params, JsonBuilder *b, gchar **err)
     *err = _ERRF(API_E_UNAVAILABLE, NULL, "module '%s' takes no drawn masks", m->op);
     return FALSE;
   }
+  // a repeat finds its group before the model runs again
+  const char *add_key = _add_key(params, sizeof(((dt_masks_form_t *)NULL)->name), err);
+  if(*err) return FALSE;
+  const dt_mask_id_t keyed = add_key ? _keyed_form(dt_masks_get_from_id(_cur->dev, m->blend_params->mask_id), add_key, 0)
+                                 : NO_MASKID;
+  if(dt_is_valid_maskid(keyed))
+  {
+    json_builder_set_member_name(b, "formid");
+    json_builder_add_int_value(b, keyed);
+    json_builder_set_member_name(b, "history_end");
+    json_builder_add_int_value(b, _cur->dev->history_end);
+    _add_created(b, FALSE);
+    return TRUE;
+  }
   if(!dt_ai_registry_is_enabled())
   {
     *err = _ERR(API_E_UNAVAILABLE, NULL, "AI features are off in darktable's preferences (plugins/ai/enabled)");
@@ -8546,9 +8717,12 @@ static gboolean _mask_ai(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   g_list_free(forms);
   g_list_free(signs);
-  if(!_mask_attach(m, grp, op, inverted, b)) return FALSE;
-  // save_creation numbered it as a plain group
-  snprintf(grp->name, sizeof(grp->name), "%s #%d", _("ai object group"), groups + 1);
+  // save_creation would number it as a plain group
+  gchar *name = add_key ? g_strdup(add_key) : g_strdup_printf("%s #%d", _("ai object group"), groups + 1);
+  const gboolean attached = _mask_attach(m, grp, op, inverted, name, b);
+  g_free(name);
+  if(!attached) return FALSE;
+  _add_created(b, TRUE);
   json_builder_set_member_name(b, "paths");
   json_builder_add_int_value(b, npaths);
   json_builder_set_member_name(b, "area");
@@ -12260,7 +12434,7 @@ static const char *_methods[] = {
   "module_enable", "capture_autotune", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
   "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
   "retouch_remove", "blend_get", "blend_set", "mask_add", "mask_list",
-  "mask_remove", "mask_attach", "mask_add.path", "mask_add.corners", "mask_ai", "mask_ai_encode", "export.background", "sample", "sample.blend_of", "ai_denoise",
+  "mask_remove", "mask_attach", "mask_add.path", "mask_add.corners", "mask_add.key", "mask_ai", "mask_ai.key", "retouch_add.key", "module_add.key", "image_duplicate.key", "mask_ai_encode", "export.background", "sample", "sample.blend_of", "ai_denoise",
 #ifdef HAVE_OVERLAY_COMPOSITE_HQ
   "ai_fill",
 #if defined(HAVE_AI) && defined(PNG_SIMPLIFIED_READ_SUPPORTED) && defined(PNG_SIMPLIFIED_WRITE_SUPPORTED)

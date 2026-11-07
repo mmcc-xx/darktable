@@ -1199,6 +1199,20 @@ void toneeq_process(dt_iop_module_t *self,
     compute_luminance_mask(in, luminance, width, height, d);
   }
 
+  dt_dev_pixelpipe_mask_tap_t *tap = piece->pipe->mask_tap;
+  if(tap && tap->module == self && !tap->mask)
+  {
+    tap->mask = dt_alloc_align_float(num_elem);
+    if(tap->mask)
+    {
+      memcpy(tap->mask, luminance, num_elem * sizeof(float));
+      tap->x = roi_in->x;
+      tap->y = roi_in->y;
+      tap->width = width;
+      tap->height = height;
+    }
+  }
+
   // Display output
   if(self->dev->gui_attached && dt_pipe_is_full(piece->pipe))
   {

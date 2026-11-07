@@ -140,6 +140,10 @@
                                     darktable's tagging, metadata editor
                                     and geotagging set them
      mask_ai_encode              -> encodes the photo for AI masks (a job)
+     toneequal_mask {instance, width, point}
+                                 -> the tone equalizer's own luminance mask,
+                                    in EV: a grid over the photo, or a point
+                                    and its band
      picker_list / picker_apply {operation, instance, control, box | point}
                                  -> darktable's window, the darkroom's photo:
                                     a module's pickers and auto buttons,
@@ -12304,6 +12308,139 @@ static gboolean _picker_apply_headless(JsonObject *params, JsonBuilder *b, gchar
   return TRUE;
 }
 
+// the mask's EV at (x, y), coordinates of the module's input; NAN off it
+static float _tap_ev(const dt_dev_pixelpipe_mask_tap_t *tap, const float x, const float y)
+{
+  const int ix = (int)floorf(x) - tap->x, iy = (int)floorf(y) - tap->y;
+  if(ix < 0 || iy < 0 || ix >= tap->width || iy >= tap->height) return NAN;
+  return MAX(log2f(MAX(tap->mask[(size_t)iy * tap->width + ix], 1e-9f)), -16.0f);
+}
+
+// the luminance mask the tone equalizer instance computes (its input,
+// guided filter included), which darktable keeps for its window only: what
+// the module's bands act on, read through a preview pipe of the edit as
+// _pick_sample reads a sample. the module is taken on, the mask being there
+// whether the module is or not. point: that point's "ev" and "band" (the
+// module_set name of the nearest of its nine nodes, -8..0 EV); else "ev", a
+// grid of width x height over the photo as rendered (rows, null off the
+// mask), width the longer side
+static gboolean _toneequal_mask(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(_cur->gui)
+  {
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "toneequal_mask works without darktable's window only");
+    return FALSE;
+  }
+  const int instance = params ? json_object_get_int_member_with_default(params, "instance", 0) : 0;
+  dt_iop_module_t *m = dt_iop_get_module_by_op_priority(_cur->dev->iop, "toneequal", instance);
+  if(!m)
+  {
+    *err = _ERRF(API_E_NOT_FOUND, "instance", "no tone equalizer instance %d", instance);
+    return FALSE;
+  }
+  const gboolean point = params && json_object_has_member(params, "point");
+  float area[4] = { 0.f };
+  gboolean unused;
+  if(point && !_parse_area(params, area, &unused, err)) return FALSE;
+  const int side = CLAMP(params ? json_object_get_int_member_with_default(params, "width", 160) : 160, 16, 512);
+
+  _session_t *s = _cur;
+  _pipe_sync(s);
+  dt_mipmap_buffer_t mb;
+  dt_mipmap_cache_get(&mb, s->dev->image_storage.id, DT_MIPMAP_F, DT_MIPMAP_BLOCKING, 'r');
+  if(!mb.buf || mb.width <= 0 || mb.height <= 0)
+  {
+    dt_mipmap_cache_release(&mb);
+    *err = g_strdup("could not load the image's preview");
+    return FALSE;
+  }
+  dt_dev_pixelpipe_t pp;
+  dt_dev_pixelpipe_init_preview(&pp);
+  dt_dev_pixelpipe_set_input(&pp, s->dev, (float *)mb.buf, mb.width, mb.height, mb.iscale);
+  dt_dev_pixelpipe_create_nodes(&pp, s->dev);
+  dt_dev_pixelpipe_synch_all(&pp, s->dev);
+  dt_dev_pixelpipe_get_dimensions(&pp, s->dev, pp.iwidth, pp.iheight, &pp.processed_width, &pp.processed_height);
+  gboolean ok = FALSE;
+  dt_dev_pixelpipe_mask_tap_t tap = { .module = m };
+  float *pts = NULL;
+  dt_dev_pixelpipe_iop_t *piece = _piece_in(&pp, m);
+  if(!piece || pp.processed_width <= 0 || pp.processed_height <= 0)
+  {
+    *err = g_strdup("the tone equalizer gets no image");
+    goto done;
+  }
+  piece->enabled = TRUE;
+  // the module's C path, in one piece: the tap is there
+  piece->process_cl_ready = FALSE;
+  piece->process_tiling_ready = FALSE;
+  pp.mask_tap = &tap;
+  if(dt_dev_pixelpipe_process(&pp, s->dev, 0, 0, pp.processed_width, pp.processed_height, 1.0f, DT_DEVICE_NONE)
+     || !tap.mask)
+  {
+    *err = g_strdup("could not compute the tone equalizer's mask");
+    goto done;
+  }
+  const float pw = pp.processed_width, ph = pp.processed_height;
+  const int gw = point ? 1 : pw >= ph ? side : MAX((int)roundf(side * pw / ph), 1);
+  const int gh = point ? 1 : pw >= ph ? MAX((int)roundf(side * ph / pw), 1) : side;
+  const size_t n = (size_t)gw * gh;
+  pts = g_new(float, 2 * n);
+  if(point)
+  {
+    pts[0] = pw * area[0];
+    pts[1] = ph * area[1];
+  }
+  else
+    for(size_t i = 0; i < n; i++)
+    {
+      pts[2 * i] = pw * ((i % gw) + 0.5f) / gw;
+      pts[2 * i + 1] = ph * ((i / gw) + 0.5f) / gh;
+    }
+  // the mask is before whatever comes after the module: crop, or lens and
+  // rotation if it was moved up. the point's EV, the band as the nodes lie
+  dt_dev_distort_backtransform_plus(s->dev, &pp, m->iop_order, DT_DEV_TRANSFORM_DIR_FORW_EXCL, pts, n);
+  if(point)
+  {
+    static const char *const bands[9] = { "noise", "ultra_deep_blacks", "deep_blacks", "blacks", "shadows",
+                                          "midtones", "highlights", "whites", "speculars" };
+    const float ev = _tap_ev(&tap, pts[0], pts[1]);
+    if(!isfinite(ev))
+    {
+      *err = _ERR(API_E_PARAMS, "point", "the point is outside the image the tone equalizer gets");
+      goto done;
+    }
+    json_builder_set_member_name(b, "ev");
+    json_builder_add_double_value(b, round(ev * 100.0f) / 100.0);
+    json_builder_set_member_name(b, "band");
+    json_builder_add_string_value(b, bands[CLAMP((int)roundf(ev), -8, 0) + 8]);
+  }
+  else
+  {
+    json_builder_set_member_name(b, "width");
+    json_builder_add_int_value(b, gw);
+    json_builder_set_member_name(b, "height");
+    json_builder_add_int_value(b, gh);
+    json_builder_set_member_name(b, "ev");
+    json_builder_begin_array(b);
+    for(size_t i = 0; i < n; i++)
+    {
+      const float ev = _tap_ev(&tap, pts[2 * i], pts[2 * i + 1]);
+      if(isfinite(ev))
+        json_builder_add_double_value(b, round(ev * 100.0f) / 100.0);
+      else
+        json_builder_add_null_value(b);
+    }
+    json_builder_end_array(b);
+  }
+  ok = TRUE;
+done:
+  g_free(pts);
+  dt_free_align(tap.mask);
+  dt_dev_pixelpipe_cleanup(&pp);
+  dt_mipmap_cache_release(&mb);
+  return ok;
+}
+
 // presses a picker or auto button of a module of the darkroom's photo. a
 // picker samples box (or point) in image space; without one, darktable's
 // default area for a fresh picker (nearly the whole image)
@@ -12632,7 +12769,7 @@ static const char *_methods[] = {
 #endif
   "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "image_remove", "style_list", "style_create", "style_delete", "style_apply",
   "history_paste", "collection", "darkroom_open", "image_info.exif", "image_metadata", "tag_list", "set_tags", "set_tags.private",
-  "group", "set_metadata", "set_location", "picker_list", "picker_apply", "picker_apply.headless", "module_remove", "module_rename", "history_compress",
+  "group", "set_metadata", "set_location", "picker_list", "picker_apply", "picker_apply.headless", "toneequal_mask", "module_remove", "module_rename", "history_compress",
   "render.history_end", "render_variants", "darkroom_snapshot", "share", "save", "reset", "render", "render.uncropped", "render.zoom", "render.show_mask", "export", "export.bpp",
   "library_status", "library_release", "library_release.auto_acquire", "library_acquire", "handover", "shutdown", "shutdown.quit_window",
   "errors.codes", NULL };
@@ -12646,7 +12783,7 @@ static const struct { const char *method; const char *event; } _session_methods[
   { "retouch_add", "edit" }, { "retouch_set", "edit" }, { "retouch_scales", "edit" }, { "retouch_remove", "edit" },
   { "blend_get", NULL }, { "blend_set", "edit" }, { "mask_add", "edit" }, { "mask_list", NULL },
   { "mask_remove", "edit" }, { "mask_attach", "edit" }, { "mask_ai", "edit" }, { "mask_ai_encode", NULL }, { "sample", NULL },
-  { "module_move", "edit" }, { "picker_list", NULL }, { "picker_apply", NULL }, { "curve_get", NULL }, { "curve_set", "edit" },
+  { "module_move", "edit" }, { "picker_list", NULL }, { "picker_apply", NULL }, { "toneequal_mask", NULL }, { "curve_get", NULL }, { "curve_set", "edit" },
   { "module_add", "edit" }, { "ai_fill", "edit" }, { "module_remove", "edit" }, { "module_rename", "edit" }, { "history_compress", "saved" },
   { "module_set", "edit" }, { "module_enable", "edit" }, { "capture_autotune", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" },
   { "save", "saved" }, { "reset", "reset" }, { "session_close", "closed" }, { NULL, NULL } };
@@ -12992,6 +13129,8 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _picker_list(params, b, &err);
   else if(!g_strcmp0(method, "picker_apply"))
     _picker_apply(params, b, &err);
+  else if(!g_strcmp0(method, "toneequal_mask"))
+    _toneequal_mask(params, b, &err);
   else if(!g_strcmp0(method, "module_add"))
     _module_add(params, b, &err);
   else if(!g_strcmp0(method, "module_remove"))

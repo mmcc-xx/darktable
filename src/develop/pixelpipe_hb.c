@@ -293,6 +293,7 @@ static gboolean _dev_pixelpipe_init_cached(dt_dev_pixelpipe_t *pipe,
   memset(pipe->backbuf_zoom_pos, 0, sizeof(dt_dev_zoom_pos_t));
   pipe->output_imgid = NO_IMGID;
   pipe->picker = NULL;
+  pipe->mask_tap = NULL;
 
   memset(&pipe->scharr, 0, sizeof(dt_dev_detail_mask_t));
   pipe->want_detail_mask = FALSE;

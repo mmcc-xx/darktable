@@ -216,6 +216,16 @@ typedef struct dt_dev_pixelpipe_picker_t
   dt_iop_colorspace_type_t cst;
 } dt_dev_pixelpipe_picker_t;
 
+// asks module for a copy of the luminance mask it computes on this pipe:
+// it fills mask (dt_alloc_align_float, the caller frees it) and the mask's
+// roi, in the coordinates of the module's input at the pipe's scale
+typedef struct dt_dev_pixelpipe_mask_tap_t
+{
+  const struct dt_iop_module_t *module;
+  float *mask;
+  int x, y, width, height;
+} dt_dev_pixelpipe_mask_tap_t;
+
 /**
  * this encapsulates the pixelpipe.
  * a develop module will need several of these:
@@ -281,6 +291,8 @@ typedef struct dt_dev_pixelpipe_t
   gboolean nocache;
   // a module picking on this pipe instead of the darkroom's, or NULL
   const dt_dev_pixelpipe_picker_t *picker;
+  // a module's luminance mask wanted from this pipe, or NULL
+  dt_dev_pixelpipe_mask_tap_t *mask_tap;
 
   dt_imgid_t output_imgid;
   /* Testing for shutting down and a running pixelpipe

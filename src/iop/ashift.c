@@ -2294,12 +2294,11 @@ static double model_fitness(double *params, void *data)
 }
 
 // setup all data structures for fitting and call NM simplex
-static dt_iop_ashift_nmsresult_t nmsfit(dt_iop_module_t *self,
-                                        dt_iop_ashift_params_t *p,
-                                        const dt_iop_ashift_fitaxis_t dir)
+static dt_iop_ashift_nmsresult_t _nmsfit(const dt_iop_ashift_gui_data_t *g,
+                                         dt_iop_ashift_params_t *p,
+                                         const dt_iop_ashift_fitaxis_t dir,
+                                         const int isflipped)
 {
-  const dt_iop_ashift_gui_data_t *g = self->gui_data;
-
   if(!g->lines) return NMS_NOT_ENOUGH_LINES;
   if(dir == ASHIFT_FIT_NONE) return NMS_SUCCESS;
 
@@ -2338,7 +2337,7 @@ static dt_iop_ashift_nmsresult_t nmsfit(dt_iop_module_t *self,
      (mdir & ASHIFT_FIT_LENS_BOTH) != 0)
   {
     // flip all directions
-    mdir ^= _get_isflipped(self) ? ASHIFT_FIT_FLIP : 0;
+    mdir ^= isflipped ? ASHIFT_FIT_FLIP : 0;
     // special case that needs to be corrected
     mdir |= (mdir & ASHIFT_FIT_LINES_BOTH) == 0 ? ASHIFT_FIT_LINES_BOTH : 0;
   }
@@ -2499,6 +2498,13 @@ static dt_iop_ashift_nmsresult_t nmsfit(dt_iop_module_t *self,
   p->lensshift_h = fit.lensshift_h;
   p->shear = fit.shear;
   return NMS_SUCCESS;
+}
+
+static dt_iop_ashift_nmsresult_t nmsfit(dt_iop_module_t *self,
+                                        dt_iop_ashift_params_t *p,
+                                        const dt_iop_ashift_fitaxis_t dir)
+{
+  return _nmsfit(self->gui_data, p, dir, _get_isflipped(self));
 }
 
 #ifdef ASHIFT_DEBUG
@@ -3065,6 +3071,56 @@ static void _draw_basic_line(dt_iop_ashift_line_t *line,
 
   // register type of line
   line->type = type;
+}
+
+// what do_fit() does with drawn lines, for an editor with no GUI:
+// darktable-api (src/api) looks it up by name. lines holds n segments
+// x1, y1, x2, y2 in pixels of the module's width x height input, each
+// vertical or horizontal by its larger extent as drawn lines are; dir is a
+// dt_iop_ashift_fitaxis_t in the module's input orientation (the caller
+// swaps it for a flipped image). returns a dt_iop_ashift_nmsresult_t;
+// params change only on success (0). the automatic crop is left to
+// dt_iop_ashift_fit_crop()
+__attribute__((visibility("default")))
+int dt_iop_ashift_fit_lines(dt_iop_params_t *params,
+                            const float *lines,
+                            const int n,
+                            const int width,
+                            const int height,
+                            const int dir)
+{
+  if(n <= 0 || width <= 0 || height <= 0) return NMS_NOT_ENOUGH_LINES;
+  dt_iop_ashift_gui_data_t *g = calloc(1, sizeof(dt_iop_ashift_gui_data_t));
+  if(!g) return NMS_NOT_ENOUGH_LINES;
+  g->lines = calloc(n, sizeof(dt_iop_ashift_line_t));
+  if(!g->lines)
+  {
+    free(g);
+    return NMS_NOT_ENOUGH_LINES;
+  }
+  for(int i = 0; i < n; i++)
+  {
+    _draw_basic_line(&g->lines[i], lines[4 * i], lines[4 * i + 1],
+                     lines[4 * i + 2], lines[4 * i + 3], ASHIFT_LINE_VERTICAL_SELECTED);
+    _draw_retrieve_line_type(&g->lines[i]);
+    if(g->lines[i].type == ASHIFT_LINE_VERTICAL_SELECTED)
+      g->vertical_count++;
+    else
+      g->horizontal_count++;
+  }
+  g->lines_count = n;
+  g->vertical_weight = g->vertical_count;
+  g->horizontal_weight = g->horizontal_count;
+  g->lines_in_width = width;
+  g->lines_in_height = height;
+  g->rotation_range = ROTATION_RANGE_SOFT;
+  g->lensshift_v_range = LENSSHIFT_RANGE_SOFT;
+  g->lensshift_h_range = LENSSHIFT_RANGE_SOFT;
+  g->shear_range = SHEAR_RANGE_SOFT;
+  const dt_iop_ashift_nmsresult_t res = _nmsfit(g, params, dir, FALSE);
+  free(g->lines);
+  free(g);
+  return res;
 }
 
 static void _gui_update_structure_states(const dt_iop_module_t *self, GtkWidget *widget)

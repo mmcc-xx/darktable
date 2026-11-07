@@ -207,6 +207,12 @@
                                     in ashift and fits its automatic crop as
                                     the darkroom does, sets crop's box (null
                                     removes it) and aspect; all or nothing
+     perspective_fit {lines | quad, space, fit, rotation, lens_shift, shear}
+                                 -> ashift's fit buttons with drawn lines
+                                    (or a quad's sides) on the image: fits
+                                    rotation, lens shift (and shear) so they
+                                    come out vertical/horizontal, then the
+                                    automatic crop
      save                        -> writes the history to the library (and
                                     the sidecar, if write_sidecar_files
                                     asks for it), as leaving the darkroom does
@@ -2325,6 +2331,258 @@ static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
     json_builder_set_member_name(b, "autocrop_fitted");
     json_builder_add_boolean_value(b, autocropped);
   }
+  return TRUE;
+}
+
+// ashift's parameter fit from drawn lines (iop/ashift.c: dt_iop_ashift_fit_lines)
+typedef int (*_fit_lines_t)(dt_iop_params_t *params, const float *lines, int n,
+                            int width, int height, int dir);
+
+// the fit buttons of rotate and perspective with drawn lines or a quad (the
+// darkroom's "lines" and "quad" structure): rotation, lens shift and shear
+// fitted so the lines come out vertical and/or horizontal, then the
+// automatic crop, as do_fit() does. lines and corners are fractions of the
+// image as rendered (space "image"), of crop's input ("uncropped") or of
+// the raw ("raw")
+static gboolean _perspective_fit(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  if(!_cur)
+  {
+    *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
+    return FALSE;
+  }
+  dt_iop_module_t *ashift = dt_iop_get_module_by_op_priority(_cur->dev->iop, "ashift", 0);
+  _fit_lines_t fit_lines = NULL;
+  _fit_crop_t fit_crop = NULL;
+  if(!ashift || !g_module_symbol(ashift->so->module, "dt_iop_ashift_fit_lines", (gpointer *)&fit_lines)
+     || !g_module_symbol(ashift->so->module, "dt_iop_ashift_fit_crop", (gpointer *)&fit_crop))
+  {
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "this darktable's rotate and perspective module can't fit from lines");
+    return FALSE;
+  }
+  JsonNode *n_lines = params ? json_object_get_member(params, "lines") : NULL;
+  JsonNode *n_quad = params ? json_object_get_member(params, "quad") : NULL;
+  if(!n_lines == !n_quad)
+  {
+    *err = _ERR(API_E_PARAMS, NULL, "perspective_fit needs lines [[x1, y1, x2, y2], ...] or quad [[x, y] x 4]");
+    return FALSE;
+  }
+  const char *space = params ? json_object_get_string_member_with_default(params, "space", "image") : "image";
+  static const char *spaces[] = { "raw", "image", "uncropped", NULL };
+  int fs = -1;
+  for(int k = 0; spaces[k]; k++)
+    if(!g_strcmp0(space, spaces[k])) fs = k;
+  if(fs < 0)
+  {
+    *err = _ERR(API_E_PARAMS, "space", "space: image, uncropped or raw");
+    return FALSE;
+  }
+  const char *mode = params ? json_object_get_string_member_with_default(params, "fit", "auto") : "auto";
+  if(g_strcmp0(mode, "auto") && g_strcmp0(mode, "vertical") && g_strcmp0(mode, "horizontal")
+     && g_strcmp0(mode, "both"))
+  {
+    *err = _ERR(API_E_PARAMS, "fit", "fit: vertical, horizontal, both or auto");
+    return FALSE;
+  }
+  const gboolean rotation = params ? json_object_get_boolean_member_with_default(params, "rotation", TRUE) : TRUE;
+  const gboolean lens_shift = params ? json_object_get_boolean_member_with_default(params, "lens_shift", TRUE) : TRUE;
+  const gboolean shear = params ? json_object_get_boolean_member_with_default(params, "shear", FALSE) : FALSE;
+  if(!rotation && !lens_shift && !shear)
+  {
+    *err = _ERR(API_E_PARAMS, "rotation", "nothing to fit: rotation, lens_shift and shear are all false");
+    return FALSE;
+  }
+
+  // the segments, x1 y1 x2 y2 each, in fractions of the space for now
+  float *pts = NULL;
+  guint n = 0;
+  if(n_lines)
+  {
+    JsonArray *a = JSON_NODE_HOLDS_ARRAY(n_lines) ? json_node_get_array(n_lines) : NULL;
+    n = a ? json_array_get_length(a) : 0;
+    if(n < 1 || n > 100)
+    {
+      *err = _ERR(API_E_PARAMS, "lines", "lines: 1 to 100 segments [x1, y1, x2, y2]");
+      return FALSE;
+    }
+    pts = g_new0(float, 4 * n);
+    for(guint k = 0; k < n; k++)
+    {
+      JsonNode *e = json_array_get_element(a, k);
+      JsonArray *l = JSON_NODE_HOLDS_ARRAY(e) ? json_node_get_array(e) : NULL;
+      if(!l || json_array_get_length(l) != 4)
+      {
+        g_free(pts);
+        *err = _ERRF(API_E_PARAMS, "lines", "line %u: needs [x1, y1, x2, y2]", k);
+        return FALSE;
+      }
+      for(int i = 0; i < 4; i++) pts[4 * k + i] = json_array_get_double_element(l, i);
+    }
+  }
+  else
+  {
+    // the corners in order around the shape; each side is a line
+    JsonArray *a = JSON_NODE_HOLDS_ARRAY(n_quad) ? json_node_get_array(n_quad) : NULL;
+    float c[8];
+    for(guint k = 0; k < 4; k++)
+    {
+      JsonNode *e = a && json_array_get_length(a) == 4 ? json_array_get_element(a, k) : NULL;
+      JsonArray *p = e && JSON_NODE_HOLDS_ARRAY(e) ? json_node_get_array(e) : NULL;
+      if(!p || json_array_get_length(p) != 2)
+      {
+        *err = _ERR(API_E_PARAMS, "quad", "quad: four corners [[x, y], ...] in order around the shape");
+        return FALSE;
+      }
+      c[2 * k] = json_array_get_double_element(p, 0);
+      c[2 * k + 1] = json_array_get_double_element(p, 1);
+    }
+    n = 4;
+    pts = g_new0(float, 16);
+    for(int k = 0; k < 4; k++)
+    {
+      pts[4 * k] = c[2 * k];
+      pts[4 * k + 1] = c[2 * k + 1];
+      pts[4 * k + 2] = c[(2 * k + 2) % 8];
+      pts[4 * k + 3] = c[(2 * k + 3) % 8];
+    }
+  }
+  for(guint k = 0; k < 4 * n; k++)
+    if(!isfinite(pts[k]))
+    {
+      g_free(pts);
+      *err = _ERR(API_E_PARAMS, n_lines ? "lines" : "quad", "coordinates must be numbers");
+      return FALSE;
+    }
+
+  _session_t *s = _pipe_session(err);
+  if(!s)
+  {
+    g_free(pts);
+    return FALSE;
+  }
+  _pipe_sync(s);
+  const dt_dev_pixelpipe_iop_t *ap = _piece(s, "ashift");
+  if(!ap || ap->buf_in.width <= 0 || ap->buf_in.height <= 0)
+  {
+    g_free(pts);
+    *err = _ERR(API_E_FAILED, NULL, "rotate and perspective's input isn't known yet");
+    return FALSE;
+  }
+  const int aw = ap->buf_in.width, ah = ap->buf_in.height;
+
+  // to the raw (as coords does), then forward to ashift's input
+  const dt_dev_pixelpipe_iop_t *cp = _piece(s, "crop");
+  const double w[3] = { s->pipe.iwidth, s->pipe.processed_width, cp ? cp->buf_in.width : s->pipe.processed_width };
+  const double h[3] = { s->pipe.iheight, s->pipe.processed_height, cp ? cp->buf_in.height : s->pipe.processed_height };
+  for(guint k = 0; k < 2 * n; k++)
+  {
+    pts[2 * k] *= w[fs];
+    pts[2 * k + 1] *= h[fs];
+  }
+  if(fs == 1)
+    dt_dev_distort_backtransform_plus(s->dev, &s->pipe, 0, DT_DEV_TRANSFORM_DIR_ALL, pts, 2 * n);
+  else if(fs == 2)
+    dt_dev_distort_backtransform_plus(s->dev, &s->pipe, cp ? cp->module->iop_order : INT_MAX,
+                                      DT_DEV_TRANSFORM_DIR_BACK_EXCL, pts, 2 * n);
+  dt_dev_distort_transform_plus(s->dev, &s->pipe, ap->module->iop_order, DT_DEV_TRANSFORM_DIR_BACK_EXCL,
+                                pts, 2 * n);
+
+  // is the image as shown turned a quarter against ashift's input (flip
+  // after it)? then its vertical is ashift's horizontal. process() asks the
+  // same for the darkroom from the diagonal, which misses a transpose
+  // (turned and mirrored): the x axis's direction tells both
+  float axis[4] = { 0.0f, 0.0f, aw, 0.0f };
+  dt_dev_distort_transform_plus(s->dev, &s->pipe, ap->module->iop_order, DT_DEV_TRANSFORM_DIR_FORW_EXCL,
+                                axis, 2);
+  const gboolean flipped = fabsf(axis[3] - axis[1]) > fabsf(axis[2] - axis[0]);
+
+  // the lines as shown: vertical by their larger extent in ashift's input,
+  // swapped when flipped
+  int nv = 0, nh = 0;
+  for(guint k = 0; k < n; k++)
+  {
+    const gboolean vert = fabsf(pts[4 * k] - pts[4 * k + 2]) <= fabsf(pts[4 * k + 1] - pts[4 * k + 3]);
+    if(vert != flipped) nv++;
+    else nh++;
+  }
+  gboolean want_v, want_h;
+  if(!g_strcmp0(mode, "auto"))
+  {
+    want_v = nv >= 2;
+    want_h = nh >= 2;
+  }
+  else
+  {
+    want_v = !g_strcmp0(mode, "vertical") || !g_strcmp0(mode, "both");
+    want_h = !g_strcmp0(mode, "horizontal") || !g_strcmp0(mode, "both");
+  }
+  if((want_v && nv < 2) || (want_h && nh < 2) || (!want_v && !want_h))
+  {
+    g_free(pts);
+    *err = _ERRF(API_E_PARAMS, n_lines ? "lines" : "quad",
+                 "not enough lines: %d vertical and %d horizontal; the fit needs at least 2 "
+                 "in each direction it straightens", nv, nh);
+    return FALSE;
+  }
+  if(shear && !(want_v && want_h))
+  {
+    g_free(pts);
+    *err = _ERR(API_E_PARAMS, "shear", "shear: only with fit both (2 vertical and 2 horizontal lines)");
+    return FALSE;
+  }
+
+  // the fit buttons' axes (ASHIFT_FIT_* in ashift.c), as shown, then turned
+  // to ashift's input
+  enum { ROT = 1, LENS_V = 2, LENS_H = 4, SHEAR = 8, LINES_V = 16, LINES_H = 32 };
+  gboolean dv = want_v, dh = want_h;
+  if(flipped)
+  {
+    dv = want_h;
+    dh = want_v;
+  }
+  const int dir = (rotation ? ROT : 0) | (lens_shift && dv ? LENS_V : 0) | (lens_shift && dh ? LENS_H : 0)
+                  | (shear ? SHEAR : 0) | (dv ? LINES_V : 0) | (dh ? LINES_H : 0);
+
+  const double before[4] = { _param(ashift, "rotation"), _param(ashift, "lensshift_v"),
+                             _param(ashift, "lensshift_h"), _param(ashift, "shear") };
+  const int res = fit_lines(ashift->params, pts, n, aw, ah, dir);
+  g_free(pts);
+  if(res)
+  {
+    *err = _ERR(API_E_FAILED, NULL, res == 1 ? "not enough lines in a direction the fit straightens"
+                : "the fit failed: draw the lines along edges that should be straight "
+                  "and vertical or horizontal, or correct by hand");
+    return FALSE;
+  }
+  const gboolean autocropped = _ashift_fit(s, ashift, fit_crop);
+  _record(ashift, TRUE);
+
+  if(!_geometry_get(b, err)) return FALSE;
+  static const char *names[] = { "rotation", "lensshift_v", "lensshift_h", "shear" };
+  json_builder_set_member_name(b, "fitted");
+  json_builder_begin_object(b);
+  for(int k = 0; k < 4; k++)
+  {
+    json_builder_set_member_name(b, names[k]);
+    json_builder_add_double_value(b, round(_param(ashift, names[k]) * 1e4) / 1e4);
+  }
+  json_builder_end_object(b);
+  json_builder_set_member_name(b, "before");
+  json_builder_begin_object(b);
+  for(int k = 0; k < 4; k++)
+  {
+    json_builder_set_member_name(b, names[k]);
+    json_builder_add_double_value(b, round(before[k] * 1e4) / 1e4);
+  }
+  json_builder_end_object(b);
+  json_builder_set_member_name(b, "vertical_lines");
+  json_builder_add_int_value(b, nv);
+  json_builder_set_member_name(b, "horizontal_lines");
+  json_builder_add_int_value(b, nh);
+  json_builder_set_member_name(b, "straightened");
+  json_builder_add_string_value(b, want_v && want_h ? "both" : want_v ? "vertical" : "horizontal");
+  json_builder_set_member_name(b, "autocrop_fitted");
+  json_builder_add_boolean_value(b, autocropped);
   return TRUE;
 }
 
@@ -12756,7 +13014,7 @@ static const char *_methods[] = {
   "ping", "client_hello", "clients", "film_rolls", "images_list", "images_list.tag", "image_info", "thumbnail", "thumbnails", "import", "set_rating", "set_label", "marker_set", "marker_list", "marker_remove",
   "session_open", "session_close", "module_list", "module_list.all", "module_get", "module_set", "module_set.lists",
   "module_enable", "capture_autotune", "preset_list", "preset_apply", "history_list", "history_list.label", "history_end", "geometry_get",
-  "geometry_set", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
+  "geometry_set", "perspective_fit", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
   "retouch_add.shape", "retouch_add.scale", "retouch_set.shape", "retouch_set.scale", "retouch_scales",
   "retouch_remove", "blend_get", "blend_set", "mask_add", "mask_list",
   "mask_remove", "mask_attach", "mask_add.path", "mask_add.corners", "mask_add.key", "mask_ai", "mask_ai.key", "retouch_add.key", "module_add.key", "image_duplicate.key", "mask_ai_encode", "export.background", "sample", "sample.blend_of", "ai_denoise",
@@ -12785,7 +13043,7 @@ static const struct { const char *method; const char *event; } _session_methods[
   { "mask_remove", "edit" }, { "mask_attach", "edit" }, { "mask_ai", "edit" }, { "mask_ai_encode", NULL }, { "sample", NULL },
   { "module_move", "edit" }, { "picker_list", NULL }, { "picker_apply", NULL }, { "toneequal_mask", NULL }, { "curve_get", NULL }, { "curve_set", "edit" },
   { "module_add", "edit" }, { "ai_fill", "edit" }, { "module_remove", "edit" }, { "module_rename", "edit" }, { "history_compress", "saved" },
-  { "module_set", "edit" }, { "module_enable", "edit" }, { "capture_autotune", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" },
+  { "module_set", "edit" }, { "module_enable", "edit" }, { "capture_autotune", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" }, { "perspective_fit", "edit" },
   { "save", "saved" }, { "reset", "reset" }, { "session_close", "closed" }, { NULL, NULL } };
 
 // returns FALSE when the engine should stop
@@ -13175,6 +13433,8 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _geometry_get(b, &err);
   else if(!g_strcmp0(method, "geometry_set"))
     _geometry_set(params, b, &err);
+  else if(!g_strcmp0(method, "perspective_fit"))
+    _perspective_fit(params, b, &err);
   else if(!g_strcmp0(method, "history_end"))
     _history_end(params, b, &err);
   else if(!g_strcmp0(method, "save"))

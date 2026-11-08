@@ -4963,6 +4963,151 @@ static gboolean _mask_remove(JsonObject *params, JsonBuilder *b, gchar **err)
   return TRUE;
 }
 
+// the group entry (in the module's mask, at any depth) that holds a shape
+static dt_masks_point_group_t *_group_entry(dt_develop_t *dev, dt_masks_form_t *grp, const dt_mask_id_t id,
+                                            const int depth)
+{
+  if(!grp || !(grp->type & DT_MASKS_GROUP) || depth > 16) return NULL;
+  for(GList *l = grp->points; l; l = g_list_next(l))
+  {
+    dt_masks_point_group_t *gp = l->data;
+#ifdef HAVE_MASKS_FLEXI
+    if(dt_masks_point_is_marker(gp)) continue;
+#endif
+    if(gp->formid == id) return gp;
+    dt_masks_point_group_t *in = _group_entry(dev, dt_masks_get_from_id(dev, gp->formid), id, depth + 1);
+    if(in) return in;
+  }
+  return NULL;
+}
+
+// change a drawn shape in place, as dragging it or its handles in the
+// darkroom does: the formid stays, so every module using it follows. shape:
+// mask_add's keys as mask_list gives them, only those that change (the rest
+// are kept); a path's border or a brush's width, hardness or density
+// without points sets every point's. opacity, inverted: its entry in its
+// group, as the mask manager's
+static gboolean _mask_set(JsonObject *params, JsonBuilder *b, gchar **err)
+{
+  dt_iop_module_t *m = _blend_module(params, err);
+  if(!m) return FALSE;
+  if(_cur->gui)
+  {
+    *err = _ERR(API_E_UNAVAILABLE, NULL, "mask_set works without darktable's window only");
+    return FALSE;
+  }
+  dt_develop_t *dev = _cur->dev;
+  const dt_mask_id_t formid = params ? json_object_get_int_member_with_default(params, "formid", 0) : 0;
+  dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
+  dt_masks_point_group_t *gp = _group_entry(dev, grp, formid, 0);
+  dt_masks_form_t *form = gp ? dt_masks_get_from_id(dev, formid) : NULL;
+  if(!form)
+  {
+    *err = _ERRF(API_E_NOT_FOUND, "formid", "module '%s' has no shape %d (mask_list)", m->op, formid);
+    return FALSE;
+  }
+  JsonObject *sh = json_object_has_member(params, "shape")
+                   && JSON_NODE_HOLDS_OBJECT(json_object_get_member(params, "shape"))
+                     ? json_object_get_object_member(params, "shape") : NULL;
+  const double opacity = json_object_get_double_member_with_default(params, "opacity", -1.0);
+  const gboolean has_inv = json_object_has_member(params, "inverted");
+  if(!sh && opacity < 0.0 && !has_inv)
+  {
+    *err = _ERR(API_E_PARAMS, "shape", "mask_set: shape (the keys to change), opacity or inverted");
+    return FALSE;
+  }
+  if(opacity > 1.0)
+  {
+    *err = _ERR(API_E_PARAMS, "opacity", "opacity: 0..1");
+    return FALSE;
+  }
+  const gboolean brush = (form->type & DT_MASKS_BRUSH) != 0;
+  const gboolean path = (form->type & DT_MASKS_PATH) != 0;
+  dt_masks_form_t *nf = NULL;
+  if(sh)
+  {
+    if(form->type & DT_MASKS_GROUP)
+    {
+      *err = _ERR(API_E_PARAMS, "formid", "a group: change its members (mask_list members)");
+      return FALSE;
+    }
+    // its geometry now, the keys given over it
+    JsonBuilder *gb = json_builder_new();
+    json_builder_begin_object(gb);
+    _add_shape_geometry(gb, form);
+    json_builder_end_object(gb);
+    JsonNode *gn = json_builder_get_root(gb);
+    g_object_unref(gb);
+    JsonObject *merged = json_node_get_object(gn);
+    const char *type = brush ? "brush" : path ? "path" : form->type & DT_MASKS_CIRCLE ? "circle"
+                       : form->type & DT_MASKS_ELLIPSE ? "ellipse" : "gradient";
+    const char *given = json_object_get_string_member_with_default(sh, "type", type);
+    if(g_strcmp0(given, type))
+    {
+      json_node_free(gn);
+      *err = _ERRF(API_E_PARAMS, "shape", "shape %d is a %s; its type can't change (mask_remove, mask_add)",
+                   formid, type);
+      return FALSE;
+    }
+    GList *keys = json_object_get_members(sh);
+    for(GList *k = keys; k; k = g_list_next(k))
+      json_object_set_member(merged, k->data, json_node_copy(json_object_get_member(sh, k->data)));
+    g_list_free(keys);
+    json_object_set_string_member(merged, "type", type);
+    nf = _shape_form(merged, 0, err);
+    json_node_free(gn);
+    if(!nf) return FALSE;
+    // a feather for the whole path or brush
+    if((path || brush) && !json_object_has_member(sh, "points"))
+    {
+      const char *bk = brush ? "width" : "border";
+      for(GList *q = nf->points; q; q = g_list_next(q))
+      {
+        if(json_object_has_member(sh, bk))
+        {
+          const float v = json_object_get_double_member(sh, bk);
+          float *bd = brush ? ((dt_masks_point_brush_t *)q->data)->border : ((dt_masks_point_path_t *)q->data)->border;
+          bd[0] = bd[1] = brush ? v : MAX(0.0005f, v);
+        }
+        if(brush && json_object_has_member(sh, "hardness"))
+          ((dt_masks_point_brush_t *)q->data)->hardness = json_object_get_double_member(sh, "hardness");
+        if(brush && json_object_has_member(sh, "density"))
+          ((dt_masks_point_brush_t *)q->data)->density = json_object_get_double_member(sh, "density");
+      }
+    }
+  }
+  if(nf)
+  {
+    g_list_free_full(form->points, free);
+    form->points = nf->points;
+    nf->points = NULL;
+    dt_masks_free_form(nf);
+  }
+  if(opacity >= 0.0)
+  {
+#ifdef HAVE_MASKS_FLEXI
+    // a group's opacity is its marker's
+    dt_masks_point_group_t *own = (form->type & DT_MASKS_GROUP) ? dt_masks_group_marker(form) : NULL;
+    if(own) own->group_opacity = opacity;
+    else
+#endif
+      gp->opacity = opacity;
+  }
+  if(has_inv)
+  {
+    if(json_object_get_boolean_member(params, "inverted")) gp->state |= DT_MASKS_STATE_INVERSE;
+    else gp->state &= ~DT_MASKS_STATE_INVERSE;
+  }
+  dt_dev_add_masks_history_item_ext(dev, m, TRUE, TRUE);
+  _cur->pipe_changed = TRUE;
+  _cur->dirty = TRUE;
+  json_builder_set_member_name(b, "formid");
+  json_builder_add_int_value(b, formid);
+  json_builder_set_member_name(b, "history_end");
+  json_builder_add_int_value(b, dev->history_end);
+  return TRUE;
+}
+
 // ---- module instances and history compression ------------------------------
 
 // a session's pipe after modules were added or removed: new nodes for the
@@ -13017,7 +13162,7 @@ static const char *_methods[] = {
   "geometry_set", "perspective_fit", "coords", "retouch_list", "retouch_heal", "retouch_add", "retouch_set",
   "retouch_add.shape", "retouch_add.scale", "retouch_set.shape", "retouch_set.scale", "retouch_scales",
   "retouch_remove", "blend_get", "blend_set", "mask_add", "mask_list",
-  "mask_remove", "mask_attach", "mask_add.path", "mask_add.corners", "mask_add.key", "mask_ai", "mask_ai.key", "retouch_add.key", "module_add.key", "image_duplicate.key", "mask_ai_encode", "export.background", "sample", "sample.blend_of", "ai_denoise",
+  "mask_remove", "mask_set", "mask_attach", "mask_add.path", "mask_add.corners", "mask_add.key", "mask_ai", "mask_ai.key", "retouch_add.key", "module_add.key", "image_duplicate.key", "mask_ai_encode", "export.background", "sample", "sample.blend_of", "ai_denoise",
 #ifdef HAVE_OVERLAY_COMPOSITE_HQ
   "ai_fill",
 #if defined(HAVE_AI) && defined(PNG_SIMPLIFIED_READ_SUPPORTED) && defined(PNG_SIMPLIFIED_WRITE_SUPPORTED)
@@ -13040,7 +13185,7 @@ static const struct { const char *method; const char *event; } _session_methods[
   { "coords", NULL }, { "retouch_list", NULL }, { "retouch_heal", "edit" },
   { "retouch_add", "edit" }, { "retouch_set", "edit" }, { "retouch_scales", "edit" }, { "retouch_remove", "edit" },
   { "blend_get", NULL }, { "blend_set", "edit" }, { "mask_add", "edit" }, { "mask_list", NULL },
-  { "mask_remove", "edit" }, { "mask_attach", "edit" }, { "mask_ai", "edit" }, { "mask_ai_encode", NULL }, { "sample", NULL },
+  { "mask_remove", "edit" }, { "mask_set", "edit" }, { "mask_attach", "edit" }, { "mask_ai", "edit" }, { "mask_ai_encode", NULL }, { "sample", NULL },
   { "module_move", "edit" }, { "picker_list", NULL }, { "picker_apply", NULL }, { "toneequal_mask", NULL }, { "curve_get", NULL }, { "curve_set", "edit" },
   { "module_add", "edit" }, { "ai_fill", "edit" }, { "module_remove", "edit" }, { "module_rename", "edit" }, { "history_compress", "saved" },
   { "module_set", "edit" }, { "module_enable", "edit" }, { "capture_autotune", "edit" }, { "history_end", "edit" }, { "geometry_set", "edit" }, { "perspective_fit", "edit" },
@@ -13411,6 +13556,8 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _mask_list(params, b, &err);
   else if(!g_strcmp0(method, "mask_remove"))
     _mask_remove(params, b, &err);
+  else if(!g_strcmp0(method, "mask_set"))
+    _mask_set(params, b, &err);
   else if(!g_strcmp0(method, "mask_attach"))
     _mask_attach_existing(params, b, &err);
   else if(!g_strcmp0(method, "sample"))

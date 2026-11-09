@@ -119,6 +119,10 @@ changes (where available).
 
 ## UI/UX Improvements
 
+- Added back and forward navigation in collections, with user-assignable
+  shortcuts. Navigation remembers collection rules and thumbnail scroll
+  positions for up to 32 visits during the current session.
+
 - The code has received a large set of changes in preparation of the
   Gtk4 migration.
   - The code for handling popover menus has been changed.
@@ -215,7 +219,30 @@ changes (where available).
   the preferences dialog to the masks panel's options popover, and the
   masking section of the preferences dialog is gone.
 
+- Color calibration has a new illuminant option, "from the white
+  balance module", which derives the illuminant from the settings of
+  the white balance module. With it, the color picker and the
+  temperature, tint, and channel coefficient sliders in the white
+  balance module set the white balance that color calibration uses.
+  The new option is the default for new scene-referred edits of color
+  raw files. It needs the white balance module's new "prepare data for
+  color calibration" checkbox to be checked, as it is by default in
+  these edits. The checkbox is available in all modes except "camera
+  reference", which does not need it. The old "as shot to reference"
+  mode becomes "as shot" with the checkbox checked. While color
+  calibration adapts with any other illuminant option, such as "as shot
+  in camera" or "custom", the white balance module disables these
+  controls and its camera presets, because the white balance is then
+  controlled in color calibration.
+
+- The recent collections module now handles single or double click
+  according to the preference setting for collections.
+
 ## Performance Improvements
+
+- New edits convert the input color profile directly to the working RGB
+  profile, avoiding an unnecessary round trip through Lab. Existing edits
+  keep their previous color processing.
 
 - The lighttable timeline no longer slows down quadratically with the
   number of collected images: with a 100,000-image collection it took
@@ -251,15 +278,83 @@ changes (where available).
 - Enlarge canvas now runs on OpenCL, so it no longer moves the image
   back to the CPU in the middle of an otherwise GPU pipeline.
 
+- Chromatic aberrations RGB now runs on OpenCL.
+
+- Grain now runs on OpenCL.
+
+- Surface blur now runs on OpenCL. It was by far the slowest module
+  left on the CPU in an OpenCL pipeline, and moved the image back to
+  the CPU for it.
+
+- Rotate pixels, which straightens the sensor layout of Fujifilm
+  SuperCCD raws, now runs on OpenCL.
+
+- Scale pixels, which sets the pixel aspect ratio for non-square-pixel
+  sensors and anamorphic desqueeze, now runs on OpenCL.
+
 - Hovering over and dragging nodes of long drawn brush strokes and
   paths is much faster, as the mask overlay is no longer redrawn on
   every mouse move and long outlines are drawn with far fewer points.
+
+- Drawn masks render faster, most of all masks with nested groups or
+  shapes reused by several modules: each group no longer clears and
+  combines a full-size buffer just to copy in its first shape.
 
 - Lens correction with lensfun is faster on the OpenCL path: lensfun
   is now asked for its corrections on a coarse grid instead of for
   every pixel, so the CPU no longer computes and uploads hundreds of
   megabytes on each run. The correction is also more precise on x86,
   where it could be up to 0.3 px off, or 0.6 px when distorting.
+
+- The raw denoise module can now run on the OpenCL device for Bayer
+  sensors.
+
+- The retouch module's heal tool now runs its solver on the OpenCL
+  device instead of copying the image back to the CPU for each
+  healed shape.
+
+- The hot pixels module can now run on the OpenCL device, so a raw
+  no longer goes back to the CPU and up again around it.
+
+- Module color pickers now compute their statistics on the OpenCL
+  device instead of copying the picked area back to the CPU.
+
+- darktable-cli uses less memory when exporting many images: it no
+  longer keeps the decoded raw of every exported image in memory
+  until its cache is full.
+
+- darktable keeps fewer decoded raws in memory: the full-size image
+  cache now holds one image per worker thread plus one, instead of
+  twice the number of worker threads.
+
+- Modules showing a histogram of their input (levels, rgb levels, rgb
+  curve, tone curve and color zones) now count it on the OpenCL device
+  instead of copying the image back to the CPU.
+
+- The raw chromatic aberrations module can now run on the OpenCL
+  device.
+
+- Haze removal no longer copies the whole image back from the OpenCL
+  device to estimate the ambient light.
+
+- The dither module's random mode can now run on the OpenCL device.
+
+- The AMaZE demosaicer, plain and dual, can now run on the OpenCL
+  device instead of sending the image back to the CPU for the
+  demosaic.
+
+- Copying images to the OpenCL device is up to four times faster on
+  NVIDIA and macOS drivers, which speeds up every step where the
+  pipeline moves the image from the CPU to the GPU.
+
+- Softproofing, gamut check and LUT-based ICC profiles in input and
+  output color profile can now run on the OpenCL device, through a 3D
+  LUT sampled from LittleCMS, instead of sending the image back to the
+  CPU. The "always use LittleCMS 2" export preference still applies the
+  exact transform on the CPU.
+
+- The LMMSE demosaicer can now run on the OpenCL device instead of
+  sending the image back to the CPU for the demosaic.
 
 ## Other Changes
 
@@ -404,6 +499,10 @@ changes (where available).
 - Lightroom import now sets the working profile to linear ProPhoto
   RGB, the space Lightroom works in, instead of linear Rec709 RGB.
 
+- In the darkroom in the left panel the navigation can now be toggled
+  through the panel's right click menu in addition to the strg+shift+n
+  shortcut.
+
 - Lightroom import adds its exposure and blacks adjustments to
   darktable's default exposure instead of replacing it. In the
   scene-referred workflow, images with a Lightroom exposure adjustment
@@ -424,7 +523,22 @@ changes (where available).
 - History items created by the Lightroom import are labeled "lr import"
   instead of having an empty label.
 
+- Raw files that RawSpeed can't decode are now loaded with LibRaw if
+  LibRaw supports their compression mode: Fujifilm lossy compressed
+  RAFs, and with LibRaw 0.23 (snapshot 202611) or newer also Nikon high
+  efficiency (HE/HE*) NEFs from the Z6 III, Z8, Z9 and Z f and Sony
+  ARW 6.0 compressed and compressed (HQ) files. Bayer DNGs RawSpeed can't
+  decode are loaded with LibRaw as well, e.g. lossless JPEG with
+  unsupported predictors or uncompressed files with inconsistent strip
+  sizes as written by some DJI drones. All other files are still loaded with RawSpeed.
+
+- The LibRaw loader now supports X-Trans sensors. Previously, RAFs
+  routed to LibRaw via the libraw_extensions setting came out red.
+
 ## Bug Fixes
+
+- Fixed faint seams on a 112 pixel grid in images demosaiced with
+  LMMSE, where each tile read leftover data from the previous tile.
 
 - Upscaled exports no longer show shifted bands where they were
   processed in tiles, and the upscale now runs on OpenCL when it fits
@@ -616,6 +730,14 @@ changes (where available).
 
 - Fixed camera mutex locks before the mutexes are initialized.
 
+- Fixed tether mode leaving its event and live-view threads running after
+  leaving the view or tearing down a camera, and used full gphoto teardown
+  when a mounted camera disappeared so the device is released cleanly.
+
+- Fixed tether mode treating transient PTP Device Busy errors as a lost
+  camera connection (common when enabling live view), and stopped
+  echoing camera-driven property updates back to the camera.
+
 - Fixed metadata tag Xmp.xmpMM.PreservedFileName not written on camera
   import.
 
@@ -697,6 +819,10 @@ changes (where available).
 - Fixed edits made just before quitting darktable, such as a rating,
   being missing from the image's XMP sidecar while the library kept
   them.
+
+- Fixed tethered additional properties: user-added entries can be removed
+  or replaced (same label), the O property picker works more than once,
+  and unloadable saved properties show as deletable unavailable stubs.
 
 - Fixed an unexpected image change in AgX when disabling 'keep the pivot
   on the diagonal' after using 'read exposure from metadata and exposure
@@ -797,11 +923,19 @@ changes (where available).
 - Fixed the wrong raster mask being applied when three or more external
   raster masks were used in one edit.
 
+- Fixed memory leaks of libgphoto2 event data, CameraFile objects, and
+  strdup'd filenames during tether polling and download.
+
 - Fixed diffuse or sharpen giving a different result on the CPU than
   with OpenCL whenever an anisotropy was set: the CPU path computed the
   diffusion weights with a coarse approximation of the exponential.
   Edits using anisotropy may now look slightly different when exported
   without OpenCL.
+
+- Fixed workspace discovery truncating names at the first '.' in the
+  database filename (for example library-client.v2.db was shown as
+  "client"), which could open or delete the wrong database. Workspace
+  names that contain path-unsafe characters are now rejected on create.
 
 - Fixed the non-local means modes of denoise (profiled) and astrophoto
   denoise giving a different result with OpenCL than on the CPU: the
@@ -832,6 +966,39 @@ changes (where available).
 - Fixed floating-point raw files with embedded DNG gain maps coming out
   wrong with OpenCL. The gain maps of other raw files are now also
   applied the same way with OpenCL as on the CPU.
+
+- Fixed the contrast equalizer with an edge sharpness set, and the
+  soft clip of negadoctor, giving a different result on the CPU than
+  with OpenCL: the CPU path used a coarse approximation of the
+  exponential. Edits using them may now look slightly different when
+  exported without OpenCL.
+
+- Fixed rotate pixels, which straightens the sensor layout of Fujifilm
+  SuperCCD raws, using the scaling interpolator instead of the warp
+  interpolator set in the preferences, as the other rotating and
+  distorting modules do.
+
+- Fixed random dither giving a slightly different noise pattern
+  depending on the number of CPU threads. Its noise pattern changed,
+  so exports using it differ in the noise but not in its strength.
+
+- Fixed stale color temperature and illuminant color in color calibration
+  after white balance changes when using "as shot in camera".
+
+- Fixed input color profile and highlight reconstruction (opposed and
+  segmentation modes) still applying part of the white balance
+  correction when the white balance module, set to "as shot to
+  reference", was switched off on a raw image. Edits made that way
+  render with different colors.
+
+- Fixed a color cast when white balance in "as shot to reference" mode
+  was pasted from another image, or applied through a style or preset:
+  white balance applied the pasted multipliers, but input color profile
+  completed the correction with the target image's own as-shot
+  multipliers.
+
+- Fixed scale pixels output shifted by a fraction of a pixel in each
+  tile when the image was processed in tiles.
 
 ## Lua
 
@@ -907,7 +1074,9 @@ changes (where available).
 
 ### Base Support
 
-- N/A
+- Canon EOS R50 V (requires LibRaw 0.23 or newer)
+- Canon EOS R6 Mark III (requires LibRaw 0.23 or newer)
+- Canon PowerShot V1 (requires LibRaw 0.23 or newer)
 
 ### White Balance Presets
 
@@ -922,11 +1091,11 @@ changes (where available).
 - Apple ProRAW DNGs
 - CinemaDNG lossless (Blackmagic, some DJI, etc.) and lossy (Blackmagic)
 - DNG 1.7 using JPEG XL (Adobe enhanced, Samsung Expert RAW)
-- Fujifilm lossy RAFs
-- Nikon high efficiency NEFs
+- Nikon high efficiency NEFs, except from the Z6 III, Z8, Z9 and Z f
+  with LibRaw 0.23 or newer
 - Phase One other than IIQ L
 - Sony ARW 4.0/5.0 downsized lossless ("M" for full-frame, "S" for full-frame & APS-C)
-- Sony ARW 6.0 compressed and compressed (HQ)
+- Sony ARW 6.0 compressed and compressed (HQ) with LibRaw older than 0.23
 
 ### Suspended Support
 

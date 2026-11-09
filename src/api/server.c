@@ -32,9 +32,8 @@
    image, at most --max-sessions, default 3), and each change is announced to
    the other clients as a notification {"method": "event", "params": {"type",
    "imgid", "history_end", "unsaved", "client"}} with type edit, saved,
-   reset, reopened, closed, image (rating/label), markers (marker_set/_remove), library_released,
-   library_acquired, handover or (darktable's window) darkroom: the photo its
-   darkroom shows now, imgid 0 for none. --idle-exit stops the engine that many seconds after the
+   reset, reopened, closed, image (rating/label), markers (marker_set/_remove), library_released
+   or library_acquired. --idle-exit stops the engine that many seconds after the
    last client left, unless an image has unsaved changes or a job runs; once its executable was
    rebuilt, that many seconds after the last request even with clients connected (they reconnect).
 
@@ -43,13 +42,12 @@
    client last opened.
 
    this server also runs in darktable's window (darktable --api, or
-   --api-socket <path>; src/common/darktable.c): on GTK's main thread, so the
-   image shown in the darkroom is edited through the darkroom's own path
-   (its widgets and history panel follow) and changes made in the window are
-   announced to the clients. at startup the window asks an engine serving the
-   same socket to hand over (method handover: it releases the library, passes
-   its unsaved edits along and exits). unsaved edits of other images are kept
-   in <socket>.drafts.json when a server stops and restored by the next one.
+   --api-socket <path>; src/common/darktable.c), kept only so that
+   also_changed_check.py --record and picker_check.py --record can record
+   their goldens: on GTK's main thread, so the image shown in the darkroom is
+   edited through the darkroom's own path. the window serves only the methods
+   in _window_methods; everything else answers unavailable. unsaved edits are
+   kept in <socket>.drafts.json when a server stops and restored by the next one.
 
    methods:
      ping                        -> {"version", "server", "methods"}
@@ -134,7 +132,6 @@
                                     images in the library as the lighttable
                                     does; open ones saved first, reopened
      collection {offset, limit}  -> darktable's current collection, selection
-     darkroom_open {imgid}       -> the photo in darktable's darkroom (window)
      image_metadata / set_tags / set_metadata / set_location / tag_list
                                  -> tags, metadata fields and location, as
                                     darktable's tagging, metadata editor
@@ -222,11 +219,12 @@
                                     defaults and auto-apply presets again
      library_status              -> owned or released, the lock holder's pid,
                                     the open sessions
-     library_release {auto_acquire}
-                                 -> closes the sessions (unsaved changes kept
-                                    as drafts), the caches and the library,
-                                    removing the lock files: darktable's GUI
-                                    can open the library now. auto_acquire
+     library_release {save, auto_acquire}
+                                 -> closes the sessions, the caches and the
+                                    library, removing the lock files:
+                                    darktable can open the library now.
+                                    refused with unsaved edits unless save
+                                    (saves them first). auto_acquire
                                     (default true): once a process has held
                                     the library and quit, take it back as
                                     library_acquire does
@@ -257,9 +255,6 @@
                                     at that scale and replies its region;
                                     history_end renders an earlier step
                                     (before/after) without undoing
-     handover                    -> (engine) releases the library to
-                                    darktable's window, replies the unsaved
-                                    edits as drafts, and exits
      shutdown                    -> closes the session and exits (engine)
 
    edits stay in memory until save. each session keeps one pixelpipe with
@@ -360,12 +355,8 @@ typedef struct _session_t
   gboolean pipe_changed;
   gboolean dirty;                    // edits since the last open or save
   gint64 last_use;
-  // darktable's window: the darkroom's image, backed by darktable.develop;
-  // renders go through mirror, a session reloaded when the darkroom's edit
-  // changed (mirror_gen != _gui_gen)
+  // darktable's window: the darkroom's image, backed by darktable.develop
   gboolean gui;
-  struct _session_t *mirror;
-  guint64 mirror_gen;
   // headless, what modules' pickers keep between picks (pickers.c), as
   // their gui_data does in the window: module -> its state
   GHashTable *picker_state;
@@ -424,9 +415,6 @@ static int _max_sessions = 3;        // each holds a full-size raw and a pipe ca
 
 static gboolean _in_gui = FALSE;     // darktable's window serves the API
 static _session_t _gui_session;      // the darkroom's image (in_gui only)
-static guint64 _gui_gen = 1;         // bumped whenever the darkroom's edit changes
-static guint32 _gui_hash_seen = 0;   // the darkroom state clients last heard of
-static gboolean _api_editing = FALSE; // the API is changing the darkroom's edit
 
 struct _client_t;
 static void _notify(const struct _client_t *from, const char *type, const dt_imgid_t imgid);
@@ -437,34 +425,6 @@ static dt_imgid_t _darkroom_image(void)
   if(!_in_gui || !darktable.develop || !(dt_view_get_current() & DT_VIEW_DARKROOM))
     return NO_IMGID;
   return darktable.develop->image_storage.id;
-}
-
-// a cheap fingerprint of the darkroom's edit: tells darkroom changes apart
-// from those the API made itself (both raise DT_SIGNAL_DEVELOP_HISTORY_CHANGE)
-static guint32 _gui_hash(void)
-{
-  guint32 h = 2166136261u;
-#define _MIX(p, n) for(size_t _k = 0; _k < (n); _k++) h = (h ^ ((const uint8_t *)(p))[_k]) * 16777619u
-  const dt_develop_t *dev = darktable.develop;
-  _MIX(&dev->history_end, sizeof(dev->history_end));
-  for(const GList *l = dev->iop; l; l = g_list_next(l))
-  {
-    const dt_iop_module_t *m = l->data;
-    _MIX(m->op, strlen(m->op));
-    _MIX(&m->multi_priority, sizeof(m->multi_priority));
-    _MIX(&m->enabled, sizeof(m->enabled));
-    if(m->params && m->params_size > 0) _MIX(m->params, m->params_size);
-  }
-#undef _MIX
-  return h;
-}
-
-// the API changed the darkroom's edit: renders need a new mirror, and the
-// signal this raises must not be announced as a change made in the window
-static void _gui_changed_by_api(void)
-{
-  _gui_gen++;
-  _gui_hash_seen = _gui_hash();
 }
 
 static gboolean _in_history(const dt_iop_module_t *m)
@@ -546,9 +506,9 @@ static void _session_close_all(void)
 }
 
 // load an image into a new session: its history replayed up to history_end,
-// as the darkroom does, and a pipe on its full-size buffer. listed: one of
-// the open sessions (else a darkroom mirror)
-static _session_t *_session_load_ext(const dt_imgid_t imgid, const gboolean listed, gchar **err)
+// as the darkroom does, and a pipe on its full-size buffer, listed among
+// the open sessions
+static _session_t *_session_load(const dt_imgid_t imgid, gchar **err)
 {
   _session_t *s = g_new0(_session_t, 1);
   s->dev = g_new0(dt_develop_t, 1);
@@ -584,13 +544,8 @@ static _session_t *_session_load_ext(const dt_imgid_t imgid, const gboolean list
   dt_dev_pixelpipe_create_nodes(&s->pipe, s->dev);
   s->pipe_changed = TRUE;
   s->last_use = g_get_monotonic_time();
-  if(listed) _sessions = g_list_append(_sessions, s);
+  _sessions = g_list_append(_sessions, s);
   return s;
-}
-
-static _session_t *_session_load(const dt_imgid_t imgid, gchar **err)
-{
-  return _session_load_ext(imgid, TRUE, err);
 }
 
 static void _session_info(JsonBuilder *b, const _session_t *s)
@@ -1155,12 +1110,9 @@ static void _record(dt_iop_module_t *m, const gboolean enable)
   if(_cur->gui)
   {
     _gui_focus();
-    _api_editing = TRUE;
     dt_iop_gui_update(m);
     dt_dev_add_history_item(_cur->dev, m, enable);
     dt_iop_gui_set_enable_button(m);
-    _api_editing = FALSE;
-    _gui_changed_by_api();
   }
   else
   {
@@ -1289,7 +1241,6 @@ static void _run_gui_changed(dt_iop_module_t *m, const void *old, GList *names)
   const gboolean gui = _cur->gui && m->gui_changed && m->gui_data;
   const dt_api_also_changed_t port = _cur->gui ? NULL : dt_api_also_changed_find(m->op);
   if(!gui && !port) return;
-  _api_editing = TRUE;
   // the controls show the new values first, as after a slider move
   if(gui)
   {
@@ -1310,7 +1261,6 @@ static void _run_gui_changed(dt_iop_module_t *m, const void *old, GList *names)
     g_free(now);
   }
   g_free(wanted);
-  _api_editing = FALSE;
 }
 
 static gboolean _module_set(JsonObject *params, JsonBuilder *b, gchar **err)
@@ -1491,15 +1441,12 @@ static gboolean _history_end(JsonObject *params, JsonBuilder *b, gchar **err)
   if(_cur->gui)
   {
     // what darktable's history panel does on a click (libs/history.c)
-    _api_editing = TRUE;
     dt_dev_undo_start_record(_cur->dev);
     dt_dev_pop_history_items(_cur->dev, n);
     dt_dev_reorder_gui_module_list(_cur->dev);
     dt_image_update_final_size(_cur->dev->image_storage.id);
     dt_dev_pixelpipe_cache_invalidate_later(_cur->dev->preview_pipe, 0, "api history_end: ");
     dt_dev_undo_end_record(_cur->dev);
-    _api_editing = FALSE;
-    _gui_changed_by_api();
   }
   else
   {
@@ -1571,20 +1518,10 @@ static gboolean _reset(JsonBuilder *b, gchar **err)
   }
   const dt_imgid_t imgid = _cur->dev->image_storage.id;
   _session_t *s = _cur;
-  if(s->gui)
-  {
-    // reloads the darkroom's history too (history.c: current image)
-    _api_editing = TRUE;
-    dt_history_delete_on_image_ext(imgid, FALSE, TRUE);
-    _api_editing = FALSE;
-  }
-  else
-  {
-    _session_close(s);
-    dt_history_delete_on_image_ext(imgid, FALSE, TRUE);
-    if(!(s = _session_load(imgid, err))) return FALSE;
-    _cur = s;
-  }
+  _session_close(s);
+  dt_history_delete_on_image_ext(imgid, FALSE, TRUE);
+  if(!(s = _session_load(imgid, err))) return FALSE;
+  _cur = s;
   // the defaults exist only in memory until saved, as when darktable first
   // opens an image; write them so the library and thumbnails agree
   dt_dev_write_history(s->dev);
@@ -1592,7 +1529,6 @@ static gboolean _reset(JsonBuilder *b, gchar **err)
   dt_mipmap_cache_remove(imgid);
   dt_image_write_sidecar_file(imgid);
   dt_history_hash_set_mipmap(imgid);
-  if(s->gui) _gui_changed_by_api();
   _session_info(b, s);
   return TRUE;
 }
@@ -1689,8 +1625,6 @@ static gboolean _preset_apply(JsonObject *params, JsonBuilder *b, gchar **err)
     g_free(label);
     if(!found) continue;
     name = g_strdup(n);
-    if(_cur->gui)
-      break;                         // the darkroom applies it itself, below
 
     const void *op = sqlite3_column_blob(st, 1);
     const int op_len = sqlite3_column_bytes(st, 1);
@@ -1720,16 +1654,7 @@ static gboolean _preset_apply(JsonObject *params, JsonBuilder *b, gchar **err)
     *err = _ERRF(API_E_NOT_FOUND, "name", "module '%s' has no preset '%s'", m->op, want);
     return FALSE;
   }
-  if(_cur->gui)
-  {
-    _gui_focus();
-    _api_editing = TRUE;
-    dt_gui_presets_apply_preset(name, m);
-    _api_editing = FALSE;
-    _gui_changed_by_api();
-  }
-  else
-    _record(m, FALSE);
+  _record(m, FALSE);
   json_builder_set_member_name(b, "name");
   json_builder_add_string_value(b, name);
   json_builder_set_member_name(b, "enabled");
@@ -1744,24 +1669,6 @@ static gboolean _preset_apply(JsonObject *params, JsonBuilder *b, gchar **err)
 // three modules, as in the darkroom: flip (steps of 90 degrees and mirroring),
 // ashift (rotate and perspective: the angle, and its automatic crop) and crop.
 // crop's box is in fractions of its input: the image as oriented and rotated
-
-// the session whose pipe shows the open image's edit: the darkroom's image
-// renders through a mirror, reloaded from the darkroom's history (written
-// first, as its autosave does) when that changed
-static _session_t *_pipe_session(gchar **err)
-{
-  if(!_cur->gui) return _cur;
-  _session_t *gui = _cur;
-  const dt_imgid_t imgid = gui->dev->image_storage.id;
-  if(!gui->mirror || gui->mirror_gen != _gui_gen || gui->mirror->dev->image_storage.id != imgid)
-  {
-    dt_dev_write_history(gui->dev);
-    if(gui->mirror) _session_free(gui->mirror);
-    gui->mirror = _session_load_ext(imgid, FALSE, err);
-    gui->mirror_gen = _gui_gen;
-  }
-  return gui->mirror;
-}
 
 // parameters changed or modules switched: syncing the nodes is enough, and
 // the cache keeps every line whose inputs are unchanged
@@ -1903,8 +1810,7 @@ static gboolean _module_set(JsonObject *params, JsonBuilder *b, gchar **err);
 // capture_autotune: measure capture sharpening's radius and noise threshold
 // on this photo and store them, capture sharpening on, as one history item;
 // what the reset button by the radius does in the window, on any photo,
-// edited or not. in the window the measurement runs on the render mirror and
-// the result goes through the darkroom (module_set)
+// edited or not
 static gboolean _capture_autotune(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(!_cur)
@@ -1912,8 +1818,7 @@ static gboolean _capture_autotune(JsonObject *params, JsonBuilder *b, gchar **er
     *err = _ERR(API_E_NOT_OPEN, NULL, "no open session");
     return FALSE;
   }
-  _session_t *s = _pipe_session(err);
-  if(!s) return FALSE;
+  _session_t *s = _cur;
   dt_iop_module_t *m = dt_iop_get_module_by_op_priority(s->dev->iop, "demosaic", 0);
   if(!m)
   {
@@ -1966,7 +1871,7 @@ static gboolean _ashift_fit(_session_t *s, dt_iop_module_t *ashift, const _fit_c
 gboolean dt_api_ashift_fit_crop(dt_iop_module_t *ashift)
 {
   _fit_crop_t fit = NULL;
-  if(!_cur || _cur->gui || !g_module_symbol(ashift->so->module, "dt_iop_ashift_fit_crop", (gpointer *)&fit))
+  if(!_cur || !g_module_symbol(ashift->so->module, "dt_iop_ashift_fit_crop", (gpointer *)&fit))
     return FALSE;
   return _ashift_fit(_cur, ashift, fit);
 }
@@ -2084,8 +1989,7 @@ static gboolean _geometry_get(JsonBuilder *b, gchar **err)
   dt_iop_module_t *flip = dt_iop_get_module_by_op_priority(_cur->dev->iop, "flip", 0);
   dt_iop_module_t *ashift = dt_iop_get_module_by_op_priority(_cur->dev->iop, "ashift", 0);
   dt_iop_module_t *crop = dt_iop_get_module_by_op_priority(_cur->dev->iop, "crop", 0);
-  _session_t *s = _pipe_session(err);
-  if(!s) return FALSE;
+  _session_t *s = _cur;
   _pipe_sync(s);
   const dt_dev_pixelpipe_iop_t *cp = _piece(s, "crop");
 
@@ -2263,8 +2167,7 @@ static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
     if(n_autocrop) _set_param(ashift, "cropmode", autocrop);
     // what gui_changed() does in the darkroom: fit the automatic crop to the
     // new rotation. ashift's input doesn't depend on any change above
-    _session_t *s = _pipe_session(err);
-    if(!s) return FALSE;
+    _session_t *s = _cur;
     autocropped = fit && _ashift_fit(s, ashift, fit);
     _record(ashift, TRUE);
   }
@@ -2281,8 +2184,7 @@ static gboolean _geometry_set(JsonObject *params, JsonBuilder *b, gchar **err)
     {
       // the largest box of that aspect inside the given (or current) one,
       // centered on it, in pixels of crop's input
-      _session_t *s = _pipe_session(err);
-      if(!s) return FALSE;
+      _session_t *s = _cur;
       _pipe_sync(s);
       const dt_dev_pixelpipe_iop_t *cp = _piece(s, "crop");
       const double fw = cp ? cp->buf_in.width : s->pipe.processed_width;
@@ -2454,12 +2356,7 @@ static gboolean _perspective_fit(JsonObject *params, JsonBuilder *b, gchar **err
       return FALSE;
     }
 
-  _session_t *s = _pipe_session(err);
-  if(!s)
-  {
-    g_free(pts);
-    return FALSE;
-  }
+  _session_t *s = _cur;
   _pipe_sync(s);
   const dt_dev_pixelpipe_iop_t *ap = _piece(s, "ashift");
   if(!ap || ap->buf_in.width <= 0 || ap->buf_in.height <= 0)
@@ -2634,12 +2531,7 @@ static gboolean _coords(JsonObject *params, JsonBuilder *b, gchar **err)
     pts[2 * k] = json_array_get_double_element(p, 0);
     pts[2 * k + 1] = json_array_get_double_element(p, 1);
   }
-  _session_t *s = _pipe_session(err);
-  if(!s)
-  {
-    g_free(pts);
-    return FALSE;
-  }
+  _session_t *s = _cur;
   _pipe_sync(s);
   // pixel sizes of the three spaces in this full-size pipe
   const dt_dev_pixelpipe_iop_t *cp = _piece(s, "crop");
@@ -3127,34 +3019,14 @@ static dt_iop_module_t *_rt_module(gchar **err)
   return m;
 }
 
-// recording a retouch change: in the window through the darkroom's history
-// (retouch then lists the shapes in its own view, dt_masks_iop_update),
-// elsewhere as a history item carrying the forms; no_image, as _record
-static void _rt_begin(void)
-{
-  if(!_cur->gui) return;
-  _gui_focus();
-  _api_editing = TRUE;
-  dt_dev_undo_start_record(_cur->dev);
-}
-
+// recording a retouch change: a history item carrying the forms; no_image,
+// as _record
 static void _rt_end(dt_iop_module_t *m)
 {
-  if(_cur->gui)
-  {
-    dt_masks_iop_update(m);
-    dt_dev_add_masks_history_item(_cur->dev, m, TRUE);
-    dt_dev_undo_end_record(_cur->dev);
-    _api_editing = FALSE;
-    _gui_changed_by_api();
-  }
-  else
-  {
-    m->enabled = TRUE;
-    dt_dev_add_masks_history_item_ext(_cur->dev, m, TRUE, TRUE);
-    _cur->pipe_changed = TRUE;
-    _cur->dirty = TRUE;
-  }
+  m->enabled = TRUE;
+  dt_dev_add_masks_history_item_ext(_cur->dev, m, TRUE, TRUE);
+  _cur->pipe_changed = TRUE;
+  _cur->dirty = TRUE;
 }
 
 // spots in retouch, as its circle tool draws them: a circle per spot with
@@ -3289,10 +3161,6 @@ static gboolean _retouch_add(JsonObject *params, const char *algorithm, JsonBuil
   if(fresh)
   {
     const float border = dt_conf_get_float("plugins/darkroom/spots/circle_border");
-    _rt_begin();
-    // in the window, a history item of its own, so the spots don't merge into
-    // a retouch step on top of the history (as heal_spots does)
-    if(_cur->gui) dt_dev_add_new_history_item(dev, m, TRUE);
     for(guint i = 0; i < n; i++)
     {
       if(old[i]) continue;
@@ -3401,7 +3269,6 @@ static gboolean _retouch_set(JsonObject *params, JsonBuilder *b, gchar **err)
     if(s.form) dt_masks_free_form(s.form);
     return FALSE;
   }
-  _rt_begin();
   if(s.form)
   {
     // the spot keeps its form, id and source; the old points go with s.form
@@ -3479,7 +3346,6 @@ static gboolean _retouch_scales(JsonObject *params, JsonBuilder *b, gchar **err)
   if(*err) return FALSE;
   if(v[0] != *field[0] || v[1] != *field[1] || v[2] != *field[2])
   {
-    _rt_begin();
     for(int k = 0; k < 3; k++) *field[k] = v[k];
     _rt_end(m);
   }
@@ -3524,7 +3390,6 @@ static gboolean _retouch_remove(JsonObject *params, JsonBuilder *b, gchar **err)
     if(!_rt_spot(m, json_array_get_int_element(a, i), NULL, err)) return FALSE;
   dt_develop_t *dev = _cur->dev;
   dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
-  _rt_begin();
   for(guint i = 0; i < n; i++)
   {
     GList *link = NULL;
@@ -4197,12 +4062,6 @@ static gboolean _mask_attach_ext(dt_iop_module_t *m, dt_masks_form_t *form, cons
                                  JsonBuilder *b)
 {
   dt_develop_t *dev = _cur->dev;
-  if(_cur->gui)
-  {
-    _gui_focus();
-    _api_editing = TRUE;
-    dt_dev_undo_start_record(dev);
-  }
   // an existing shape (mask_attach) joins the group shared, as the
   // darkroom's "add existing shape" does; a new one is registered first
   if(g_list_find(dev->forms, form))
@@ -4248,25 +4107,10 @@ static gboolean _mask_attach_ext(dt_iop_module_t *m, dt_masks_form_t *form, cons
   // the drawn tab on, keeping parametric ranges if on
   m->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DT_API_MASK_DRAWN
                                | (m->blend_params->mask_mode & DEVELOP_MASK_CONDITIONAL);
-  if(_cur->gui)
-  {
-    dt_masks_iop_update(m);
-    // with the forms, as darktable's mask manager records a shape's combine
-    // or inverse change: dt_masks_gui_form_save_creation recorded them (and
-    // synced the darkroom's pipes) before the group entry got them above,
-    // and a module history item alone keeps that earlier copy
-    dt_dev_add_masks_history_item(dev, m, TRUE);
-    dt_dev_undo_end_record(dev);
-    _api_editing = FALSE;
-    _gui_changed_by_api();
-  }
-  else
-  {
-    m->enabled = TRUE;
-    dt_dev_add_masks_history_item_ext(dev, m, TRUE, TRUE);
-    _cur->pipe_changed = TRUE;
-    _cur->dirty = TRUE;
-  }
+  m->enabled = TRUE;
+  dt_dev_add_masks_history_item_ext(dev, m, TRUE, TRUE);
+  _cur->pipe_changed = TRUE;
+  _cur->dirty = TRUE;
   json_builder_set_member_name(b, "formid");
   json_builder_add_int_value(b, form->formid);
   json_builder_set_member_name(b, "history_end");
@@ -4941,23 +4785,13 @@ static gboolean _mask_remove(JsonObject *params, JsonBuilder *b, gchar **err)
     *err = _ERRF(API_E_NOT_FOUND, "formid", "module '%s' has no shape %d (mask_list)", m->op, formid);
     return FALSE;
   }
-  if(_cur->gui)
-  {
-    _api_editing = TRUE;
-    dt_masks_form_remove(m, grp, dt_masks_get_from_id(dev, formid));
-    _api_editing = FALSE;
-    _gui_changed_by_api();
-  }
-  else
-  {
-    free(hit->data);
-    grp->points = g_list_delete_link(grp->points, hit);
-    if(!grp->points)
-      m->blend_params->mask_mode &= ~DT_API_MASK_DRAWN;
-    dt_dev_add_masks_history_item_ext(dev, m, TRUE, TRUE);
-    _cur->pipe_changed = TRUE;
-    _cur->dirty = TRUE;
-  }
+  free(hit->data);
+  grp->points = g_list_delete_link(grp->points, hit);
+  if(!grp->points)
+    m->blend_params->mask_mode &= ~DT_API_MASK_DRAWN;
+  dt_dev_add_masks_history_item_ext(dev, m, TRUE, TRUE);
+  _cur->pipe_changed = TRUE;
+  _cur->dirty = TRUE;
   json_builder_set_member_name(b, "history_end");
   json_builder_add_int_value(b, dev->history_end);
   return TRUE;
@@ -4991,11 +4825,6 @@ static gboolean _mask_set(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   dt_iop_module_t *m = _blend_module(params, err);
   if(!m) return FALSE;
-  if(_cur->gui)
-  {
-    *err = _ERR(API_E_UNAVAILABLE, NULL, "mask_set works without darktable's window only");
-    return FALSE;
-  }
   dt_develop_t *dev = _cur->dev;
   const dt_mask_id_t formid = params ? json_object_get_int_member_with_default(params, "formid", 0) : 0;
   dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
@@ -5210,54 +5039,43 @@ static gboolean _module_add(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   dt_iop_module_t *m = NULL;
   gboolean shapes_copied = TRUE, shapes = FALSE;
-  if(_cur->gui)
+  // the base in the history first, so the instances' order is recorded
+  dt_dev_add_history_item_ext(dev, base, FALSE, TRUE);
+  m = dt_dev_module_duplicate(dev, base);
+  if(m)
   {
-    _api_editing = TRUE;
-    m = dt_iop_gui_duplicate(base, copy);
-    if(m && key) dt_iop_update_multi_name(m, key, TRUE, TRUE, TRUE);
-    _api_editing = FALSE;
-    _gui_changed_by_api();
-  }
-  else
-  {
-    // the base in the history first, so the instances' order is recorded
-    dt_dev_add_history_item_ext(dev, base, FALSE, TRUE);
-    m = dt_dev_module_duplicate(dev, base);
-    if(m)
+    dt_iop_reload_defaults(m);
+    if(key)
     {
-      dt_iop_reload_defaults(m);
-      if(key)
+      g_strlcpy(m->multi_name, key, sizeof(m->multi_name));
+      m->multi_name_hand_edited = TRUE;
+    }
+    if(copy)
+    {
+      memcpy(m->params, base->params, m->params_size);
+      if(m->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
       {
-        g_strlcpy(m->multi_name, key, sizeof(m->multi_name));
-        m->multi_name_hand_edited = TRUE;
-      }
-      if(copy)
-      {
-        memcpy(m->params, base->params, m->params_size);
-        if(m->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
+        dt_api_commit_blend_params(m, base->blend_params);
+        // its own group with the base's shapes, as the darkroom's copy
+        if(dt_is_valid_maskid(base->blend_params->mask_id))
         {
-          dt_api_commit_blend_params(m, base->blend_params);
-          // its own group with the base's shapes, as the darkroom's copy
-          if(dt_is_valid_maskid(base->blend_params->mask_id))
+          m->blend_params->mask_id = NO_MASKID;
+          shapes = _masks_use_same_as(dev, m, base);
+          if(!shapes)
           {
-            m->blend_params->mask_id = NO_MASKID;
-            shapes = _masks_use_same_as(dev, m, base);
-            if(!shapes)
-            {
-              m->blend_params->mask_mode &= ~DT_API_MASK_DRAWN;
-              shapes_copied = FALSE;
-            }
+            m->blend_params->mask_mode &= ~DT_API_MASK_DRAWN;
+            shapes_copied = FALSE;
           }
         }
       }
-      m->enabled = TRUE;
-      if(shapes)
-        dt_dev_add_masks_history_item_ext(dev, m, TRUE, TRUE);
-      else
-        dt_dev_add_history_item_ext(dev, m, TRUE, TRUE);
-      _pipe_rebuild(_cur);
-      _cur->dirty = TRUE;
     }
+    m->enabled = TRUE;
+    if(shapes)
+      dt_dev_add_masks_history_item_ext(dev, m, TRUE, TRUE);
+    else
+      dt_dev_add_history_item_ext(dev, m, TRUE, TRUE);
+    _pipe_rebuild(_cur);
+    _cur->dirty = TRUE;
   }
   if(!m)
   {
@@ -5301,60 +5119,50 @@ static gboolean _module_remove(JsonObject *params, JsonBuilder *b, gchar **err)
                            m->op, m->multi_priority);
     return FALSE;
   }
-  if(_cur->gui)
+  const gboolean is_zero = m->multi_priority == 0;
+  // what dt_dev_module_remove does for the darkroom (gui_attached)
+  int k = 0;
+  for(GList *l = dev->history; l;)
   {
-    _api_editing = TRUE;
-    dt_iop_gui_delete(m);
-    _api_editing = FALSE;
-    _gui_changed_by_api();
+    GList *n = g_list_next(l);
+    dt_dev_history_item_t *hist = l->data;
+    if(hist->module == m)
+    {
+      if(k < dev->history_end) dev->history_end--;
+      dt_dev_free_history_item(hist);
+      dev->history = g_list_delete_link(dev->history, l);
+    }
+    else
+      k++;
+    l = n;
   }
-  else
+  dt_dev_module_remove(dev, m);
+  // the pipe order list names instances by operation and number: drop
+  // the removed one's entry, or a later instance with its number gets two
+  dt_ioppr_resync_iop_list(dev);
+  if(is_zero)
   {
-    const gboolean is_zero = m->multi_priority == 0;
-    // what dt_dev_module_remove does for the darkroom (gui_attached)
-    int k = 0;
-    for(GList *l = dev->history; l;)
+    dt_iop_module_t *first = NULL;
+    for(GList *h = dev->history; h && !first; h = g_list_next(h))
     {
-      GList *n = g_list_next(l);
-      dt_dev_history_item_t *hist = l->data;
-      if(hist->module == m)
-      {
-        if(k < dev->history_end) dev->history_end--;
-        dt_dev_free_history_item(hist);
-        dev->history = g_list_delete_link(dev->history, l);
-      }
-      else
-        k++;
-      l = n;
+      dt_dev_history_item_t *hist = h->data;
+      if(hist->module->instance == m->instance) first = hist->module;
     }
-    dt_dev_module_remove(dev, m);
-    // the pipe order list names instances by operation and number: drop
-    // the removed one's entry, or a later instance with its number gets two
-    dt_ioppr_resync_iop_list(dev);
-    if(is_zero)
+    if(!first) first = next;
+    // its entry in the order list follows the new number
+    GList *e = dt_ioppr_get_iop_order_link(dev->iop_order_list, first->op, first->multi_priority);
+    if(e) ((dt_iop_order_entry_t *)e->data)->instance = 0;
+    dt_iop_update_multi_priority(first, 0);
+    for(GList *h = dev->history; h; h = g_list_next(h))
     {
-      dt_iop_module_t *first = NULL;
-      for(GList *h = dev->history; h && !first; h = g_list_next(h))
-      {
-        dt_dev_history_item_t *hist = h->data;
-        if(hist->module->instance == m->instance) first = hist->module;
-      }
-      if(!first) first = next;
-      // its entry in the order list follows the new number
-      GList *e = dt_ioppr_get_iop_order_link(dev->iop_order_list, first->op, first->multi_priority);
-      if(e) ((dt_iop_order_entry_t *)e->data)->instance = 0;
-      dt_iop_update_multi_priority(first, 0);
-      for(GList *h = dev->history; h; h = g_list_next(h))
-      {
-        dt_dev_history_item_t *hist = h->data;
-        if(hist->module == first) hist->multi_priority = 0;
-      }
+      dt_dev_history_item_t *hist = h->data;
+      if(hist->module == first) hist->multi_priority = 0;
     }
-    // kept, as the darkroom keeps it: the pipe's nodes still point at it
-    dev->alliop = g_list_append(dev->alliop, m);
-    _pipe_rebuild(_cur);
-    _cur->dirty = TRUE;
   }
+  // kept, as the darkroom keeps it: the pipe's nodes still point at it
+  dev->alliop = g_list_append(dev->alliop, m);
+  _pipe_rebuild(_cur);
+  _cur->dirty = TRUE;
   json_builder_set_member_name(b, "history_end");
   json_builder_add_int_value(b, dev->history_end);
   json_builder_set_member_name(b, "instances");
@@ -5389,22 +5197,11 @@ static gboolean _module_rename(JsonObject *params, JsonBuilder *b, gchar **err)
                            sizeof(m->multi_name) - 1);
     return FALSE;
   }
-  if(_cur->gui)
-  {
-    _gui_focus();
-    _api_editing = TRUE;
-    dt_iop_update_multi_name(m, name, *name != '\0', TRUE, TRUE);
-    _api_editing = FALSE;
-    _gui_changed_by_api();
-  }
-  else
-  {
-    gchar *n = g_strstrip(g_strdup(name));
-    g_strlcpy(m->multi_name, n, sizeof(m->multi_name));
-    m->multi_name_hand_edited = *n != '\0';
-    g_free(n);
-    _record(m, TRUE);
-  }
+  gchar *n = g_strstrip(g_strdup(name));
+  g_strlcpy(m->multi_name, n, sizeof(m->multi_name));
+  m->multi_name_hand_edited = *n != '\0';
+  g_free(n);
+  _record(m, TRUE);
   _add_instance(b, m);
   json_builder_set_member_name(b, "history_end");
   json_builder_add_int_value(b, _cur->dev->history_end);
@@ -5425,42 +5222,20 @@ static gboolean _history_compress(JsonObject *params, JsonBuilder *b, gchar **er
   const gboolean truncate = params ? json_object_get_boolean_member_with_default(params, "truncate", FALSE) : FALSE;
   const dt_imgid_t imgid = _cur->dev->image_storage.id;
   const int before = g_list_length(_cur->dev->history);
-  if(_cur->gui)
-  {
-    dt_develop_t *dev = _cur->dev;
-    _api_editing = TRUE;
-    dt_dev_undo_start_record(dev);
-    dt_dev_write_history(dev);
-    if(truncate) dt_history_truncate_on_image(imgid, dev->history_end);
-    else dt_history_compress_on_image(imgid);
-    dt_dev_reload_history_items(dev);
-    dt_dev_write_history(dev);
-    dt_image_synch_xmp(imgid);
-    dev->history_end = g_list_length(dev->history);
-    dt_image_set_history_end(imgid, dev->history_end);
-    dt_dev_reload_history_items(dev);
-    dt_dev_undo_end_record(dev);
-    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_DEVELOP_HISTORY_INVALIDATED);
-    _api_editing = FALSE;
-    _gui_changed_by_api();
-  }
-  else
-  {
-    _session_t *s = _cur;
-    _save_session(s);
-    if(truncate) dt_history_truncate_on_image(imgid, s->dev->history_end);
-    else dt_history_compress_on_image(imgid);
-    // reload, and write back once so the items are numbered without gaps
-    _session_close(s);
-    if(!(s = _session_load(imgid, err))) return FALSE;
-    _cur = s;
-    s->dev->history_end = g_list_length(s->dev->history);
-    dt_dev_pop_history_items_ext(s->dev, s->dev->history_end);
-    dt_dev_write_history(s->dev);
-    dt_image_set_history_end(imgid, s->dev->history_end);
-    dt_image_synch_xmp(imgid);
-    s->pipe_changed = TRUE;
-  }
+  _session_t *s = _cur;
+  _save_session(s);
+  if(truncate) dt_history_truncate_on_image(imgid, s->dev->history_end);
+  else dt_history_compress_on_image(imgid);
+  // reload, and write back once so the items are numbered without gaps
+  _session_close(s);
+  if(!(s = _session_load(imgid, err))) return FALSE;
+  _cur = s;
+  s->dev->history_end = g_list_length(s->dev->history);
+  dt_dev_pop_history_items_ext(s->dev, s->dev->history_end);
+  dt_dev_write_history(s->dev);
+  dt_image_set_history_end(imgid, s->dev->history_end);
+  dt_image_synch_xmp(imgid);
+  s->pipe_changed = TRUE;
   json_builder_set_member_name(b, "items_before");
   json_builder_add_int_value(b, before);
   json_builder_set_member_name(b, "saved");
@@ -5515,23 +5290,9 @@ static gboolean _module_move(JsonObject *params, JsonBuilder *b, gchar **err)
                            " that must stay in order)", m->op, after ? "after" : "before", target->op);
     return FALSE;
   }
-  if(_cur->gui)
-  {
-    _gui_focus();
-    _api_editing = TRUE;
-    dt_dev_reorder_gui_module_list(dev);
-    dt_dev_add_history_item(dev, m, TRUE);
-    dt_dev_pixelpipe_rebuild(dev);
-    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_DEVELOP_MODULE_MOVED);
-    _api_editing = FALSE;
-    _gui_changed_by_api();
-  }
-  else
-  {
-    dt_dev_add_history_item_ext(dev, m, TRUE, TRUE);
-    _pipe_rebuild(_cur);
-    _cur->dirty = TRUE;
-  }
+  dt_dev_add_history_item_ext(dev, m, TRUE, TRUE);
+  _pipe_rebuild(_cur);
+  _cur->dirty = TRUE;
   _add_instance(b, m);
   json_builder_set_member_name(b, "history_end");
   json_builder_add_int_value(b, dev->history_end);
@@ -5785,9 +5546,7 @@ static gboolean _image_duplicate(JsonObject *params, const dt_imgid_t current, g
     }
   }
   _session_t *s = _session_find(imgid);
-  if(s && s->gui)
-    dt_dev_write_history(s->dev);
-  else if(s && s->dirty && !virgin)
+  if(s && s->dirty && !virgin)
   {
     if(!save)
     {
@@ -5814,7 +5573,6 @@ static gboolean _image_duplicate(JsonObject *params, const dt_imgid_t current, g
     dt_metadata_set(newid, "Xmp.darktable.version_name", key, FALSE);
     dt_image_synch_xmp(newid);
   }
-  if(_in_gui) DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_FILMROLLS_CHANGED);
   JsonObject *q = json_object_new();
   json_object_set_int_member(q, "imgid", newid);
   const gboolean ok = _image_info(q, b, err);
@@ -5828,7 +5586,7 @@ static gboolean _image_duplicate(JsonObject *params, const dt_imgid_t current, g
 // remove images from the library, as the lighttable's "remove" does
 // (control_jobs.c, _control_remove_images_job_run): the files stay, other
 // versions of the same file keep their own edits. all or nothing: refused
-// for the darkroom's photo, unsaved changes, a local copy, or an image used
+// for unsaved changes, a local copy, or an image used
 // as an overlay. open sessions of the removed images are closed. returns
 // the removed ids in *removed
 static gboolean _image_remove(JsonObject *params, GList **removed, JsonBuilder *b, gchar **err)
@@ -5846,8 +5604,6 @@ static gboolean _image_remove(JsonObject *params, GList **removed, JsonBuilder *
     const dt_imgid_t imgid = json_array_get_int_element(ids, i);
     if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
       *err = _ERRF(API_E_NOT_FOUND, "imgids", "no image with id %d", imgid);
-    else if(imgid == _darkroom_image())
-      *err = _ERRF(API_E_BUSY, "imgids", "image %d is open in darktable's darkroom: open another photo there first", imgid);
     else
     {
       const _session_t *s = _session_find_listed(imgid);
@@ -5887,13 +5643,6 @@ static gboolean _image_remove(JsonObject *params, GList **removed, JsonBuilder *
     dt_image_synch_all_xmp(l->data);
   g_list_free_full(paths, g_free);
   dt_film_remove_empty();
-  if(_in_gui)
-  {
-    dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
-                               DT_COLLECTION_PROP_UNDEF, g_list_copy(*removed));
-    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_FILMROLLS_CHANGED);
-    dt_control_queue_redraw_center();
-  }
   json_builder_set_member_name(b, "removed");
   json_builder_begin_array(b);
   for(GList *l = *removed; l; l = g_list_next(l))
@@ -6005,7 +5754,7 @@ static GArray *_targets(JsonObject *params, const dt_imgid_t current, const dt_i
       *err = _ERRF(API_E_NOT_FOUND, "imgids", "no image with id %d", id);
     else if(id == source)
       *err = _ERRF(API_E_PARAMS, "imgids", "image %d is the source", id);
-    else if(s && !s->gui && s->dirty && !save)
+    else if(s && s->dirty && !save)
       *err = _ERRF(API_E_UNSAVED, NULL, "image %d has unsaved changes, which this saves: save first, or pass save: true", id);
   }
   if(*err)
@@ -6016,11 +5765,10 @@ static GArray *_targets(JsonObject *params, const dt_imgid_t current, const dt_i
   return ids;
 }
 
-typedef gboolean (*_library_edit_t)(const dt_imgid_t imgid, const gboolean darkroom, gpointer data);
+typedef gboolean (*_library_edit_t)(const dt_imgid_t imgid, gpointer data);
 
-// runs a change of saved edits on each target: the darkroom's image through
-// the darkroom (edit is told so), a session here saved before and reopened
-// after. changed lists the images done, for their events
+// runs a change of saved edits on each target: a session here is saved
+// before and reopened after. changed lists the images done, for their events
 static gboolean _edit_saved(GArray *ids, _library_edit_t edit, gpointer data, GArray *changed,
                             JsonBuilder *b, gchar **err)
 {
@@ -6031,22 +5779,14 @@ static gboolean _edit_saved(GArray *ids, _library_edit_t edit, gpointer data, GA
     const dt_imgid_t id = g_array_index(ids, dt_imgid_t, i);
     _session_t *s = _session_find(id);
     gboolean saved = FALSE;
-    if(s && !s->gui && s->dirty)
+    if(s && s->dirty)
     {
       _save_session(s);
       saved = TRUE;
     }
-    if(s && s->gui)
-    {
-      _api_editing = TRUE;
-      edit(id, TRUE, data);
-      _api_editing = FALSE;
-      _gui_changed_by_api();
-    }
-    else
-      edit(id, FALSE, data);
+    edit(id, data);
     gboolean reopened = FALSE;
-    if(s && !s->gui)
+    if(s)
     {
       _session_close(s);
       reopened = _session_load(id, err) != NULL;
@@ -6058,7 +5798,7 @@ static gboolean _edit_saved(GArray *ids, _library_edit_t edit, gpointer data, GA
     json_builder_set_member_name(b, "saved_first");
     json_builder_add_boolean_value(b, saved);
     json_builder_set_member_name(b, "reopened");
-    json_builder_add_boolean_value(b, reopened || (s && s->gui));
+    json_builder_add_boolean_value(b, reopened);
     json_builder_end_object(b);
     if(*err) break;
   }
@@ -6116,12 +5856,9 @@ static gboolean _style_list(JsonObject *params, JsonBuilder *b, gchar **err)
   return TRUE;
 }
 
-static gboolean _style_apply_one(const dt_imgid_t imgid, const gboolean darkroom, gpointer data)
+static gboolean _style_apply_one(const dt_imgid_t imgid, gpointer data)
 {
-  if(darkroom)
-    dt_styles_apply_to_dev(data, imgid);
-  else
-    dt_styles_apply_to_image(data, FALSE, FALSE, imgid);
+  dt_styles_apply_to_image(data, FALSE, FALSE, imgid);
   return TRUE;
 }
 
@@ -6166,9 +5903,7 @@ static gboolean _style_create(JsonObject *params, const dt_imgid_t current, Json
     return FALSE;
   }
   const _session_t *s = _session_find(imgid);
-  if(s && s->gui)
-    dt_dev_write_history(s->dev);
-  else if(s && s->dirty)
+  if(s && s->dirty)
   {
     *err = _ERRF(API_E_UNSAVED, NULL, "image %d has unsaved changes and a style takes the saved edit: save first", imgid);
     return FALSE;
@@ -6232,11 +5967,9 @@ typedef struct _paste_t
   GList *nums;
 } _paste_t;
 
-static gboolean _paste_one(const dt_imgid_t imgid, const gboolean darkroom, gpointer data)
+static gboolean _paste_one(const dt_imgid_t imgid, gpointer data)
 {
   const _paste_t *p = data;
-  // writes the darkroom's history first and reloads it after when imgid
-  // is the darkroom's image
   return dt_history_copy_and_paste_on_image(p->from, imgid, p->merge, p->nums, p->order, p->full, TRUE);
 }
 
@@ -6253,7 +5986,7 @@ static gboolean _history_paste(JsonObject *params, const dt_imgid_t current, GAr
     return FALSE;
   }
   const _session_t *s = _session_find(from);
-  if(s && !s->gui && s->dirty)
+  if(s && s->dirty)
   {
     *err = _ERRF(API_E_UNSAVED, NULL, "image %d has unsaved changes and pasting takes the saved edit: save first", from);
     return FALSE;
@@ -6283,7 +6016,6 @@ static gboolean _history_paste(JsonObject *params, const dt_imgid_t current, GAr
     g_list_free(p.nums);
     return FALSE;
   }
-  if(s && s->gui) dt_dev_write_history(s->dev);
   const gboolean ok = _edit_saved(ids, _paste_one, &p, changed, b, err);
   g_array_free(ids, TRUE);
   g_list_free(p.nums);
@@ -6510,12 +6242,10 @@ static _export_t *_export_prepare(JsonObject *params, const dt_imgid_t current, 
   }
 
   // the export reads the saved history: unsaved changes are saved first on
-  // request, else refused. the darkroom's edit is saved as its autosave does
+  // request, else refused
   _session_t *s = _session_find(imgid);
   gboolean saved = FALSE;
-  if(s && s->gui)
-    dt_dev_write_history(s->dev);
-  else if(s && s->dirty)
+  if(s && s->dirty)
   {
     if(!save)
     {
@@ -6832,11 +6562,6 @@ static gboolean _library_status(JsonBuilder *b, const dt_imgid_t current, gchar 
     json_builder_add_int_value(b, pid);
     json_builder_set_member_name(b, "auto_acquire");
     json_builder_add_boolean_value(b, _acquire_watch != 0);
-    json_builder_set_member_name(b, "drafts");
-    json_builder_begin_array(b);
-    for(GList *l = _drafts; l; l = g_list_next(l))
-      json_builder_add_int_value(b, ((_draft_t *)l->data)->imgid);
-    json_builder_end_array(b);
   }
   else
   {
@@ -6863,7 +6588,7 @@ static gboolean _library_status(JsonBuilder *b, const dt_imgid_t current, gchar 
   return TRUE;
 }
 
-static gboolean _library_release(JsonBuilder *b, gchar **err)
+static gboolean _library_release(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   if(_released)
   {
@@ -6871,7 +6596,36 @@ static gboolean _library_release(JsonBuilder *b, gchar **err)
     return FALSE;
   }
   const gint64 t0 = g_get_monotonic_time();
-  _drafts_free();
+  // a program that gets the library next reads what is saved: unsaved edits
+  // are saved here on request, or the release is refused
+  const gboolean save = params && json_object_get_boolean_member_with_default(params, "save", FALSE);
+  if(!save)
+  {
+    GString *dirty = g_string_new(NULL);
+    for(GList *l = _sessions; l; l = g_list_next(l))
+    {
+      const _session_t *s = l->data;
+      if(s->dirty) g_string_append_printf(dirty, "%s%d", dirty->len ? ", " : "", s->dev->image_storage.id);
+    }
+    if(dirty->len)
+    {
+      *err = _ERRF(API_E_UNSAVED, NULL, "unsaved changes in image(s) %s: save or discard them,"
+                   " or library_release {save: true}", dirty->str);
+      g_string_free(dirty, TRUE);
+      return FALSE;
+    }
+    g_string_free(dirty, TRUE);
+  }
+  json_builder_set_member_name(b, "saved");
+  json_builder_begin_array(b);
+  for(GList *l = _sessions; l; l = g_list_next(l))
+  {
+    _session_t *s = l->data;
+    if(!s->dirty) continue;
+    _save_session(s);
+    json_builder_add_int_value(b, s->dev->image_storage.id);
+  }
+  json_builder_end_array(b);
   json_builder_set_member_name(b, "closed");
   json_builder_begin_array(b);
   for(GList *l = _sessions; l; l = g_list_next(l))
@@ -6879,7 +6633,6 @@ static gboolean _library_release(JsonBuilder *b, gchar **err)
     const _session_t *s = l->data;
     const dt_imgid_t imgid = s->dev->image_storage.id;
     json_builder_add_int_value(b, imgid);
-    if(s->dirty) _draft_add(s);
   }
   json_builder_end_array(b);
   _session_close_all();
@@ -6897,8 +6650,6 @@ static gboolean _library_release(JsonBuilder *b, gchar **err)
 
   json_builder_set_member_name(b, "state");
   json_builder_add_string_value(b, "released");
-  json_builder_set_member_name(b, "drafts_kept");
-  json_builder_add_int_value(b, g_list_length(_drafts));
   json_builder_set_member_name(b, "ms");
   json_builder_add_int_value(b, (g_get_monotonic_time() - t0) / 1000);
   return TRUE;
@@ -6994,7 +6745,6 @@ static gboolean _library_acquire(JsonBuilder *b, gchar **err)
 
   json_builder_set_member_name(b, "state");
   json_builder_add_string_value(b, "owned");
-  _restore_drafts(b);
   json_builder_set_member_name(b, "ms");
   json_builder_add_int_value(b, (g_get_monotonic_time() - t0) / 1000);
   return TRUE;
@@ -7054,10 +6804,8 @@ static void _acquire_watch_start(void)
   _acquire_watch = g_timeout_add_seconds(2, _acquire_watch_cb, NULL);
 }
 
-// ---- handing the library over to darktable's window ----------------------
-// darktable started with --api asks a running engine to step aside: the
-// engine releases the library, sends its drafts along and exits; darktable
-// restores the drafts once its own startup is done (dt_api_start)
+// ---- drafts as JSON --------------------------------------------------------
+// <socket>.drafts.json, written when a server stops and read at the next start
 
 static void _drafts_to_json(JsonBuilder *b)
 {
@@ -7126,22 +6874,6 @@ static void _drafts_from_json(JsonArray *a)
     }
     _drafts = g_list_append(_drafts, d);
   }
-}
-
-static gboolean _handover(JsonBuilder *b, gchar **err)
-{
-  if(!_released)
-  {
-    JsonBuilder *rb = json_builder_new();
-    json_builder_begin_object(rb);
-    const gboolean ok = _library_release(rb, err);
-    json_builder_end_object(rb);
-    g_object_unref(rb);
-    if(!ok) return FALSE;
-  }
-  _drafts_to_json(b);
-  _drafts_free();
-  return TRUE;
 }
 
 // ---- browsing the library -------------------------------------------------
@@ -7387,8 +7119,8 @@ static gboolean _collection(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   const int offset = params ? json_object_get_int_member_with_default(params, "offset", 0) : 0;
   const int limit = params ? json_object_get_int_member_with_default(params, "limit", 200) : 200;
-  if(!_in_gui) dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
-                                          DT_COLLECTION_PROP_UNDEF, NULL);
+  dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
+                             DT_COLLECTION_PROP_UNDEF, NULL);
   sqlite3_stmt *st;
   int total = 0;
   sqlite3_prepare_v2(dt_database_get(darktable.db), "SELECT COUNT(*) FROM memory.collected_images",
@@ -7440,100 +7172,6 @@ static gboolean _collection(JsonObject *params, JsonBuilder *b, gchar **err)
   while(sqlite3_step(st) == SQLITE_ROW) json_builder_add_int_value(b, sqlite3_column_int(st, 0));
   sqlite3_finalize(st);
   json_builder_end_array(b);
-  return TRUE;
-}
-
-// opens a photo in darktable's darkroom (its window only), as clicking it
-// in the filmstrip does when the darkroom shows, else as double-clicking
-// it in the lighttable. the switch completes on the main loop: the client
-// gets a "darkroom" event (library_status: darkroom_imgid)
-static gboolean _darkroom_open(JsonObject *params, JsonBuilder *b, gchar **err)
-{
-  const dt_imgid_t imgid = params ? json_object_get_int_member_with_default(params, "imgid", NO_IMGID) : NO_IMGID;
-  if(!_in_gui)
-  {
-    *err = _ERR(API_E_UNAVAILABLE, NULL, "darkroom_open needs darktable's window serving the API");
-    return FALSE;
-  }
-  if(!dt_is_valid_imgid(imgid) || !_image_exists(imgid))
-  {
-    *err = _ERRF(API_E_NOT_FOUND, "imgid", "no image with id %d", imgid);
-    return FALSE;
-  }
-  if(_darkroom_image() == imgid)
-    ;
-  else if(dt_view_get_current() == DT_VIEW_DARKROOM)
-  {
-    // the darkroom writes the edit it leaves (_dev_change_image)
-    dt_selection_deselect(darktable.selection, darktable.develop->image_storage.id);
-    dt_selection_select(darktable.selection, imgid);
-    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_VIEWMANAGER_THUMBTABLE_ACTIVATE, imgid);
-  }
-  else
-  {
-    // the darkroom opens the image acted on: hovered, else selected
-    // (dt_act_on_get_main_image)
-    dt_selection_select_single(darktable.selection, imgid);
-    dt_control_set_mouse_over_id(imgid);
-    dt_ctl_switch_mode_to("darkroom");
-  }
-  json_builder_set_member_name(b, "imgid");
-  json_builder_add_int_value(b, imgid);
-  json_builder_set_member_name(b, "darkroom_imgid");
-  json_builder_add_int_value(b, _darkroom_image());
-  return TRUE;
-}
-
-// a snapshot in the darkroom's snapshots module of its image at a history
-// step, shown split against the edit as clicking the snapshot does: the
-// window's own before/after
-static gboolean _darkroom_snapshot(JsonObject *params, JsonBuilder *b, gchar **err)
-{
-  const dt_imgid_t imgid = _darkroom_image();
-  if(!dt_is_valid_imgid(imgid))
-  {
-    *err = _ERR(API_E_UNAVAILABLE, NULL, "darkroom_snapshot needs darktable's window serving the API, with a photo in the darkroom");
-    return FALSE;
-  }
-  if(params && json_object_has_member(params, "imgid") && json_object_get_int_member(params, "imgid") != imgid)
-  {
-    *err = _ERRF(API_E_UNAVAILABLE, "imgid", "the darkroom has image %d open", imgid);
-    return FALSE;
-  }
-  const int items = g_list_length(darktable.develop->history);
-  const int end = params ? json_object_get_int_member_with_default(params, "history_end", 0) : 0;
-  if(end < 0 || end > items)
-  {
-    *err = _ERRF(API_E_PARAMS, "history_end", "history_end must be 0..%d", items);
-    return FALSE;
-  }
-  int (*take_at)(dt_lib_module_t *, int, gboolean) = NULL;
-  dt_lib_module_t *lib = NULL;
-  for(GList *l = darktable.lib->plugins; l; l = g_list_next(l))
-  {
-    dt_lib_module_t *m = l->data;
-    if(!g_strcmp0(m->plugin_name, "snapshots")) lib = m;
-  }
-  if(!lib || !lib->module || !g_module_symbol(lib->module, "dt_lib_snapshots_take_at", (gpointer *)&take_at))
-  {
-    *err = _ERR(API_E_UNAVAILABLE, NULL, "this darktable's snapshots module can't take a snapshot for the API");
-    return FALSE;
-  }
-  const gboolean show = params ? json_object_get_boolean_member_with_default(params, "show", TRUE) : TRUE;
-  const int slot = take_at(lib, end, show);
-  if(slot < 0)
-  {
-    *err = _ERR(API_E_BUSY, NULL, "every snapshot slot is in use: remove one in the snapshots module first");
-    return FALSE;
-  }
-  json_builder_set_member_name(b, "imgid");
-  json_builder_add_int_value(b, imgid);
-  json_builder_set_member_name(b, "history_end");
-  json_builder_add_int_value(b, end);
-  json_builder_set_member_name(b, "slot");
-  json_builder_add_int_value(b, slot);
-  json_builder_set_member_name(b, "shown");
-  json_builder_add_boolean_value(b, show);
   return TRUE;
 }
 
@@ -7594,8 +7232,6 @@ static gboolean _thumbnail(JsonObject *params, JsonBuilder *b, gchar **err)
   return ok;
 }
 
-static void _marks_note(const dt_imgid_t imgid);
-
 static gboolean _set_rating(JsonObject *params, JsonBuilder *b, gchar **err)
 {
   const dt_imgid_t imgid = params ? json_object_get_int_member_with_default(params, "imgid", -1) : -1;
@@ -7622,12 +7258,6 @@ static gboolean _set_rating(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   // as the lighttable: rejecting keeps the stars, a rating clears the reject
   dt_ratings_apply_on_image(imgid, rating, FALSE, FALSE, FALSE);
-  _marks_note(imgid);
-  // darktable's window redraws the thumbnail and filters again, as after
-  // its own rating shortcut (ratings.c, _action_process_rating)
-  if(_in_gui)
-    dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
-                               DT_COLLECTION_PROP_RATING_RANGE, g_list_prepend(NULL, GINT_TO_POINTER(imgid)));
   return _image_info(params, b, err);
 }
 
@@ -7651,11 +7281,6 @@ static gboolean _set_label(JsonObject *params, JsonBuilder *b, gchar **err)
   else
     dt_colorlabels_remove_label(imgid, label);
   dt_image_write_sidecar_file(imgid);
-  _marks_note(imgid);
-  // as after darktable's own color label shortcut (colorlabels.c)
-  if(_in_gui)
-    dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
-                               DT_COLLECTION_PROP_COLORLABEL, g_list_prepend(NULL, GINT_TO_POINTER(imgid)));
   return _image_info(params, b, err);
 }
 
@@ -8043,7 +7668,6 @@ static gboolean _marker_remove(JsonObject *params, JsonBuilder *b, gchar **err)
 
 static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err);
 
-// the darkroom's image renders through its mirror (_pipe_session)
 // ---- tags, metadata, location -----------------------------------------------
 // with darktable's own code, as its tagging, metadata editor and geotagging
 // modules: written to the library and the sidecar; the window's panels are
@@ -8196,7 +7820,6 @@ static gboolean _set_tags(JsonObject *params, const dt_imgid_t current, JsonBuil
     if(dt_tag_exists(json_array_get_string_element(detach, i), &tagid))
       dt_tag_detach_images(tagid, imgs, FALSE);
   }
-  if(_in_gui) DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_TAG_CHANGED);
   _imgs_changed(imgs, b);
   g_list_free(imgs);
   return TRUE;
@@ -8229,9 +7852,6 @@ static gboolean _group(JsonObject *params, JsonBuilder *b, gchar **err)
   for(GList *l = imgs; l; l = g_list_next(l))
     if(GPOINTER_TO_INT(l->data) != leader) dt_grouping_add_to_group(leader, GPOINTER_TO_INT(l->data));
   const dt_imgid_t group_id = dt_grouping_change_representative(leader);
-  if(_in_gui)
-    dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
-                               DT_COLLECTION_PROP_UNDEF, NULL);
   json_builder_set_member_name(b, "group_id");
   json_builder_add_int_value(b, group_id);
   g_list_free(imgs);
@@ -8268,7 +7888,6 @@ static gboolean _set_metadata(JsonObject *params, const dt_imgid_t current, Json
       dt_metadata_set(GPOINTER_TO_INT(i->data), _metadata_field(l->data)->tagname,
                       json_object_get_string_member(values, l->data), FALSE);
   g_list_free(names);
-  if(_in_gui) DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_METADATA_CHANGED, DT_METADATA_SIGNAL_NEW_VALUE);
   _imgs_changed(imgs, b);
   g_list_free(imgs);
   return TRUE;
@@ -8299,7 +7918,6 @@ static gboolean _set_location(JsonObject *params, const dt_imgid_t current, Json
   GList *imgs = _imgids(params, current, err);
   if(!imgs) return FALSE;
   dt_image_set_locations(imgs, &loc, FALSE);
-  if(_in_gui) DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_GEOTAG_CHANGED, g_list_copy(imgs), 0);
   _imgs_changed(imgs, b);
   g_list_free(imgs);
   return TRUE;
@@ -8339,8 +7957,7 @@ static gboolean _tag_list(JsonObject *params, JsonBuilder *b, gchar **err)
 
 // ---- alternatives -------------------------------------------------------------
 // render_variants: each variant's steps applied to the edit, rendered, then
-// taken back, so nothing of them stays in the history. in darktable's window
-// they run on the render mirror, never on the darkroom's own edit
+// taken back, so nothing of them stays in the history
 
 // edit methods a variant may use: none of them adds or removes a module
 // instance or moves one, so restoring the history restores the edit
@@ -8400,10 +8017,7 @@ static gboolean _render_variants(JsonObject *params, JsonBuilder *b, gchar **err
     }
   }
 
-  _session_t *owner = _cur;
-  _session_t *s = owner->gui ? _pipe_session(err) : owner;
-  if(!s) return FALSE;
-  _cur = s;
+  _session_t *s = _cur;
   dt_develop_t *dev = s->dev;
   GList *history = dt_history_duplicate(dev->history);
   GList *forms = dt_masks_dup_forms_deep(dev->forms, NULL);
@@ -8461,8 +8075,7 @@ static gboolean _render_variants(JsonObject *params, JsonBuilder *b, gchar **err
 
     // take the variant back: the history as it was, replayed. history_end
     // first, so the replay doesn't swap the shapes itself: that parks the
-    // old ones on darktable.develop (dt_masks_replace_current_forms), which
-    // in darktable's window is the darkroom's edit
+    // old ones on darktable.develop (dt_masks_replace_current_forms)
     g_list_free_full(dev->history, dt_dev_free_history_item);
     dev->history = dt_history_duplicate(history);
     dev->history_end = end;
@@ -8478,27 +8091,13 @@ static gboolean _render_variants(JsonObject *params, JsonBuilder *b, gchar **err
   g_list_free_full(forms, (void (*)(void *))dt_masks_free_form);
   s->dirty = dirty;
   dev->focus_hash = focus;
-  _cur = owner;
   if(g_list_length(dev->iop) != instances)
   {
     // a step added an instance after all: the edit can't be trusted any more
-    if(owner->gui) owner->mirror_gen = 0;
     *err = g_strdup("a variant changed the module instances; reopen the photo with fresh");
     return FALSE;
   }
   return TRUE;
-}
-
-static gboolean _render(JsonObject *params, JsonBuilder *b, gchar **err)
-{
-  if(!_cur || !_cur->gui) return _render_session(params, b, err);
-  _session_t *gui = _cur;
-  _session_t *mirror = _pipe_session(err);
-  if(!mirror) return FALSE;
-  _cur = mirror;
-  const gboolean ok = _render_session(params, b, err);
-  _cur = gui;
-  return ok;
 }
 
 // what a render shows: the region of the (scaled) image it processed
@@ -8947,18 +8546,6 @@ static gboolean _sample_session(JsonObject *params, JsonBuilder *b, gchar **err)
   return TRUE;
 }
 
-static gboolean _sample(JsonObject *params, JsonBuilder *b, gchar **err)
-{
-  if(!_cur || !_cur->gui) return _sample_session(params, b, err);
-  _session_t *gui = _cur;
-  _session_t *mirror = _pipe_session(err);
-  if(!mirror) return FALSE;
-  _cur = mirror;
-  const gboolean ok = _sample_session(params, b, err);
-  _cur = gui;
-  return ok;
-}
-
 // ---- AI object masks --------------------------------------------------------
 // what the darkroom's AI object mask does (develop/masks/object.c): SAM
 // segments the photo around points the user clicks, and the mask is traced
@@ -9027,9 +8614,7 @@ static gboolean _seg_model(gchar **err)
 // _cur at the session whose pipe rendered it
 static gboolean _seg_input(_session_t **sp, uint8_t **rgb, int *w, int *h, gchar **key, gchar **err)
 {
-  _session_t *s = _pipe_session(err);
-  if(!s) return FALSE;
-  _cur = s;
+  _session_t *s = _cur;
   _pipe_sync(s);
   const dt_hash_t dh = dt_dev_hash_distort_plus(s->dev, &s->pipe, 0, DT_DEV_TRANSFORM_DIR_ALL);
   *key = g_strdup_printf("%d:%" PRIu64 ":%dx%d", s->dev->image_storage.id, (uint64_t)dh,
@@ -9672,9 +9257,6 @@ static gboolean _ai_denoise_finish(gpointer data)
       dt_grouping_add_to_group(grpid, dst);
       if(grpid == src) dt_grouping_change_representative(dst);
       dt_image_synch_xmp(dst);
-      if(_in_gui)
-        dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
-                                   DT_COLLECTION_PROP_UNDEF, NULL);
       j->state = _JOB_DONE;
     }
   }
@@ -10608,10 +10190,7 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
   float match[6] = { 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f };  // color match: gains, offsets
   gboolean matched = FALSE;
   const _job_t *queued = NULL;              // the background job a filled call started
-  // the session whose pipe measures and renders: in darktable's window the
-  // darkroom's mirror (_pipe_session), with its own copy of the instance
-  _session_t *owner = _cur, *ps = _cur;
-  dt_iop_module_t *pm = NULL;
+  _session_t *ps = _cur;                    // the session whose pipe measures and renders
 
   // the instance: crop_to's for filled; else the first composite if it is
   // unused, else a new one after the last
@@ -10676,24 +10255,9 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
 
   // where the shape is, at the composite's place in the pipe
   // (the pipe has its copy of the shapes only while it runs: one for now)
-  ps = _pipe_session(err);
-  if(!ps)
-  {
-    ps = owner;
-    goto done;
-  }
-  pm = m;
-  if(ps != owner)
-  {
-    pm = NULL;
-    for(GList *l = ps->dev->iop; l && !pm; l = g_list_next(l))
-    {
-      dt_iop_module_t *o = l->data;
-      if(!g_strcmp0(o->op, "overlay") && o->multi_priority == m->multi_priority) pm = o;
-    }
-  }
+  dt_iop_module_t *pm = m;
   _pipe_sync(ps);
-  dt_dev_pixelpipe_iop_t *piece = pm ? _piece_of(ps, pm) : NULL;
+  dt_dev_pixelpipe_iop_t *piece = _piece_of(ps, pm);
   dt_pthread_mutex_lock(&ps->dev->history_mutex);
   ps->pipe.forms = dt_masks_dup_forms_deep(ps->dev->forms, NULL);
   dt_pthread_mutex_unlock(&ps->dev->history_mutex);
@@ -10792,9 +10356,7 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
     j->fill_side = side;
     j->fill_made_at = MAX(fw, fh);
     j->fill_instance = reuse;
-    // darktable's job handle, where its control runs (its window)
     j->handle = dt_control_job_create(NULL, "api: ai fill");
-    if(j->handle && _in_gui) dt_control_job_add_progress(j->handle, _("AI fill"), FALSE);
     _jobs = g_list_append(_jobs, j);
     j->thread = g_thread_new("api-fill", _fill_job_run, j);
     queued = j;
@@ -10870,9 +10432,6 @@ static gboolean _ai_fill(JsonObject *params, JsonBuilder *b, gchar **err)
     const dt_imgid_t grpid = hi && dt_is_valid_imgid(hi->group_id) ? hi->group_id : host;
     dt_image_cache_read_release(hi);
     dt_grouping_add_to_group(grpid, patch);
-    if(_in_gui)
-      dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
-                                 DT_COLLECTION_PROP_UNDEF, NULL);
   }
 
   // the patch placed 1:1 at its box: scale on the height, top left, offsets
@@ -11077,7 +10636,6 @@ static gboolean _fill_job_finish(gpointer data)
     ok = _ai_fill(j->fill_params, b, &err);
     _fill_ready = NULL;
     json_builder_end_object(b);
-    if(_cur->gui) _gui_last_edit = g_get_monotonic_time();
     _cur = saved;
     if(ok)
     {
@@ -11449,12 +11007,6 @@ static gboolean _import_finish(gpointer data)
     // (import_session.c); destroy only frees after a ref
     dt_import_session_ref(im->session);
     dt_import_session_destroy(im->session);
-  }
-  if(imported && _in_gui)
-  {
-    dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD, DT_COLLECTION_PROP_UNDEF,
-                               NULL);
-    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_FILMROLLS_CHANGED);
   }
   if(j->handle)
   {
@@ -12729,11 +12281,6 @@ static float _tap_ev(const dt_dev_pixelpipe_mask_tap_t *tap, const float x, cons
 // mask), width the longer side
 static gboolean _toneequal_mask(JsonObject *params, JsonBuilder *b, gchar **err)
 {
-  if(_cur->gui)
-  {
-    *err = _ERR(API_E_UNAVAILABLE, NULL, "toneequal_mask works without darktable's window only");
-    return FALSE;
-  }
   const int instance = params ? json_object_get_int_member_with_default(params, "instance", 0) : 0;
   dt_iop_module_t *m = dt_iop_get_module_by_op_priority(_cur->dev->iop, "toneequal", instance);
   if(!m)
@@ -13171,11 +12718,25 @@ static const char *_methods[] = {
 #endif
 #endif
   "job_status", "job_list", "job_cancel", "module_add", "module_move", "curve_get", "curve_set", "image_duplicate", "image_remove", "style_list", "style_create", "style_delete", "style_apply",
-  "history_paste", "collection", "darkroom_open", "image_info.exif", "image_metadata", "tag_list", "set_tags", "set_tags.private",
+  "history_paste", "collection", "image_info.exif", "image_metadata", "tag_list", "set_tags", "set_tags.private",
   "group", "set_metadata", "set_location", "picker_list", "picker_apply", "picker_apply.headless", "toneequal_mask", "module_remove", "module_rename", "history_compress",
-  "render.history_end", "render_variants", "darkroom_snapshot", "share", "save", "reset", "render", "render.uncropped", "render.zoom", "render.show_mask", "export", "export.bpp",
-  "library_status", "library_release", "library_release.auto_acquire", "library_acquire", "handover", "shutdown", "shutdown.quit_window",
+  "render.history_end", "render_variants", "share", "save", "reset", "render", "render.uncropped", "render.zoom", "render.show_mask", "export", "export.bpp",
+  "library_status", "library_release", "library_release.auto_acquire", "library_release.save", "library_acquire", "shutdown", "shutdown.quit_window",
   "errors.codes", NULL };
+
+// what darktable's window still serves: it records the also_changed and
+// picker goldens, nothing else
+static const char *_window_methods[] = {
+  "ping", "client_hello", "clients", "library_status", "session_open", "session_close",
+  "history_list", "history_end", "module_list", "module_get", "module_set", "curve_get",
+  "picker_list", "picker_apply", "job_status", "job_list", "shutdown", NULL };
+
+static gboolean _window_serves(const char *method)
+{
+  for(int i = 0; _window_methods[i]; i++)
+    if(!g_strcmp0(method, _window_methods[i])) return TRUE;
+  return FALSE;
+}
 
 // methods that work on an edit session, and the event each one sends
 static const struct { const char *method; const char *event; } _session_methods[] = {
@@ -13267,13 +12828,14 @@ static gboolean _handle(_client_t *c, const gchar *line)
 
   if(err)
     ;
-  else if(_jobs_running() && (!g_strcmp0(method, "library_release") || !g_strcmp0(method, "handover")
-                               || !g_strcmp0(method, "shutdown") || !g_strcmp0(method, "image_remove")))
+  else if(_jobs_running() && (!g_strcmp0(method, "library_release") || !g_strcmp0(method, "shutdown")
+                               || !g_strcmp0(method, "image_remove")))
     err = _ERR(API_E_BUSY, NULL, "a background job is running (job_list): wait for it, or job_cancel it, first");
+  else if(_opt.in_gui && !_window_serves(method))
+    err = _ERRF(API_E_UNAVAILABLE, NULL, "%s: darktable's window serves only the recording of the also_changed and picker goldens; use the headless engine (darktable-api)", method);
   else if(_released && g_strcmp0(method, "ping") && g_strcmp0(method, "library_status")
      && g_strcmp0(method, "client_hello") && g_strcmp0(method, "clients")
-     && g_strcmp0(method, "library_acquire") && g_strcmp0(method, "shutdown")
-     && g_strcmp0(method, "handover"))
+     && g_strcmp0(method, "library_acquire") && g_strcmp0(method, "shutdown"))
     err = _ERR(API_E_RELEASED, NULL, "the library is released: call library_acquire first");
   else if(!g_strcmp0(method, "ping"))
   {
@@ -13464,10 +13026,6 @@ static gboolean _handle(_client_t *c, const gchar *line)
   }
   else if(!g_strcmp0(method, "collection"))
     _collection(params, b, &err);
-  else if(!g_strcmp0(method, "darkroom_open"))
-    _darkroom_open(params, b, &err);
-  else if(!g_strcmp0(method, "darkroom_snapshot"))
-    _darkroom_snapshot(params, b, &err);
   else if(!g_strcmp0(method, "share"))
   {
     const char *kind = params ? json_object_get_string_member_with_default(params, "kind", NULL) : NULL;
@@ -13561,7 +13119,7 @@ static gboolean _handle(_client_t *c, const gchar *line)
   else if(!g_strcmp0(method, "mask_attach"))
     _mask_attach_existing(params, b, &err);
   else if(!g_strcmp0(method, "sample"))
-    _sample(params, b, &err);
+    _sample_session(params, b, &err);
   else if(!g_strcmp0(method, "coords"))
     _coords(params, b, &err);
   else if(!g_strcmp0(method, "retouch_list"))
@@ -13588,21 +13146,11 @@ static gboolean _handle(_client_t *c, const gchar *line)
     _save(b, &err);
   else if(!g_strcmp0(method, "library_status"))
     _library_status(b, c->current, &err);
-  else if(!g_strcmp0(method, "handover") && !_opt.in_gui)
-  {
-    // darktable's window takes over: everyone else waits for it
-    if(_handover(b, &err))
-    {
-      event = "handover";
-      go_on = FALSE;
-    }
-  }
-  else if(_opt.in_gui && (!g_strcmp0(method, "library_release") || !g_strcmp0(method, "library_acquire")
-                          || !g_strcmp0(method, "handover")))
+  else if(_opt.in_gui && (!g_strcmp0(method, "library_release") || !g_strcmp0(method, "library_acquire")))
     err = _ERR(API_E_UNAVAILABLE, NULL, "darktable's window has the library; quit darktable to hand it to the engine");
   else if(!g_strcmp0(method, "library_release") || !g_strcmp0(method, "library_acquire"))
   {
-    if(!g_strcmp0(method, "library_release") ? _library_release(b, &err) : _library_acquire(b, &err))
+    if(!g_strcmp0(method, "library_release") ? _library_release(params, b, &err) : _library_acquire(b, &err))
       event = !g_strcmp0(method, "library_release") ? "library_released" : "library_acquired";
     if(!err && !g_strcmp0(method, "library_release")
        && (!params || json_object_get_boolean_member_with_default(params, "auto_acquire", TRUE)))
@@ -13611,7 +13159,7 @@ static gboolean _handle(_client_t *c, const gchar *line)
   else if(!g_strcmp0(method, "reset"))
     _reset(b, &err);
   else if(!g_strcmp0(method, "render"))
-    _render(params, b, &err);
+    _render_session(params, b, &err);
   else if(!g_strcmp0(method, "render_variants"))
     _render_variants(params, b, &err);
   else if(!g_strcmp0(method, "shutdown"))
@@ -13802,43 +13350,11 @@ gchar *dt_api_default_socket(const char *configdir)
 
 // ---- darktable's window ----------------------------------------------------
 
-static void _gui_history_cb(gpointer instance, gpointer user_data)
-{
-  const dt_imgid_t imgid = _darkroom_image();
-  if(!dt_is_valid_imgid(imgid)) return;
-  _gui_gen++;
-  if(_api_editing) return;          // raised by the API's own change, told already
-  const guint32 h = _gui_hash();
-  if(h == _gui_hash_seen) return;   // the API's own change, raised later
-  _gui_hash_seen = h;
-  _notify(NULL, "edit", imgid);
-}
-
-// tell the clients which photo the darkroom shows (event "darkroom", imgid
-// 0 when none) whenever that changes
-static dt_imgid_t _darkroom_seen = NO_IMGID;
-
-static void _darkroom_announce(void)
-{
-  const dt_imgid_t imgid = _darkroom_image();
-  if(imgid == _darkroom_seen) return;
-  _darkroom_seen = imgid;
-  _notify(NULL, "darkroom", dt_is_valid_imgid(imgid) ? imgid : 0);
-}
-
-static void _gui_view_cb(gpointer instance, gpointer old_view, gpointer new_view, gpointer user_data)
-{
-  _gui_gen++;
-  _darkroom_announce();
-}
-
+// the darkroom now edits this image: a session of it here would be a
+// second, diverging edit. its unsaved changes are dropped
 static void _gui_image_cb(gpointer instance, gpointer user_data)
 {
-  _gui_gen++;
   const dt_imgid_t imgid = _darkroom_image();
-  _gui_hash_seen = dt_is_valid_imgid(imgid) ? _gui_hash() : 0;
-  // the darkroom now edits this image: a session of it here would be a
-  // second, diverging edit. its unsaved changes are dropped
   _session_t *s = dt_is_valid_imgid(imgid) ? _session_find_listed(imgid) : NULL;
   if(s)
   {
@@ -13846,159 +13362,9 @@ static void _gui_image_cb(gpointer instance, gpointer user_data)
     _session_close(s);
     if(dirty) _notify(NULL, "reopened", imgid);
   }
-  _darkroom_announce();
-}
-
-static void _gui_info_cb(gpointer instance, GList *imgs, gpointer user_data)
-{
-  for(GList *l = imgs; l; l = g_list_next(l))
-    _notify(NULL, "image", GPOINTER_TO_INT(l->data));
-}
-
-// ratings, rejects and color labels changed in darktable's window (stars
-// clicked on a thumbnail, shortcuts, undo, the filmstrip): darktable raises
-// "metadata changed" without saying which images, or "collection changed"
-// with them only for some paths. so on either, once the main loop is idle,
-// each image's marks are read again (one query) and compared with the last
-// seen; the changed images get an "image" event. the API's own changes are
-// noted as they are made, so they aren't announced twice
-
-static GHashTable *_marks = NULL;      // imgid -> its marks + 1 (0 is "absent")
-static guint _marks_timer = 0;
-
-static GHashTable *_marks_read(const dt_imgid_t only)
-{
-  GHashTable *h = g_hash_table_new(NULL, NULL);
-  sqlite3_stmt *st;
-  // bits 0-2 the rating, 3 the reject flag (DT_IMAGE_REJECTED), 4- the labels
-  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                              "SELECT i.id, (i.flags & 15)"
-                              "  | (IFNULL((SELECT SUM(1 << color) FROM main.color_labels"
-                              "            WHERE imgid = i.id), 0) << 4)"
-                              " FROM main.images AS i WHERE ?1 < 1 OR i.id = ?1",
-                              -1, &st, NULL);
-  DT_DEBUG_SQLITE3_BIND_INT(st, 1, only);
-  while(sqlite3_step(st) == SQLITE_ROW)
-    g_hash_table_insert(h, GINT_TO_POINTER(sqlite3_column_int(st, 0)),
-                        GINT_TO_POINTER(sqlite3_column_int(st, 1) + 1));
-  sqlite3_finalize(st);
-  return h;
-}
-
-static void _marks_note(const dt_imgid_t imgid)
-{
-  if(!_marks) return;
-  GHashTable *one = _marks_read(imgid);
-  gpointer v = g_hash_table_lookup(one, GINT_TO_POINTER(imgid));
-  if(v) g_hash_table_insert(_marks, GINT_TO_POINTER(imgid), v);
-  g_hash_table_destroy(one);
-}
-
-static gboolean _marks_check(gpointer data)
-{
-  _marks_timer = 0;
-  GHashTable *now = _marks_read(NO_IMGID);
-  GHashTableIter it;
-  gpointer id, v;
-  g_hash_table_iter_init(&it, now);
-  while(g_hash_table_iter_next(&it, &id, &v))
-  {
-    const gpointer was = _marks ? g_hash_table_lookup(_marks, id) : NULL;
-    // new images (an import) aren't changes to announce
-    if(was && was != v) _notify(NULL, "image", GPOINTER_TO_INT(id));
-  }
-  if(_marks) g_hash_table_destroy(_marks);
-  _marks = now;
-  return G_SOURCE_REMOVE;
-}
-
-static void _marks_changed(void)
-{
-  // a burst of signals (a rating on a selection) is one check
-  if(_marks && !_marks_timer) _marks_timer = g_timeout_add(100, _marks_check, NULL);
-}
-
-static void _gui_metadata_cb(gpointer instance, const guint type, gpointer user_data)
-{
-  _marks_changed();
-}
-
-static void _gui_collection_cb(gpointer instance, const dt_collection_change_t query_change,
-                               const dt_collection_properties_t changed_property, gpointer imgs,
-                               const int next, gpointer user_data)
-{
-  _marks_changed();
 }
 
 static void _drafts_load(void);
-static void _drafts_write(const char *file);
-
-gboolean dt_api_handover(const char *path)
-{
-  struct sockaddr_un addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sun_family = AF_UNIX;
-  g_strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
-  const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if(fd < 0 || connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0)
-  {
-    if(fd >= 0) close(fd);
-    return FALSE;                     // nobody serves the library
-  }
-  // one request, then read until the engine has replied and gone (EOF):
-  // by then it has released the library and removed its socket
-  const char *req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"handover\"}\n";
-  gboolean ok = write(fd, req, strlen(req)) == (ssize_t)strlen(req);
-  GString *in = g_string_new(NULL);
-  const gint64 until = g_get_monotonic_time() + 30 * G_USEC_PER_SEC;
-  char buf[65536];
-  while(ok && g_get_monotonic_time() < until)
-  {
-    struct pollfd pfd = { .fd = fd, .events = POLLIN };
-    if(poll(&pfd, 1, 500) <= 0) continue;
-    const ssize_t n = read(fd, buf, sizeof(buf));
-    if(n <= 0) break;
-    g_string_append_len(in, buf, n);
-  }
-  close(fd);
-  // the reply is the line with "id": 1; notifications may come first
-  gboolean took = FALSE;
-  gchar **lines = g_strsplit(in->str, "\n", -1);
-  for(gchar **l = lines; *l; l++)
-  {
-    JsonParser *p = json_parser_new();
-    if(**l && json_parser_load_from_data(p, *l, -1, NULL)
-       && JSON_NODE_HOLDS_OBJECT(json_parser_get_root(p)))
-    {
-      JsonObject *o = json_node_get_object(json_parser_get_root(p));
-      if(json_object_has_member(o, "id") && json_object_has_member(o, "result"))
-      {
-        JsonObject *r = json_object_get_object_member(o, "result");
-        if(json_object_has_member(r, "drafts"))
-          _drafts_from_json(json_object_get_array_member(r, "drafts"));
-        took = TRUE;
-      }
-      else if(json_object_has_member(o, "error"))
-        dt_print(DT_DEBUG_ALWAYS, "[api] the engine on %s refused to hand over", path);
-    }
-    g_object_unref(p);
-  }
-  g_strfreev(lines);
-  g_string_free(in, TRUE);
-  if(took)
-    dt_print(DT_DEBUG_ALWAYS, "[api] took the library over from the engine on %s (%d drafts)",
-             path, g_list_length(_drafts));
-  // on disk at once, where dt_api_start reads them: darktable can still
-  // crash before then (#78), and the engine that had them is gone
-  if(took && _drafts)
-  {
-    gchar *file = g_strconcat(path, ".drafts.json", NULL);
-    _drafts_write(file);
-    _drafts_free();
-    g_free(file);
-  }
-  return took;
-}
 
 // darktable's window deletes the built-in presets at start for the modules
 // to store them again (gui/gtk.c, dt_gui_presets_init); a headless start
@@ -14032,19 +13398,12 @@ void dt_api_start(const dt_api_options_t *options)
   if(!_in_gui) _drop_stale_builtin_presets();
   if(_in_gui)
   {
-    DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_HISTORY_CHANGE, _gui_history_cb, NULL);
     DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_IMAGE_CHANGED, _gui_image_cb, NULL);
-    DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_IMAGE_INFO_CHANGED, _gui_info_cb, NULL);
-    DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_VIEWMANAGER_VIEW_CHANGED, _gui_view_cb, NULL);
     DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_CONTROL_PICKERDATA_READY, _gui_pickerdata_cb, NULL);
     DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED, _gui_preview_finished_cb, NULL);
     DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_UI_PIPE_FINISHED, _gui_full_finished_cb, NULL);
-    DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_METADATA_CHANGED, _gui_metadata_cb, NULL);
-    DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_COLLECTION_CHANGED, _gui_collection_cb, NULL);
-    _marks = _marks_read(NO_IMGID);
   }
-  // unsaved edits handed over by an engine (dt_api_handover) or kept by the
-  // last server that stopped
+  // unsaved edits kept by the last server that stopped
   _socket_path = g_strdup(options->socket_path);
   _drafts_load();
   if(_drafts)
@@ -14127,21 +13486,9 @@ gboolean dt_api_stop(void)
   if(!_released) _drafts_save();
   if(_in_gui)
   {
-    DT_CONTROL_SIGNAL_DISCONNECT(_gui_history_cb, NULL);
-    DT_CONTROL_SIGNAL_DISCONNECT(_gui_image_cb, NULL);
-    DT_CONTROL_SIGNAL_DISCONNECT(_gui_info_cb, NULL);
-    DT_CONTROL_SIGNAL_DISCONNECT(_gui_view_cb, NULL);
     DT_CONTROL_SIGNAL_DISCONNECT(_gui_pickerdata_cb, NULL);
     DT_CONTROL_SIGNAL_DISCONNECT(_gui_preview_finished_cb, NULL);
     DT_CONTROL_SIGNAL_DISCONNECT(_gui_full_finished_cb, NULL);
-    DT_CONTROL_SIGNAL_DISCONNECT(_gui_metadata_cb, NULL);
-    DT_CONTROL_SIGNAL_DISCONNECT(_gui_collection_cb, NULL);
-    if(_marks_timer) g_source_remove(_marks_timer);
-    _marks_timer = 0;
-    if(_marks) g_hash_table_destroy(_marks);
-    _marks = NULL;
-    if(_gui_session.mirror) _session_free(_gui_session.mirror);
-    _gui_session.mirror = NULL;
   }
   while(_clients) _client_free(_clients->data);
   if(_listen_source) g_source_remove(_listen_source);

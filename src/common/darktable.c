@@ -2215,8 +2215,6 @@ int dt_init(int argc,
   dt_datetime_init();
 
 #ifdef HAVE_API
-  // a darktable-api engine may hold the library: have it hand over before
-  // opening the library, so this window gets the lock and its unsaved edits
   gchar *api_socket = NULL;
   if(api_from_command && init_gui)
   {
@@ -2224,7 +2222,6 @@ int dt_init(int argc,
     dt_loc_get_user_config_dir(configdir, sizeof(configdir));
     api_socket = api_socket_from_command ? g_strdup(api_socket_from_command)
                                          : dt_api_default_socket(configdir);
-    dt_api_handover(api_socket);
   }
 #endif
 

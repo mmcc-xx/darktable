@@ -183,20 +183,64 @@ static void _agx(dt_iop_module_t *m, const char *field, const void *old)
 
 // ---- color calibration (channelmixerrgb.c) ----------------------------------
 
-// _get_white_balance_coeff: the camera white balance against D65 the
-// module's "as shot in camera" reads
-static void _cm_white_balance(const dt_iop_module_t *m, dt_aligned_pixel_t wb)
+// temperature.c's DT_IOP_TEMP_* presets
+enum { _TEMP_UNKNOWN = -1, _TEMP_AS_SHOT = 0, _TEMP_SPOT = 1, _TEMP_USER = 2, _TEMP_D65 = 3,
+       _TEMP_NUM_STD = 4 };
+
+static dt_iop_module_t *_find_module(const dt_develop_t *dev, const char *op)
 {
-  const dt_dev_chroma_t *chr = &m->dev->chroma;
-  for_four_channels(k) wb[k] = 1.0f;
+  for(const GList *l = dev->iop; l; l = g_list_next(l))
+    if(dt_iop_module_is(l->data, op)) return l->data;
+  return NULL;
+}
+
+// dt_dev_get_gui_wb: the white balance temperature's current params give
+// (temperature.c _gui_wb_proxy, _wb_from_params). only temperature's
+// gui_init sets that proxy, so headless the port derives it here instead of
+// taking dev->chroma.wb, which holds what the last commit published
+static void _cm_gui_wb(dt_iop_module_t *m, dt_dev_wb_t *wb)
+{
+  dt_dev_get_gui_wb(m->dev, wb);
+  if(m->dev->proxy.gui_wb) return;
+  dt_iop_module_t *t = _find_module(m->dev, "temperature");
+  const float *coeffs = t ? _P(float, t, "red") : NULL;
+  const int *preset = t ? _P(int, t, "preset") : NULL;
+  const gboolean *late = t ? _P(gboolean, t, "late_correction") : NULL;
+  if(!coeffs || !preset || !late) return;
+  const gboolean true_monochrome = dt_image_monochrome_flags(&m->dev->image_storage) & DT_IMAGE_MONOCHROME;
+  const gboolean applied = t->enabled && !true_monochrome;
+  for_four_channels(k) wb->coeffs[k] = applied ? coeffs[k] : 1.0f;
+  wb->camera_reference = applied && *preset == _TEMP_D65;
+  wb->late_correction = applied && !wb->camera_reference && *late;
+}
+
+// _get_d65_correction_ratios, with _dev_is_D65_chroma
+static void _cm_d65_ratios(const dt_iop_module_t *m, const dt_dev_wb_t *wb, dt_aligned_pixel_t ratios)
+{
+  for_four_channels(k) ratios[k] = 1.0f;
   if(!dt_image_is_matrix_correction_supported(&m->dev->image_storage)) return;
-  const gboolean d65 = chr->late_correction ? dt_dev_equal_chroma(chr->wb_coeffs, chr->as_shot)
-                                            : dt_dev_equal_chroma(chr->wb_coeffs, chr->D65coeffs);
-  if(d65) return;
-  const gboolean valid = chr->D65coeffs[0] > 0.0 && chr->D65coeffs[1] > 0.0 && chr->D65coeffs[2] > 0.0;
-  const gboolean changed = chr->wb_coeffs[0] > 1.0f || chr->wb_coeffs[1] > 1.0f || chr->wb_coeffs[2] > 1.0f;
-  if(valid && changed)
-    for_four_channels(k) wb[k] = (float)chr->D65coeffs[k] / chr->wb_coeffs[k];
+  if(wb->late_correction || dt_dev_equal_chroma(wb->coeffs, wb->D65coeffs)) return;
+  const gboolean valid = wb->D65coeffs[0] > 0.0 && wb->D65coeffs[1] > 0.0 && wb->D65coeffs[2] > 0.0;
+  const gboolean changed = wb->coeffs[0] > 1.0f || wb->coeffs[1] > 1.0f || wb->coeffs[2] > 1.0f;
+  if(valid && changed) dt_dev_wb_get_rgb_correction(wb, TRUE, ratios);
+}
+
+// _illuminant_xy_from_wb_or_D50, with _illuminant_xy_from_unprepared_wb
+static void _cm_xy_from_wb(const dt_iop_module_t *m, const dt_dev_wb_t *wb, float *x, float *y)
+{
+  const dt_image_t *img = &m->dev->image_storage;
+  gboolean found = FALSE;
+  if(wb->late_correction || wb->camera_reference)
+    found = find_illuminant_xy_from_wb_coeffs(img, wb->coeffs, x, y);
+  else if(!_wb_coeffs_invalid(wb->coeffs, 3))
+  {
+    dt_aligned_pixel_t ratios = { 1.f, 1.f, 1.f, 1.f };
+    for(int k = 0; k < 3; k++) ratios[k] = wb->D65coeffs[k] / wb->coeffs[k];
+    found = find_illuminant_xy_from_as_shot_coeffs(img, ratios, x, y);
+  }
+  if(found) return;
+  *x = D50xyY.x;
+  *y = D50xyY.y;
 }
 
 // _check_if_close_to_daylight, the parts gui_changed uses: the correlated
@@ -214,11 +258,21 @@ float dt_api_cct(const float x, const float y)
   return _cm_cct(x, y);
 }
 
-static void _cm_from_camera(dt_iop_module_t *m, float *x, float *y, float *temperature, int *adaptation)
+// "as shot in camera" (camera) or "from the white balance module" (wb): the
+// illuminant and its temperature, and CAT16 (_check_if_close_to_daylight)
+static void _cm_derived(dt_iop_module_t *m, const gboolean camera, float *x, float *y, float *temperature,
+                        int *adaptation)
 {
-  dt_aligned_pixel_t wb;
-  _cm_white_balance(m, wb);
-  find_temperature_from_raw_coeffs(&m->dev->image_storage, wb, x, y);
+  dt_dev_wb_t wb;
+  _cm_gui_wb(m, &wb);
+  if(camera)
+  {
+    dt_aligned_pixel_t ratios;
+    _cm_d65_ratios(m, &wb, ratios);
+    find_illuminant_xy_from_as_shot_coeffs(&m->dev->image_storage, ratios, x, y);
+  }
+  else
+    _cm_xy_from_wb(m, &wb, x, y);
   *temperature = _cm_cct(*x, *y);
   if(adaptation) *adaptation = DT_ADAPTATION_CAT16;
 }
@@ -232,26 +286,28 @@ static void _channelmixerrgb(dt_iop_module_t *m, const char *field, const void *
   if(!illuminant || !x || !y || !temperature || !ifluo || !iled) return;
   if(_is(field, "illuminant"))
   {
-    // leaving "as shot in camera": start from the camera's white balance
-    if(_OLD(int, m, old, "illuminant") == DT_ILLUMINANT_CAMERA)
-      _cm_from_camera(m, x, y, temperature, adaptation);
+    // leaving "as shot in camera" or "from the white balance module": start
+    // from the illuminant it derived
+    const int prev = _OLD(int, m, old, "illuminant");
+    if(prev == DT_ILLUMINANT_CAMERA || prev == DT_ILLUMINANT_FROM_WB)
+      _cm_derived(m, prev == DT_ILLUMINANT_CAMERA, x, y, temperature, adaptation);
     // to daylight or black body the window restores the temperature last
     // set in that mode, which only its controls remember: here the setting
     // keeps the value it had
     if(*illuminant == DT_ILLUMINANT_D || *illuminant == DT_ILLUMINANT_BB)
       *temperature = _OLD(float, m, old, "temperature");
-    if(*illuminant == DT_ILLUMINANT_CAMERA)
-      _cm_from_camera(m, x, y, temperature, adaptation);
+    if(*illuminant == DT_ILLUMINANT_CAMERA || *illuminant == DT_ILLUMINANT_FROM_WB)
+      _cm_derived(m, *illuminant == DT_ILLUMINANT_CAMERA, x, y, temperature, adaptation);
   }
   if(_is(field, "illuminant") || _is(field, "illum_fluo") || _is(field, "illum_led")
      || _is(field, "temperature"))
   {
+    const gboolean derived = *illuminant == DT_ILLUMINANT_CAMERA || *illuminant == DT_ILLUMINANT_FROM_WB;
     // the chromaticity follows the illuminant it is defined by
-    if(*illuminant != DT_ILLUMINANT_CUSTOM && *illuminant != DT_ILLUMINANT_CAMERA)
+    if(*illuminant != DT_ILLUMINANT_CUSTOM && !derived)
       illuminant_to_xy(*illuminant, NULL, NULL, x, y, *temperature, *ifluo, *iled);
     // modes without a temperature show the closest one
-    if(*illuminant != DT_ILLUMINANT_D && *illuminant != DT_ILLUMINANT_BB
-       && *illuminant != DT_ILLUMINANT_CAMERA)
+    if(*illuminant != DT_ILLUMINANT_D && *illuminant != DT_ILLUMINANT_BB && !derived)
       *temperature = _cm_cct(*x, *y);
   }
 }
@@ -281,31 +337,55 @@ static void _profile_gamma(dt_iop_module_t *m, const char *field, const void *ol
 
 // ---- white balance (temperature.c) -----------------------------------------
 
-enum { _TEMP_AS_SHOT = 0, _TEMP_USER = 2, _TEMP_D65 = 3, _TEMP_D65_LATE = 4 };
+// dt_dev_cat_is_active: a color calibration instance in the pipe applies a
+// chromatic adaptation (channelmixerrgb.c _cat_proxy_source, _applies_cat).
+// only color calibration's gui_init sets that proxy, so headless the port
+// asks the instances here
+static gboolean _cat_is_active(dt_iop_module_t *m)
+{
+  if(m->dev->proxy.cat_source) return dt_dev_cat_is_active(m->dev);
+  if(dt_image_is_monochrome(&m->dev->image_storage)) return FALSE;
+  for(const GList *l = m->dev->iop; l; l = g_list_next(l))
+  {
+    dt_iop_module_t *c = l->data;
+    if(!dt_iop_module_is(c, "channelmixerrgb") || c->iop_order == INT_MAX || !c->enabled) continue;
+    const int *illuminant = _P(int, c, "illuminant"), *adaptation = _P(int, c, "adaptation");
+    if(!illuminant || !adaptation) continue;
+    // commit_params forces CAT16 for these, whatever adaptation the params hold
+    const gboolean forced = *illuminant == DT_ILLUMINANT_CAMERA || *illuminant == DT_ILLUMINANT_FROM_WB;
+    if(*illuminant != DT_ILLUMINANT_PIPE && (*adaptation != DT_ADAPTATION_RGB || forced)) return TRUE;
+  }
+  return FALSE;
+}
 
 static void _temperature(dt_iop_module_t *m, const char *field, const void *old)
 {
   int *preset = _P(int, m, "preset");
   const float *coeffs = _P(float, m, "red");
-  if(!preset || !coeffs) return;
-  // _update_preset: moving a coefficient makes the preset "user defined",
-  // and the late correction only belongs to the as shot to reference preset.
-  // the presets combobox is set to user first, whose callback copies the
-  // cached coefficients, which are the ones just set
+  gboolean *late = _P(gboolean, m, "late_correction");
+  if(!preset || !coeffs || !late) return;
+  // gui_changed: "prepare data for color calibration" changes neither the
+  // coefficients nor the preset
+  if(_is(field, "late_correction")) return;
+  // moving a coefficient makes the preset "user modified" (gui_changed). the
+  // presets combobox is set to user first, whose callback copies the cached
+  // coefficients, which are the ones just set
   if(_is(field, "red") || _is(field, "green") || _is(field, "blue") || _is(field, "various"))
-  {
     *preset = _TEMP_USER;
-    m->dev->chroma.late_correction = FALSE;
-  }
-  // the window then refreshes the module (gui_update), which names the
-  // coefficients that are the camera's as shot (the late correction preset
-  // keeps its name) or its D65 ones. the first three settings are compared
+  // _update_preset: leaving camera reference for as shot or a camera preset
+  // prepares the data for color calibration if that adapts
+  if(_is(field, "preset") && _OLD(int, m, old, "preset") == _TEMP_D65
+     && (*preset == _TEMP_AS_SHOT || *preset >= _TEMP_NUM_STD))
+    *late = _cat_is_active(m);
+  // the window then refreshes the module (gui_update): a saved camera
+  // reference stays one, coefficients that are the camera's as shot are named
+  // so, and legacy params without a preset that hold its D65 ones become the
+  // camera reference. the first three settings are compared
   const dt_dev_chroma_t *chr = &m->dev->chroma;
+  if(*preset == _TEMP_D65) return;
   if(dt_dev_equal_chroma(coeffs, chr->as_shot))
-  {
-    if(*preset != _TEMP_D65_LATE) *preset = _TEMP_AS_SHOT;
-  }
-  else if(dt_dev_equal_chroma(coeffs, chr->D65coeffs))
+    *preset = _TEMP_AS_SHOT;
+  else if(*preset == _TEMP_UNKNOWN && dt_dev_equal_chroma(coeffs, chr->wb.D65coeffs))
     *preset = _TEMP_D65;
 }
 

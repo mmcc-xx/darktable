@@ -1537,7 +1537,7 @@ static void _rgbcurve_create_curve(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe,
 
 // color_picker_apply: coefficients that make the area's mean neutral,
 // green normalized to 1, then the preset "from image area" (_update_preset,
-// which drops the late correction). the sample is the module's input as the
+// which keeps "prepare data for color calibration"). the sample is the module's input as the
 // pipe gives it, the raw mosaic for a raw (picker color space IOP_CS_NONE)
 static void _temperature(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_api_pick_t *pick)
 {
@@ -1554,7 +1554,6 @@ static void _temperature(dt_iop_module_t *m, dt_dev_pixelpipe_t *pipe, const dt_
   pcoeffs[1] = 1.0f;
 
   *preset = 1; // DT_IOP_TEMP_SPOT
-  m->dev->chroma.late_correction = FALSE;
 }
 
 // darktable hides the module's controls for a monochrome sensor (gui_update)

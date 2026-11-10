@@ -6314,6 +6314,19 @@ static _export_t *_export_prepare(JsonObject *params, const dt_imgid_t current, 
   format->dimension(format, fdata, &fw, &fh);
   const uint32_t w = (sw == 0 || fw == 0) ? MAX(sw, fw) : MIN(sw, fw);
   const uint32_t h = (sh == 0 || fh == 0) ? MAX(sh, fh) : MIN(sh, fh);
+  // a native export has no explicit box: resolve it to the image dimensions.
+  // passing 0x0 into the export pipeline makes it take the much heavier
+  // unconstrained path (tens of GB on a 21MP image).
+  if(mw == 0 && mh == 0)
+  {
+    const dt_image_t *img = dt_image_cache_get(imgid, 'r');
+    if(img)
+    {
+      mw = img->width;
+      mh = img->height;
+      dt_image_cache_read_release(img);
+    }
+  }
   fdata->max_width = (mw != 0 && w != 0) ? MIN(w, mw) : MAX(w, mw);
   fdata->max_height = (mh != 0 && h != 0) ? MIN(h, mh) : MAX(h, mh);
   g_strlcpy(fdata->style, style ? style : dt_conf_get_string_const("plugins/lighttable/export/style"),

@@ -76,6 +76,7 @@
 #include "control/jobs/sidecar_jobs.h"
 #include "control/signal.h"
 #include "develop/blend.h"
+#include "develop/frame.h"
 #include "develop/imageop.h"
 #include "gui/accelerators.h"
 #include "gui/workspace.h"
@@ -1077,6 +1078,12 @@ char *version = g_strdup_printf(
                "  Colord                 -> ENABLED\n"
 #else
                "  Colord                 -> DISABLED\n"
+#endif
+
+#ifdef HAVE_WAYLAND
+               "  Wayland color mgmt     -> ENABLED\n"
+#else
+               "  Wayland color mgmt     -> DISABLED\n"
 #endif
 
 #ifdef HAVE_GPHOTO2
@@ -2697,6 +2704,7 @@ int dt_init(int argc,
     dt_gui_process_events();
     dt_splash_screen_destroy();
     dt_welcome_screen_run_if_needed();
+    dt_colorspaces_notify_retired_selection();
 
     // finally set the cursor to be the default.
     // for some reason this is needed on some systems to pick up the correctly themed cursor
@@ -2893,6 +2901,7 @@ void dt_cleanup()
   dt_image_cache_cleanup();
   dt_mipmap_cache_cleanup();
 
+  dt_frame_cleanup();
   dt_colorspaces_cleanup(darktable.color_profiles);
 #ifdef HAVE_AI
   dt_ai_models_cleanup();

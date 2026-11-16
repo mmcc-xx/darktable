@@ -272,7 +272,7 @@ void dt_iop_default_init(dt_iop_module_t *module)
         i->UShort.Default;
       break;
     case DT_INTROSPECTION_TYPE_INT8:
-      *(short*)((uint8_t *)module->default_params + i->header.offset) = i->Int8.Default;
+      *(int8_t*)((uint8_t *)module->default_params + i->header.offset) = i->Int8.Default;
       break;
     case DT_INTROSPECTION_TYPE_ENUM:
       *(int*)((uint8_t *)module->default_params + i->header.offset) = i->Enum.Default;
@@ -2340,12 +2340,12 @@ gboolean _iop_validate_params(dt_introspection_field_t *field,
        field->UShort.Default);
     break;
   case DT_INTROSPECTION_TYPE_INT8:
-    all_ok = (*(uint8_t*)p >= field->Int8.Min && *(uint8_t*)p <= field->Int8.Max);
+    all_ok = (*(int8_t*)p >= field->Int8.Min && *(int8_t*)p <= field->Int8.Max);
     values = g_strdup_printf
-      (" (%ud - [%ud..%ud] : default %ud)",
-       *(uint8_t*)p,
+      (" (%d - [%d..%d] : default %d)",
+       *(int8_t*)p,
        field->Int8.Min, field->Int8.Max,
-       field->Int8.Default);
+       (int8_t)field->Int8.Default);
     break;
   case DT_INTROSPECTION_TYPE_CHAR:
     all_ok = (*(char*)p >= field->Char.Min && *(char*)p <= field->Char.Max);
@@ -3634,6 +3634,11 @@ static gboolean _on_drag_motion(GtkWidget *widget,
   GtkWidget *src_header = gtk_drag_get_source_widget(dc);
   if(!src_header) return TRUE;
   GtkWidget *src_expander = gtk_widget_get_ancestor(src_header, DTGTK_TYPE_EXPANDER);
+  // only a drag of a module header moves modules: anything else dragged from
+  // inside a module, like a row of the masks list, also has its expander as
+  // ancestor, and would be taken for the module itself
+  if(!src_expander || src_header != dtgtk_expander_get_header_event_box(DTGTK_EXPANDER(src_expander)))
+    return TRUE;
 
   dt_iop_module_t *src = NULL;
   for(GList *iop = darktable.develop->iop; iop; iop = iop->next)
@@ -3719,6 +3724,11 @@ void dt_iop_gui_set_expander(dt_iop_module_t *module)
   GtkWidget *iopw = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
   GtkWidget *expander = dtgtk_expander_new(header, iopw);
   gtk_widget_set_name(expander, "iop-expander");
+
+  /* per-module CSS class to enable styling of individual processing modules */
+  char css_class[160] = { 0 };
+  snprintf(css_class, sizeof(css_class), "dt_iop_%s", module->op);
+  dt_gui_add_class(expander, css_class);
 
   GtkWidget *header_evb = dtgtk_expander_get_header_event_box(DTGTK_EXPANDER(expander));
   GtkWidget *body_evb = dtgtk_expander_get_body_event_box(DTGTK_EXPANDER(expander));

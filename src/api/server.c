@@ -281,6 +281,7 @@
 #include "common/utility.h"
 #include "develop/blend.h"
 #include "develop/develop.h"
+#include "develop/frame.h"
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
 #include "develop/masks.h"
@@ -505,6 +506,38 @@ static void _session_close_all(void)
   while(_sessions) _session_close(_sessions->data);
 }
 
+// what a pipe of ours renders to: the main window's display output, as
+// the darkroom's pipes take it each run (develop.c), in format. our pipes
+// run outside dt_dev_process_image_job, so nothing else sets it
+static void _pipe_output(dt_dev_pixelpipe_t *pipe, const dt_frame_format_t format)
+{
+  dt_colorspaces_get_display_output(DT_COLORSPACE_DISPLAY, &pipe->output);
+  pipe->output.format = format;
+}
+
+// the pixels of the frame a session's pipe published last, if it is
+// w x h in format (RGB24: cairo's BGRX bytes; FLOAT: RGBA floats), 4 * w
+// per row; valid until the pipe runs again. NULL if not
+static const void *_pipe_pixels(dt_dev_pixelpipe_t *pipe, const int w, const int h,
+                                const dt_frame_format_t format)
+{
+  const dt_frame_t *frame = pipe->frame;
+  if(!frame || dt_frame_format(frame) != format) return NULL;
+  const dt_frame_geometry_t *g = dt_frame_geometry(frame);
+  return g->width == w && g->height == h ? dt_frame_pixels(frame) : NULL;
+}
+
+// drop the frame a pipe published, as a float measurement leaves it
+static void _pipe_drop_frame(dt_dev_pixelpipe_t *pipe)
+{
+  dt_pthread_mutex_lock(&pipe->backbuf_mutex);
+  dt_frame_t *frame = pipe->frame;
+  pipe->frame = NULL;
+  pipe->backbuf_width = pipe->backbuf_height = 0;
+  dt_pthread_mutex_unlock(&pipe->backbuf_mutex);
+  dt_frame_unref(frame);
+}
+
 // load an image into a new session: its history replayed up to history_end,
 // as the darkroom does, and a pipe on its full-size buffer, listed among
 // the open sessions
@@ -538,6 +571,7 @@ static _session_t *_session_load(const dt_imgid_t imgid, gchar **err)
   // a full (darkroom) pipe: an export pipe keeps only DT_PIPECACHE_MIN cache
   // lines, so every render would start again from the raw file
   dt_dev_pixelpipe_init(&s->pipe);
+  _pipe_output(&s->pipe, DT_FRAME_RGB24);
   dt_dev_pixelpipe_set_icc(&s->pipe, DT_COLORSPACE_SRGB, NULL, DT_INTENT_PERCEPTUAL);
   dt_dev_pixelpipe_set_input(&s->pipe, s->dev, (float *)s->buf.buf,
                              s->buf.width, s->buf.height, s->buf.iscale);
@@ -1756,8 +1790,7 @@ static gboolean _capture_measure(_session_t *s, dt_iop_module_t *m, float *radiu
         off = g_list_prepend(off, p);
       }
     }
-    const dt_dev_pixelpipe_type_t type = pipe->type;
-    pipe->type |= DT_DEV_PIXELPIPE_IMAGE_FLOAT;
+    pipe->output.format = DT_FRAME_FLOAT;
     // a cached demosaic line wouldn't process again
     dt_dev_pixelpipe_cache_flush(pipe);
     dt_dev_pixelpipe_get_dimensions(pipe, s->dev, pipe->iwidth, pipe->iheight,
@@ -1766,13 +1799,10 @@ static gboolean _capture_measure(_session_t *s, dt_iop_module_t *m, float *radiu
     dt_dev_pixelpipe_process(pipe, s->dev, 0, 0, pipe->processed_width, pipe->processed_height, 1.0f,
                              DT_DEVICE_NONE);
     ok = result(piece, radius, thrs);
-    pipe->type = type;
+    pipe->output.format = DT_FRAME_RGB24;
     for(GList *l = off; l; l = g_list_next(l)) ((dt_dev_pixelpipe_iop_t *)l->data)->enabled = TRUE;
     g_list_free(off);
-    g_free(pipe->backbuf);
-    pipe->backbuf = NULL;
-    pipe->backbuf_size = 0;
-    pipe->backbuf_width = pipe->backbuf_height = 0;
+    _pipe_drop_frame(pipe);
     dt_dev_pixelpipe_cache_flush(pipe);
   }
   s->pipe_changed = TRUE;
@@ -8110,7 +8140,7 @@ typedef struct _view_t
 } _view_t;
 
 // run the pipe as render asks (fitted inside max_w x max_h, or zoomed on a
-// region, uncropped or not), leaving the result in the pipe's backbuf (BGRA)
+// region, uncropped or not), leaving the result in the pipe's frame (_pipe_pixels, BGRX)
 static gboolean _process_view(JsonObject *params, const int max_w, const int max_h, _view_t *v, gchar **err)
 {
   const gint64 t0 = g_get_monotonic_time();
@@ -8189,7 +8219,7 @@ static gboolean _process_view(JsonObject *params, const int max_w, const int max
     _cur->pipe_changed = TRUE;
   }
   v->ms = (g_get_monotonic_time() - t0) / 1000;
-  if(!_cur->pipe.backbuf || _cur->pipe.backbuf_width != v->w || _cur->pipe.backbuf_height != v->h)
+  if(!_pipe_pixels(&_cur->pipe, v->w, v->h, DT_FRAME_RGB24))
   {
     *err = g_strdup("the pipe produced no output");
     return FALSE;
@@ -8280,10 +8310,10 @@ static gboolean _render_session(JsonObject *params, JsonBuilder *b, gchar **err)
   if(!done) return FALSE;
   const gint64 t1 = g_get_monotonic_time();
 
-  // backbuf is a cache line in display byte order (BGRA): convert a copy
+  // the frame is in cairo's byte order (BGRX): convert a copy
   const size_t npix = (size_t)v.w * v.h;
   uint8_t *rgba = g_malloc(npix * 4);
-  const uint8_t *src = _cur->pipe.backbuf;
+  const uint8_t *src = _pipe_pixels(&_cur->pipe, v.w, v.h, DT_FRAME_RGB24);
   for(size_t k = 0; k < npix; k++)
   {
     rgba[4 * k + 0] = src[4 * k + 2];
@@ -8424,9 +8454,9 @@ static gboolean _sample_session(JsonObject *params, JsonBuilder *b, gchar **err)
   if(bm)
   {
     copy = g_malloc((size_t)v.w * v.h * 4);
-    memcpy(copy, _cur->pipe.backbuf, (size_t)v.w * v.h * 4);
+    memcpy(copy, _pipe_pixels(&_cur->pipe, v.w, v.h, DT_FRAME_RGB24), (size_t)v.w * v.h * 4);
   }
-  const uint8_t *buf = copy ? copy : _cur->pipe.backbuf;
+  const uint8_t *buf = copy ? copy : _pipe_pixels(&_cur->pipe, v.w, v.h, DT_FRAME_RGB24);
   // image fractions to view pixels
   const double kx = v.scale * v.pw, ky = v.scale * v.ph;
   _add_view(b, &v);
@@ -8632,7 +8662,7 @@ static gboolean _seg_input(_session_t **sp, uint8_t **rgb, int *w, int *h, gchar
     return FALSE;
   }
   *rgb = g_malloc((size_t)v.w * v.h * 3);
-  const uint8_t *src = s->pipe.backbuf;
+  const uint8_t *src = _pipe_pixels(&s->pipe, v.w, v.h, DT_FRAME_RGB24);
   for(size_t k = 0; k < (size_t)v.w * v.h; k++)
   {
     (*rgb)[3 * k + 0] = src[4 * k + 2];
@@ -9487,27 +9517,23 @@ static float *_render_before(dt_develop_t *dev, dt_dev_pixelpipe_t *pipe, const 
       off = g_list_prepend(off, piece);
     }
   }
-  const dt_dev_pixelpipe_type_t type = pipe->type;
-  pipe->type |= DT_DEV_PIXELPIPE_IMAGE_FLOAT;
+  pipe->output.format = DT_FRAME_FLOAT;
   dt_dev_pixelpipe_cache_flush(pipe);
   dt_dev_pixelpipe_get_dimensions(pipe, dev, pipe->iwidth, pipe->iheight,
                                   &pipe->processed_width, &pipe->processed_height);
   dt_dev_pixelpipe_process(pipe, dev, x, y, w, h, scale, DT_DEVICE_NONE);
   float *out = NULL;
-  if(pipe->backbuf && pipe->backbuf_width == w && pipe->backbuf_height == h
-     && pipe->backbuf_size == sizeof(float) * 4 * w * h)
+  const float *px = _pipe_pixels(pipe, w, h, DT_FRAME_FLOAT);
+  if(px)
   {
     out = dt_alloc_align_float((size_t)4 * w * h);
-    if(out) memcpy(out, pipe->backbuf, sizeof(float) * 4 * w * h);
+    if(out) memcpy(out, px, sizeof(float) * 4 * w * h);
   }
-  pipe->type = type;
+  pipe->output.format = DT_FRAME_RGB24;
   for(GList *l = off; l; l = g_list_next(l)) ((dt_dev_pixelpipe_iop_t *)l->data)->enabled = TRUE;
   g_list_free(off);
-  // the screen backbuf was float: drop it and the cached float lines
-  g_free(pipe->backbuf);
-  pipe->backbuf = NULL;
-  pipe->backbuf_size = 0;
-  pipe->backbuf_width = pipe->backbuf_height = 0;
+  // the frame was float: drop it and the cached lines of the modules off
+  _pipe_drop_frame(pipe);
   dt_dev_pixelpipe_cache_flush(pipe);
   return out;
 }
@@ -11995,6 +12021,7 @@ static gboolean _pick_sample(_session_t *s, dt_iop_module_t *m, const dt_api_pic
   }
   dt_dev_pixelpipe_t pp;
   dt_dev_pixelpipe_init_preview(&pp);
+  _pipe_output(&pp, DT_FRAME_RGB24);
   dt_dev_pixelpipe_set_input(&pp, s->dev, (float *)mb.buf, mb.width, mb.height, mb.iscale);
   dt_dev_pixelpipe_create_nodes(&pp, s->dev);
   dt_dev_pixelpipe_synch_all(&pp, s->dev);
@@ -12306,6 +12333,7 @@ static gboolean _toneequal_mask(JsonObject *params, JsonBuilder *b, gchar **err)
   }
   dt_dev_pixelpipe_t pp;
   dt_dev_pixelpipe_init_preview(&pp);
+  _pipe_output(&pp, DT_FRAME_RGB24);
   dt_dev_pixelpipe_set_input(&pp, s->dev, (float *)mb.buf, mb.width, mb.height, mb.iscale);
   dt_dev_pixelpipe_create_nodes(&pp, s->dev);
   dt_dev_pixelpipe_synch_all(&pp, s->dev);

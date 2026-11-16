@@ -187,6 +187,25 @@ static void _agx(dt_iop_module_t *m, const char *field, const void *old)
 enum { _TEMP_UNKNOWN = -1, _TEMP_AS_SHOT = 0, _TEMP_SPOT = 1, _TEMP_USER = 2, _TEMP_D65 = 3,
        _TEMP_NUM_STD = 4 };
 
+// temperature.c _params_mode: the saved mode, or for legacy params without
+// one, the mode their multipliers match (the first three are compared)
+static int _temp_mode(const dt_develop_t *dev, const int preset, const float *coeffs)
+{
+  if(preset != _TEMP_UNKNOWN) return preset;
+  if(dt_dev_equal_chroma(coeffs, dev->chroma.as_shot)) return _TEMP_AS_SHOT;
+  if(dt_dev_equal_chroma(coeffs, dev->chroma.wb.D65coeffs)) return _TEMP_D65;
+  return _TEMP_UNKNOWN;
+}
+
+// temperature.c _own_coeffs: as shot and camera reference apply the image's
+// own multipliers, whatever is stored; NULL for the other modes
+static const double *_temp_own(const dt_develop_t *dev, const int mode)
+{
+  return mode == _TEMP_AS_SHOT ? dev->chroma.as_shot
+       : mode == _TEMP_D65     ? dev->chroma.wb.D65coeffs
+                               : NULL;
+}
+
 static dt_iop_module_t *_find_module(const dt_develop_t *dev, const char *op)
 {
   for(const GList *l = dev->iop; l; l = g_list_next(l))
@@ -209,8 +228,14 @@ static void _cm_gui_wb(dt_iop_module_t *m, dt_dev_wb_t *wb)
   if(!coeffs || !preset || !late) return;
   const gboolean true_monochrome = dt_image_monochrome_flags(&m->dev->image_storage) & DT_IMAGE_MONOCHROME;
   const gboolean applied = t->enabled && !true_monochrome;
-  for_four_channels(k) wb->coeffs[k] = applied ? coeffs[k] : 1.0f;
-  wb->camera_reference = applied && *preset == _TEMP_D65;
+  const int mode = _temp_mode(m->dev, *preset, coeffs);
+  const double *own = _temp_own(m->dev, mode);
+  for_four_channels(k)
+  {
+    wb->coeffs[k] = applied ? (own ? (float)own[k] : coeffs[k]) : 1.0f;
+    wb->D65coeffs[k] = m->dev->chroma.wb.D65coeffs[k];
+  }
+  wb->camera_reference = applied && mode == _TEMP_D65;
   wb->late_correction = applied && !wb->camera_reference && *late;
 }
 
@@ -361,7 +386,7 @@ static gboolean _cat_is_active(dt_iop_module_t *m)
 static void _temperature(dt_iop_module_t *m, const char *field, const void *old)
 {
   int *preset = _P(int, m, "preset");
-  const float *coeffs = _P(float, m, "red");
+  float *coeffs = _P(float, m, "red");
   gboolean *late = _P(gboolean, m, "late_correction");
   if(!preset || !coeffs || !late) return;
   // gui_changed: "prepare data for color calibration" changes neither the
@@ -377,16 +402,17 @@ static void _temperature(dt_iop_module_t *m, const char *field, const void *old)
   if(_is(field, "preset") && _OLD(int, m, old, "preset") == _TEMP_D65
      && (*preset == _TEMP_AS_SHOT || *preset >= _TEMP_NUM_STD))
     *late = _cat_is_active(m);
-  // the window then refreshes the module (gui_update): a saved camera
-  // reference stays one, coefficients that are the camera's as shot are named
-  // so, and legacy params without a preset that hold its D65 ones become the
-  // camera reference. the first three settings are compared
-  const dt_dev_chroma_t *chr = &m->dev->chroma;
-  if(*preset == _TEMP_D65) return;
-  if(dt_dev_equal_chroma(coeffs, chr->as_shot))
-    *preset = _TEMP_AS_SHOT;
-  else if(*preset == _TEMP_UNKNOWN && dt_dev_equal_chroma(coeffs, chr->wb.D65coeffs))
-    *preset = _TEMP_D65;
+  // the window then refreshes the module (gui_update): legacy params
+  // without a mode get the one their multipliers match; as shot and camera
+  // reference show the image's own multipliers; the other standard modes are
+  // labeled user modified. a camera preset is matched against the camera's
+  // list, which only the window loads: it stays
+  *preset = _temp_mode(m->dev, *preset, coeffs);
+  const double *own = _temp_own(m->dev, *preset);
+  if(own)
+    for_four_channels(k) coeffs[k] = own[k];
+  else if(*preset < _TEMP_NUM_STD)
+    *preset = _TEMP_USER;
 }
 
 // ---- spektrafilm (spektrafilm.c) --------------------------------------------

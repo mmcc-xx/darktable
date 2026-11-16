@@ -31,6 +31,7 @@
 #include "common/image.h"
 #include "common/gimp.h"
 #include "gui/guides.h"
+#include "gui/presenter.h"
 #include "gui/splash.h"
 #include "bauhaus/bauhaus.h"
 #include "develop/blend.h"
@@ -363,7 +364,8 @@ static void _focuspeaking_switch_button_callback(GtkWidget *button,
 
   if(state_memory == state_new) return; // nothing to change, bypass
 
-  darktable.gui->show_focus_peaking = state_new;
+  // the pipe workers read it when they publish a frame
+  g_atomic_int_set(&darktable.gui->show_focus_peaking, state_new);
 
   gtk_widget_queue_draw(button);
 
@@ -901,7 +903,9 @@ static gboolean _draw(GtkWidget *da,
   darktable.gui->drawing_snapshot = da == ss;
   if(!darktable.gui->drawing_snapshot) gtk_widget_queue_draw(ss);
 
-  dt_control_expose(da, cr);
+  cairo_t *pcr = dt_presenter_begin(da, cr);
+  dt_control_expose(da, pcr);
+  dt_presenter_end(da, pcr);
 
   return TRUE;
 }
@@ -909,6 +913,16 @@ static gboolean _draw(GtkWidget *da,
 static GdkDevice *_touchpad = NULL;
 static gint64 _touchpad_last_gesture = 0;
 #define DT_TOUCHPAD_ASSOCIATION_USEC (500 * G_TIME_SPAN_MILLISECOND)
+
+static void _display_pref_changed(gpointer instance,
+                                  gpointer user_data)
+{
+  // the display profile file preference applies without a restart; asking
+  // again with the file unchanged changes nothing
+  dt_colorspaces_set_display_profile(DT_COLORSPACE_DISPLAY);
+  if(darktable.develop && darktable.develop->second_wnd)
+    dt_colorspaces_set_display_profile(DT_COLORSPACE_DISPLAY2);
+}
 
 static void _touchpad_gestures_pref_changed(gpointer instance,
                                             gpointer user_data)
@@ -2049,7 +2063,6 @@ int dt_gui_gtk_init(dt_gui_gtk_t *gui)
   GtkWidget *widget;
   if(!gui->ui)
     gui->ui = g_malloc0(sizeof(dt_ui_t));
-  gui->surface = NULL;
   gui->hide_tooltips = dt_conf_get_bool("ui/hide_tooltips") ? 1 : 0;
   gui->grouping = dt_conf_get_bool("ui_last/grouping");
   gui->expanded_group_id = NO_IMGID;
@@ -2075,6 +2088,8 @@ int dt_gui_gtk_init(dt_gui_gtk_t *gui)
   gui->touchpad_gestures_enabled = dt_conf_get_bool("darkroom/ui/touchpad_gestures");
   DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_PREFERENCES_CHANGE,
                             _touchpad_gestures_pref_changed, gui);
+  DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_PREFERENCES_CHANGE,
+                            _display_pref_changed, NULL);
 
   /* Have the delete event (window close) end the program */
   snprintf(path, sizeof(path), "%s/icons", datadir);
@@ -2385,11 +2400,6 @@ void dt_gui_gtk_run(dt_gui_gtk_t *gui)
     g_main_loop_unref(gui->main_loop);
     gui->main_loop = NULL;
     g_atomic_int_set(&darktable.gui_running, 0);
-  }
-  if(darktable.gui->surface)
-  {
-    cairo_surface_destroy(darktable.gui->surface);
-    darktable.gui->surface = NULL;
   }
 }
 
@@ -3893,6 +3903,17 @@ static gboolean _flexi_shape_highlighted(void)
   return FALSE;
 }
 
+// the halo has nothing to offer a focused module that cannot be masked, and
+// would sit on top of the interactive overlay a module draws on the canvas
+// (a chart, a crop frame, ...) when that reaches the border, swallowing the
+// clicks meant for it
+static gboolean _flexi_halo_unwanted(void)
+{
+  const dt_iop_module_t *module = darktable.develop ? darktable.develop->gui_module : NULL;
+  if(!module) return FALSE;
+  if(!(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING)) return TRUE;
+  return module->canvas_overlay_active && module->canvas_overlay_active((dt_iop_module_t *)module);
+}
 
 // clicking a sliver pins the panel open on that side. Like the toolbar button
 // and the "blend mask" caption (dt_masks_gui_flexi_inline_collapse_clicked in
@@ -4720,7 +4741,8 @@ static GtkWidget *_flexi_build_halo(dt_ui_t *ui, const gboolean right)
 // While it is shown it takes clicks over that strip of canvas, so it stands
 // down for a canvas gesture the panel itself started -- reaching the canvas
 // means leaving the panel, and a band in the way would break the very operation
-// the user came to finish.
+// the user came to finish. The same goes for a focused module that cannot be
+// masked, or that is showing an interactive overlay (_flexi_halo_unwanted).
 //
 // It deliberately does NOT stand down for armed mask editing generally, even
 // though shape nodes are editable right up to and past the image border and the
@@ -4753,7 +4775,8 @@ static gboolean _flexi_proximity_poll(gpointer user_data)
   gboolean live[2] = { collapsed || ui->flexi_panel_right,
                        collapsed || !ui->flexi_panel_right };
 
-  if(!_flexi_canvas_op_pending() && !_flexi_shape_highlighted() && gtk_widget_get_realized(base))
+  if(!_flexi_canvas_op_pending() && !_flexi_shape_highlighted()
+     && !_flexi_halo_unwanted() && gtk_widget_get_realized(base))
   {
     GdkWindow *win = gtk_widget_get_window(base);
     GdkDisplay *display = gtk_widget_get_display(base);
